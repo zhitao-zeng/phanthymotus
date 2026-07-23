@@ -449,22 +449,49 @@ def _start_registration(mcp_port: int, name: str, category: str):
     threading.Thread(target=_run, daemon=True, name="register").start()
 
 
+def _rss_mb() -> float:
+    """Return current process RSS in MB."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _start_rss_monitor(interval_s: int = 30):
+    """Background thread: log RSS every interval_s seconds."""
+
+    def _run():
+        import time as _t
+        while True:
+            _t.sleep(interval_s)
+            rss = _rss_mb()
+            log.info(f"[rss] {rss:.0f} MB")
+
+    threading.Thread(target=_run, daemon=True, name="rss_monitor").start()
+
+
 def main():
     global _bundle
 
-    cfg      = _load_config()
+    cfg = _load_config()
     mcp_port = int(os.environ.get("MCP_PORT") or cfg.get("mcp_port", 15720))
-    ws_port  = int(os.environ.get("WS_PORT") or cfg.get("ws_port", 15721))
+    ws_port = int(os.environ.get("WS_PORT") or cfg.get("ws_port", 15721))
 
-    log.info(f"perception bundle starting, mcp_port={mcp_port}, ws_port={ws_port}")
+    log.info(f"perception bundle starting, mcp_port={mcp_port}, ws_port={ws_port}, rss={_rss_mb():.0f}MB")
     log.info(f"config: plugins.asr.enabled={cfg.get('plugins',{}).get('asr',{}).get('enabled')}, "
              f"plugins.tts.enabled={cfg.get('plugins',{}).get('tts',{}).get('enabled')}")
-    asr_cfg = cfg.get('plugins',{}).get('asr',{})
-    tts_cfg = cfg.get('plugins',{}).get('tts',{})
-    log.info(f"  asr: provider={asr_cfg.get('provider')}, url={asr_cfg.get('url','')[:40] or '(empty)'}, "
-             f"model={asr_cfg.get('model','') or '(default)'}, key={'set' if asr_cfg.get('key') else 'MISSING'}")
-    log.info(f"  tts: provider={tts_cfg.get('provider')}, model={tts_cfg.get('model','') or '(default)'}, "
+    asr_cfg = cfg.get('plugins', {}).get('asr', {})
+    tts_cfg = cfg.get('plugins', {}).get('tts', {})
+    log.info(f"  asr: provider={asr_cfg.get('provider')}, url={asr_cfg.get('url', '')[:40] or '(empty)'}, "
+             f"model={asr_cfg.get('model', '') or '(default)'}, key={'set' if asr_cfg.get('key') else 'MISSING'}")
+    log.info(f"  tts: provider={tts_cfg.get('provider')}, model={tts_cfg.get('model', '') or '(default)'}, "
              f"api_key={'set' if tts_cfg.get('api_key') else 'MISSING'}")
+
+    _start_rss_monitor(interval_s=30)
 
     os.environ.setdefault("RCUTILS_LOGGING_SEVERITY_THRESHOLD", "50")
     os.environ.setdefault("ROS_LOG_LEVEL", "WARN")

@@ -1,17 +1,11 @@
-# ── Jetson variant (JetPack 6) ─────────────────────────────────────
-# Self-contained: builds jp6-torch from public dustynv images — no private
-# registry needed. Local builds can skip the inline stage by setting
-# BASE_IMAGE=local/phanthy-motus/jetson-base:jp6-torch (or via
-# build_perception.sh which does the same).
-#
-# Build context: repo root (phanthy-motus/) so we can access both
-# src/perception_stack/ and deploy/ros-base/audio_msgs/
+# ── Jetson variant (JetPack 6) — ASR-only build ───────────────────
+# Stripped to the minimum for ASR evaluation: sherpa-onnx paraformer,
+# ROS2 audio_msgs, VAD. No OCR/VOP/HTMSG/CLIP deps.
 #
 # Usage:
 #   docker build -f perception/Dockerfile.jetson --network=host \
-#     -t phanthymotus-perception-ocr:jp6 .
-#
-#   ./deploy/build_perception.sh --variant jetson --mirror tuna
+#     --build-arg BASE_IMAGE=local/phanthy-motus/jetson-base:jp6-torch \
+#     -t phanthymotus-perception-asr:jp6 .
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
@@ -21,7 +15,6 @@ ARG PYTORCH_DONOR=docker.m.daocloud.io/dustynv/l4t-pytorch:r36.4.0
 ARG BASE_IMAGE=
 
 # ── Stage: jp6-torch (inline, from public dustynv images) ──────────
-# Same as deploy/prepare_jp_v6_local.sh and the vits2-trt-jp6 pattern.
 FROM ${PYTORCH_DONOR} AS pytorch-donor
 FROM ${ROS_BASE} AS jp6-torch-built
 RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* && \
@@ -40,11 +33,9 @@ RUN cd /tmp/pt-donor && \
     done && \
     rm -rf /tmp/pt-donor
 
-# Use pre-built BASE_IMAGE when set; otherwise use the inline build above
 FROM ${BASE_IMAGE:-jp6-torch-built}
 ARG PYPI_MIRROR APT_MIRROR
 
-# jp6/dustynv base sets PIP_INDEX_URL=jetson.webredirect.org (dead)
 ENV PIP_INDEX_URL=${PYPI_MIRROR} \
     PIP_EXTRA_INDEX_URL= \
     PIP_TRUSTED_HOST="mirrors.tuna.tsinghua.edu.cn pypi.tuna.tsinghua.edu.cn pypi.org files.pythonhosted.org" \
@@ -52,85 +43,36 @@ ENV PIP_INDEX_URL=${PYPI_MIRROR} \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 \
-    OPENCV_FOR_THREADS_NUM=1 \
-    VIPS_CONCURRENCY=1 \
     MALLOC_ARENA_MAX=2
 
-# ── APT mirror (conditional) ─────────────────────────────────────
+# ── APT mirror ───────────────────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
         sed -i "s/archive.ubuntu.com/${APT_MIRROR}/g; s/ports.ubuntu.com/${APT_MIRROR}/g" /etc/apt/sources.list; \
     fi
 
-# ── System deps ────────────────────────────────────────────────────
-# (build-essential + python3-dev: webrtcvad has no aarch64 wheel, builds from source)
+# ── System deps (build-essential + python3-dev: webrtcvad builds from source) ──
 RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
-      ffmpeg build-essential python3-dev libvips42 && \
+      ffmpeg build-essential python3-dev && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
-
-# libffi8: not needed on JP6 — Ubuntu 22.04 ships libffi.so.8 natively.
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} "empy<4"
 
-# ── audio_msgs ROS2 package (Humble already in base) ──────────────
+# ── audio_msgs ROS2 package ───────────────────────────────────────
 COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
 RUN cd /ros_ws && \
     . /opt/ros/humble/install/setup.bash && \
     colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
 
-# ── Python deps ────────────────────────────────────────────────────
+# ── ASR Python deps ───────────────────────────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml requests websockets webrtcvad websocket-client dashscope && \
     pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad
 
-# ── HTMSG deps (KISS-ICP + future semantic) ──────────────────────
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    kiss-icp scipy
-
-# ── VOP deps (YOLOv8-World object detection) ─────────────────────
-# NOTE: cv2 in the jp6 base works out of the box (the jp511 __init__ fix is
-# not needed and its python3.8 paths do not exist here).
-# Install ultralytics WITHOUT replacing Jetson's CUDA torch + torchvision
-RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    matplotlib pandas tqdm "pillow>=7.1.2" psutil py-cpuinfo \
-    "ultralytics-thop>=0.2.7" "seaborn>=0.11.0" && \
-    pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
-# ultralytics CLIP (needed for set_classes). The jp6 base bakes
-# PIP_INDEX_URL=jetson.webredirect.org (dead), so force the PyPI mirror
-# for the isolated build env (needs setuptools>=70).
-RUN PIP_INDEX_URL=${PYPI_MIRROR} pip3 install --no-cache-dir --no-deps "git+https://github.com/ultralytics/CLIP.git" && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} ftfy regex
-
-# Pre-download CLIP weights into image (avoids 338MB download at runtime)
-RUN mkdir -p /work/weights/clip && \
-    python3 -c "import urllib.request; urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/ViT-B-32.pt', '/work/weights/clip/ViT-B-32.pt')"
-
-# Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
-ENV YOLO_CONFIG_DIR=/work
-
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
-
-# ── ONNX Runtime CPU (CPython 3.10 / aarch64) ─────────────────────
-# OCR runs on CPU to keep each evaluator container's working set bounded.
-RUN pip3 uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true; \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-      "numpy==1.26.4" "onnxruntime==1.23.0" && \
-    python3 -c "import onnxruntime as ort; providers = ort.get_available_providers(); assert ort.__version__ == '1.23.0', ort.__version__; assert 'CPUExecutionProvider' in providers, providers; assert 'CUDAExecutionProvider' not in providers, providers"
-
-# ── RapidOCR utilities + low-memory MNN OCR runtime ───────────────
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-      "numpy==1.26.4" pyclipper==1.3.0.post3 six Shapely==2.0.5 Pillow \
-      omegaconf==2.3.0 colorlog && \
-    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} \
-      rapidocr==3.9.1 && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-      "MNN==3.6.0" "pyvips==3.1.0" && \
-    RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
-    find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete
 
 # ── Offline ASR model ─────────────────────────────────────────────
 ARG ASR_OFFLINE_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/official_paraformer
@@ -140,17 +82,8 @@ RUN python3 /tmp/asr_model_downloader.py \
     --output-dir /models/sherpa-onnx/asr-offline
 
 # ── VAD model (sherpa-onnx Silero VAD) ────────────────────────────
-# Pre-download to avoid COS dependency at runtime on air-gapped eval machines.
 RUN mkdir -p /models/sherpa-onnx/vad && \
     python3 -c "import urllib.request; urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/silero_vad.onnx', '/models/sherpa-onnx/vad/silero_vad.onnx')"
-
-# ── OCR model (kept outside Git) ──────────────────────────────────
-ARG OCR_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-small-mnn
-COPY perception/utils/ocr_model_downloader.py /tmp/ocr_model_downloader.py
-RUN python3 /tmp/ocr_model_downloader.py \
-    --base-url "${OCR_MODEL_BASE_URL}" \
-    --output-dir /models/ocr/ppocrv6-small-mnn \
-    --filenames det.mnn rec.mnn keys.txt
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
@@ -158,16 +91,13 @@ COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
-COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
 
 EXPOSE 15720
 EXPOSE 15721
 
-# 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
 RUN find /ros_ws/install /opt/ros/humble/install -type d \( -name "site-packages" -o -name "dist-packages" \) \
       > /usr/local/lib/python3.10/dist-packages/ros_ws.pth
 
-# ROS2 shared libraries（audio_msgs .so 等）
 ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 

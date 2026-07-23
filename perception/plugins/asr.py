@@ -30,6 +30,18 @@ from plugins.asr_runtime import (
     resolve_vad_settings,
 )
 
+
+def _rss_mb() -> float:
+    """Return current process RSS in MB (works on Linux)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
 log = logging.getLogger(__name__)
 
 SAMPLE_RATE    = 16000
@@ -513,7 +525,7 @@ class _ASRNode(Node):
             daemon=True, name="vad_worker",
         )
         self._vad_proc.start()
-        log.info(f"[asr] VAD worker process started (pid={self._vad_proc.pid})")
+        log.info(f"[asr] VAD worker process started (pid={self._vad_proc.pid}, rss={_rss_mb():.0f}MB)")
         # Verify VAD worker is alive before returning "running" to caller.
         # A dead VAD worker silently drops all audio — fail fast so the
         # evaluation framework knows the instance is broken.
@@ -579,6 +591,8 @@ class _ASRNode(Node):
         ts  = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         self._received_chunks += 1
         self._last_audio_ts = ts
+        if self._received_chunks == 1:
+            log.info(f"[asr] first audio chunk received (rss={_rss_mb():.0f}MB)")
         try:
             self._pcm_queue.put_nowait((pcm, ts))
         except queue.Full:
@@ -614,7 +628,7 @@ class _ASRNode(Node):
                 self._completed_utterances += 1
                 self._last_result_ts = result["asr_complete_ts"]
                 self._last_error = None
-                log.info(f"[asr] {text!r}")
+                log.info(f"[asr] result → {text!r} (rss={_rss_mb():.0f}MB)")
             except Exception as e:
                 self._transcribe_errors += 1
                 self._last_error = str(e)
