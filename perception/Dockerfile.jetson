@@ -59,9 +59,9 @@ RUN rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
 
 # ── audio_msgs ROS2 package ───────────────────────────────────────
 COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
-RUN cd /ros_ws && \
-    . /opt/ros/humble/setup.bash && \
-    colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
+RUN /bin/bash -c "source /opt/ros/humble/setup.bash && \
+    cd /ros_ws && \
+    colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release"
 
 # ── ASR Python deps ───────────────────────────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
