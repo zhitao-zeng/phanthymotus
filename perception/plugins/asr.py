@@ -514,6 +514,19 @@ class _ASRNode(Node):
         )
         self._vad_proc.start()
         log.info(f"[asr] VAD worker process started (pid={self._vad_proc.pid})")
+        # Verify VAD worker is alive before returning "running" to caller.
+        # A dead VAD worker silently drops all audio — fail fast so the
+        # evaluation framework knows the instance is broken.
+        time.sleep(1.0)
+        if not self._vad_proc.is_alive():
+            exitcode = self._vad_proc.exitcode
+            self.state = "error"
+            self.destroy_subscription(self._sub); self._sub = None
+            raise RuntimeError(
+                f"VAD worker process died immediately (exitcode={exitcode}). "
+                f"Check that /models/sherpa-onnx/vad/silero_vad.onnx exists "
+                f"or that the COS fallback download succeeded."
+            )
         # Transcription worker thread (reads from utterance_queue)
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
