@@ -43,7 +43,12 @@ ENV PIP_INDEX_URL=${PYPI_MIRROR} \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 \
-    MALLOC_ARENA_MAX=2
+    MALLOC_ARENA_MAX=2 \
+    FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+# FASTDDS_BUILTIN_TRANSPORTS=UDPv4: disable SHM transport. FastDDS picks
+# shared-memory for same-host peers, but /dev/shm is per-container, so
+# cross-container payloads vanish into an unreachable segment. Verified:
+# with UDPv4 forced, cross-container pub/sub works (2026-07-24 probe).
 
 # ── APT mirror ───────────────────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
