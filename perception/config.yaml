@@ -2,7 +2,7 @@ mcp_port: 15720
 
 plugins:
   asr:
-    enabled: false
+    enabled: true
     mode: offline               # offline | streaming (online/segmented are legacy aliases)
     model_path: /models/sherpa-onnx/asr-offline
     asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en
@@ -52,7 +52,7 @@ plugins:
     fps: 5
 
   ocr:
-    enabled: true
+    enabled: false
     provider: rapidocr
     backend: mnn
     fallback_backend: ""
