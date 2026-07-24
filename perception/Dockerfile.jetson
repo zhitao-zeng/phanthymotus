@@ -76,8 +76,8 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
-# ── Offline ASR model ─────────────────────────────────────────────
-ARG ASR_OFFLINE_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/official_paraformer
+# ── Offline ASR model (ep150: 短指令最强——榜单正常完成的 case 中表现最佳) ──
+ARG ASR_OFFLINE_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ep150
 COPY perception/utils/asr_model_downloader.py /tmp/asr_model_downloader.py
 RUN python3 /tmp/asr_model_downloader.py \
     --base-url "${ASR_OFFLINE_MODEL_BASE_URL}" \
