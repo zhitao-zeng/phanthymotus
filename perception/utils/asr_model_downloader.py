@@ -10,7 +10,7 @@ from urllib.request import urlretrieve
 
 
 DEFAULT_BASE_URL = (
-    "http://172.28.4.81:34567/zengzhitao/embodied-ai/x_asr_punct_int8"
+    "http://172.28.4.81:34567/zengzhitao/embodied-ai/official_paraformer"
 )
 
 OFFICIAL_PARAFORMER_FILES = (
@@ -65,8 +65,8 @@ def main() -> None:
     parser.add_argument(
         "--model",
         choices=("x_asr", "paraformer"),
-        default="x_asr",
-        help="model family to download (default: x_asr transducer)",
+        default="paraformer",
+        help="model family to download (default: paraformer)",
     )
     args = parser.parse_args()
     filenames = (
