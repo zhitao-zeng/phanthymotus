@@ -10,13 +10,23 @@ from urllib.request import urlretrieve
 
 
 DEFAULT_BASE_URL = (
-    "http://172.28.4.81:34567/zengzhitao/embodied-ai/official_paraformer"
+    "http://172.28.4.81:34567/zengzhitao/embodied-ai/x_asr_punct_int8"
 )
 
 OFFICIAL_PARAFORMER_FILES = (
     "config.json",
     "model.int8.onnx",
     "tokens.txt",
+)
+
+# x-asr-zipformer-transducer-zh-en-punct-int8-2026-06-03
+# （本地评测 0.8087，超过 official_paraformer 0.7810；需 transducer 三件套）
+X_ASR_PUNCT_INT8_FILES = (
+    "encoder-epoch-99-avg-1.int8.onnx",
+    "decoder-epoch-99-avg-1.onnx",
+    "joiner-epoch-99-avg-1.int8.onnx",
+    "tokens.txt",
+    "bpe.model",
 )
 
 
@@ -52,8 +62,17 @@ def main() -> None:
     parser.add_argument(
         "--output-dir", default="/models/sherpa-onnx/asr-offline"
     )
+    parser.add_argument(
+        "--model",
+        choices=("x_asr", "paraformer"),
+        default="x_asr",
+        help="model family to download (default: x_asr transducer)",
+    )
     args = parser.parse_args()
-    download_model(args.base_url, args.output_dir, OFFICIAL_PARAFORMER_FILES)
+    filenames = (
+        X_ASR_PUNCT_INT8_FILES if args.model == "x_asr" else OFFICIAL_PARAFORMER_FILES
+    )
+    download_model(args.base_url, args.output_dir, filenames)
 
 
 if __name__ == "__main__":

@@ -39,6 +39,24 @@ def _resolve_model_file(model_root: Path, configured_model: str) -> Path:
     return onnx_files[0].resolve()
 
 
+def _find_transducer_files(model_root: Path) -> tuple[str, str, str] | None:
+    """检测 transducer 三件套（encoder/decoder/joiner），存在则返回路径，优先 int8。"""
+
+    def _pick(prefix: str) -> str:
+        files = sorted(model_root.glob(f"{prefix}*.onnx"))
+        if not files:
+            return ""
+        int8 = [f for f in files if "int8" in f.name]
+        return str((int8[0] if int8 else files[0]).resolve())
+
+    encoder = _pick("encoder")
+    decoder = _pick("decoder")
+    joiner = _pick("joiner")
+    if encoder and decoder and joiner:
+        return encoder, decoder, joiner
+    return None
+
+
 def _create_sherpa_recognizer(
     model_path: str,
     config: dict,
@@ -50,8 +68,6 @@ def _create_sherpa_recognizer(
 
     root = Path(model_path)
     model_root = root if root.is_dir() else root.parent
-    configured_model = config.get("model") or config.get("model_path") or ""
-    model_file = _resolve_model_file(model_root, configured_model or str(root))
 
     configured_tokens = Path(config.get("tokens", "tokens.txt"))
     tokens = (
@@ -63,8 +79,7 @@ def _create_sherpa_recognizer(
         raise FileNotFoundError(f"Token file not found: {tokens}")
 
     recognizer_config = config.get("recognizerConfig", {})
-    kwargs = {
-        "paraformer": str(model_file),
+    common_kwargs = {
         "tokens": str(tokens),
         "num_threads": int(config.get("numThreads", 1)),
         "sample_rate": int(sample_rate),
@@ -74,6 +89,26 @@ def _create_sherpa_recognizer(
         ),
         "debug": bool(config.get("debug", False)),
         "provider": config.get("provider", "cpu"),
+    }
+
+    # Transducer 模型（encoder/decoder/joiner 三件套，如 x-asr-punct）优先
+    transducer_files = _find_transducer_files(model_root)
+    if transducer_files:
+        encoder, decoder, joiner = transducer_files
+        log.info(f"[asr-offline] transducer model detected: {model_root}")
+        return sherpa_onnx.OfflineRecognizer.from_transducer(
+            encoder=encoder,
+            decoder=decoder,
+            joiner=joiner,
+            **common_kwargs,
+        )
+
+    # Paraformer 单模型文件
+    configured_model = config.get("model") or config.get("model_path") or ""
+    model_file = _resolve_model_file(model_root, configured_model or str(root))
+    kwargs = {
+        **common_kwargs,
+        "paraformer": str(model_file),
         "rule_fsts": recognizer_config.get("ruleFsts", ""),
         "rule_fars": recognizer_config.get("ruleFars", ""),
     }
