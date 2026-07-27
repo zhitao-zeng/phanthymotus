@@ -566,8 +566,6 @@ class _ASRNode(Node):
         self._vad_proc.start()
         log.info(f"[asr] VAD worker process started (pid={self._vad_proc.pid}, rss={_rss_mb():.0f}MB)")
         # Verify VAD worker is alive before returning "running" to caller.
-        # A dead VAD worker silently drops all audio — fail fast so the
-        # evaluation framework knows the instance is broken.
         time.sleep(1.0)
         if not self._vad_proc.is_alive():
             exitcode = self._vad_proc.exitcode
@@ -582,7 +580,18 @@ class _ASRNode(Node):
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
         self.state = "running"
-        log.info("[asr] started, waiting for audio data...")
+        # Wait for first audio chunk to confirm DDS subscription is active.
+        # evaluate.py publishes immediately after MCP start returns; in a
+        # loaded system (20 Docker containers) DDS discovery may lag.
+        deadline = time.time() + 2.0
+        while self._received_chunks == 0 and time.time() < deadline:
+            time.sleep(0.1)
+        received = self._received_chunks > 0
+        log.info(
+            "[asr] started, ready=%s (received=%d chunks in %.1fs)",
+            "yes" if received else "no-sub", self._received_chunks,
+            time.time() - (deadline - 2.0),
+        )
         return self._status_dict()
 
     def stop(self) -> dict:
