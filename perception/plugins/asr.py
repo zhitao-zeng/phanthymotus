@@ -418,6 +418,11 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         f"backend={vad_session.backend}, kws={kws_enabled})"
     )
     audio_count = 0
+    all_pcm = b''           # 累积全部 PCM，VAD 无产出时兜底整句送 ASR
+    first_ts = None
+    last_ts = None
+    has_utterance = False   # 本轮是否已经产出过 utterance
+    silence_chunks = 0       # 连续静音 chunk 计数
 
     while not stop_evt.is_set():
         try:
@@ -428,6 +433,30 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         audio_count += 1
         if audio_count == 1:
             _log.info(f"[vad-worker] first audio chunk received! len={len(pcm)}")
+            first_ts = ts
+
+        # 检测纯零静音流（eval_data.py 末尾发送 ~48 chunks of \\x00 分段触发 VAD 端点）
+        is_silent = all(b == 0 for b in pcm)
+        if is_silent:
+            silence_chunks += 1
+        else:
+            silence_chunks = 0
+            all_pcm += pcm
+            last_ts = ts
+
+        # 兜底：音频已累积，但 VAD 无产出且静音流超阈值 → 立即整句送 ASR
+        if not has_utterance and silence_chunks > 30 and len(all_pcm) > SAMPLE_RATE:
+            _log.info(
+                f"[vad-worker] fallback: VAD silent for {silence_chunks} chunks, "
+                f"flushing {len(all_pcm)} bytes as one utterance"
+            )
+            try:
+                result_q.put((all_pcm, first_ts or 0, ts), timeout=1.0)
+            except queue.Full:
+                _log.warning("[vad-worker] fallback: utterance queue full, dropping")
+            has_utterance = True
+            all_pcm = b''
+            continue
 
         if len(pcm) < 320:
             continue
@@ -461,8 +490,18 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         _log.info(f"[vad-worker] utterance complete, len={len(utterance)} bytes")
         try:
             result_q.put((utterance, start_ts, end_ts), timeout=0.2)
+            has_utterance = True
+            all_pcm = b''   # 重置：VAD 已正常产出，不需要兜底
         except queue.Full:
             _log.warning("[vad-worker] utterance queue full, dropping segment")
+
+    # 兜底：收到过音频但 VAD 没产出任何 utterance（case 7 类临界短指令）→ 整句送 ASR
+    if not has_utterance and len(all_pcm) > SAMPLE_RATE:
+        _log.info(f"[vad-worker] fallback: no VAD utterance, flushing {len(all_pcm)} bytes as one")
+        try:
+            result_q.put((all_pcm, first_ts or 0, last_ts or 0), timeout=1.0)
+        except queue.Full:
+            _log.warning("[vad-worker] fallback: utterance queue full, dropping")
 
     _log.info("[vad-worker] process exiting")
 
