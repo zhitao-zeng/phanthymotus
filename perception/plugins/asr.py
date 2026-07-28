@@ -422,6 +422,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     first_ts = None
     last_ts = None
     has_utterance = False   # 本轮是否已经产出过 utterance
+    fallback_fired = False   # 兜底已触发 → 后续 VAD 产出丢弃（防双发）
     silence_chunks = 0       # 连续静音 chunk 计数
 
     while not stop_evt.is_set():
@@ -455,6 +456,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             except queue.Full:
                 _log.warning("[vad-worker] fallback: utterance queue full, dropping")
             has_utterance = True
+            fallback_fired = True
             all_pcm = b''
             continue
 
@@ -486,6 +488,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         if kws_enabled:
             state = 'waiting_wake'
         if len(utterance) <= SAMPLE_RATE:  # 500ms of PCM16
+            continue
+        if fallback_fired:
+            # 兜底已发整段 → VAD 迟到的产出会重复，丢弃
+            _log.info(f"[vad-worker] dropping VAD utterance after fallback, len={len(utterance)} bytes")
             continue
         _log.info(f"[vad-worker] utterance complete, len={len(utterance)} bytes")
         try:
@@ -549,10 +555,15 @@ class _ASRNode(Node):
         if not self._adapter:
             raise RuntimeError("ASR adapter not configured")
         from audio_msgs.msg import AudioChunk
-        log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
-        self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
-        self._stop_event.clear()
-        # Start VAD in a child process
+        # Subscription created once and kept alive across start/stop cycles:
+        # a fresh publisher matches an EXISTING subscriber immediately,
+        # whereas recreating the subscriber every case forces the publisher
+        # to wait for the next SPDP announcement cycle (random chunk loss).
+        if self._sub is None:
+            log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
+            self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
+        # Start VAD in a child process (queues must exist before stop_event
+        # is cleared, otherwise early chunks hit put_nowait(None))
         self._pcm_queue = multiprocessing.Queue(maxsize=1000)
         self._utterance_queue = multiprocessing.Queue(maxsize=100)
         self._vad_stop = multiprocessing.Event()
@@ -579,25 +590,14 @@ class _ASRNode(Node):
         # Transcription worker thread (reads from utterance_queue)
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
+        self._stop_event.clear()
         self.state = "running"
-        # Wait for first audio chunk to confirm DDS subscription is active.
-        # evaluate.py publishes immediately after MCP start returns; in a
-        # loaded system (20 Docker containers) DDS discovery may lag.
-        deadline = time.time() + 2.0
-        while self._received_chunks == 0 and time.time() < deadline:
-            time.sleep(0.1)
-        received = self._received_chunks > 0
-        log.info(
-            "[asr] started, ready=%s (received=%d chunks in %.1fs)",
-            "yes" if received else "no-sub", self._received_chunks,
-            time.time() - (deadline - 2.0),
-        )
+        log.info("[asr] started, waiting for audio data...")
         return self._status_dict()
 
     def stop(self) -> dict:
-        # Stop subscription first to prevent new audio_cb calls
-        if self._sub:
-            self.destroy_subscription(self._sub); self._sub = None
+        # Keep the subscription alive (see start()); just gate the callback
+        # so late chunks from the finished case are dropped.
         self._stop_event.set()
         if self._vad_stop:
             self._vad_stop.set()
@@ -621,8 +621,11 @@ class _ASRNode(Node):
     def _audio_cb(self, msg):
         if self._stop_event.is_set():
             return
-        # Detect dead VAD subprocess to avoid BrokenPipeError in queue feeder
-        if self._vad_proc and not self._vad_proc.is_alive():
+        # Detect dead VAD subprocess to avoid BrokenPipeError in queue feeder.
+        # Guard with state==running: during start(), between stop_event.clear()
+        # and the new VAD process spawn, self._vad_proc still references the
+        # previous (stopped) process and must not trigger the dead-worker path.
+        if self.state == "running" and self._vad_proc and not self._vad_proc.is_alive():
             log.warning(f"[asr] VAD worker died (exitcode={self._vad_proc.exitcode}), stopping ASR")
             self._stop_event.set()
             # Clean up queues to suppress feeder thread errors
@@ -871,19 +874,14 @@ class ASRPlugin:
 
         elif action == "stop":
             if instance_id and instance_id in self._nodes:
-                node = self._nodes[instance_id]
-                result = node.stop()
-                self._executor.remove_node(node)
-                del self._nodes[instance_id]
-                return result
+                # Node + subscription stay registered with the executor so
+                # DDS discovery persists across cases (see _ASRNode.start).
+                return self._nodes[instance_id].stop()
             elif not instance_id and self._nodes:
                 # Stop all instances (backward compat / project stop)
                 results = []
                 for key in list(self._nodes.keys()):
-                    node = self._nodes[key]
-                    node.stop()
-                    self._executor.remove_node(node)
-                    del self._nodes[key]
+                    self._nodes[key].stop()
                     results.append(key)
                 return {"state": "idle", "stopped_instances": results}
             return {"state": "idle"}
