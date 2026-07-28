@@ -556,10 +556,10 @@ class _ASRNode(Node):
         if not self._adapter:
             raise RuntimeError("ASR adapter not configured")
         from audio_msgs.msg import AudioChunk
-        # Subscription created once and kept alive across start/stop cycles:
-        # a fresh publisher matches an EXISTING subscriber immediately,
-        # whereas recreating the subscriber every case forces the publisher
-        # to wait for the next SPDP announcement cycle (random chunk loss).
+        # Subscription: destroy on stop so each case's fresh
+        # RosAsrTopicClient always discovers a new subscriber endpoint.
+        # Persistent subscriber breaks discovery when publisher recreates
+        # its own endpoint every case.
         if self._sub is None:
             log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
             self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
@@ -606,8 +606,13 @@ class _ASRNode(Node):
         return self._status_dict()
 
     def stop(self) -> dict:
-        # Keep the subscription alive (see start()); just gate the callback
-        # so late chunks from the finished case are dropped.
+        # Destroy subscription each case so that the next case's fresh
+        # RosAsrTopicClient always discovers a "new" subscriber — keeping
+        # the subscriber alive breaks discovery when the publisher recreates
+        # its own endpoint every time.
+        if self._sub:
+            self.destroy_subscription(self._sub)
+            self._sub = None
         self._stop_event.set()
         if self._vad_stop:
             self._vad_stop.set()
