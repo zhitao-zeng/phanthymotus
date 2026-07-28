@@ -567,7 +567,12 @@ class _ASRNode(Node):
         self._pcm_queue = multiprocessing.Queue(maxsize=1000)
         self._utterance_queue = multiprocessing.Queue(maxsize=100)
         self._vad_stop = multiprocessing.Event()
-        self._vad_proc = multiprocessing.Process(
+        # spawn (not fork): forking after the transcription worker has run
+        # onnxruntime inference leaves the child with locked internal
+        # mutexes — the VAD process then hangs forever creating its session
+        # (alive but never segments anything). Spawn starts a clean
+        # interpreter that builds its own onnxruntime state.
+        self._vad_proc = multiprocessing.get_context("spawn").Process(
             target=_vad_worker,
             args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
                   self._vad_backend, self._vad_threshold, self._vad_silence_ms,
