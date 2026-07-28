@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing
 import os
 import queue
 import struct
@@ -319,46 +320,52 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
 
 # ── VAD Worker Process ────────────────────────────────────────────────────────
 
-def _vad_worker(pcm_q, result_q, stop_evt, cfg: dict):
-    """Runs as a daemon thread — sherpa-onnx ONNX VAD + optional KWS gate.
+def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
+                stop_evt: multiprocessing.Event,
+                backend: str, threshold: float, silence_ms: int, pre_roll_ms: int,
+                model_dir: str,
+                kws_cfg: dict = None):
+    """Runs in a child process — sherpa-onnx ONNX VAD + optional KWS gate.
 
     Pipeline: Audio → VAD → (KWS gate) → utterance output
-    The process stays alive across start/stop cycles; a reset sentinel
-    (b'__RESET__') triggers state flush and reinitialization.
+    - If kws_cfg is provided and enabled, only output utterances after keyword detected
+    - Otherwise (kws disabled), output all utterances (backward compat)
     """
     logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                         datefmt='%H:%M:%S')
     _log = logging.getLogger("asr.vad_worker")
 
-    backend = cfg["backend"]
-    threshold = cfg["threshold"]
-    silence_ms = cfg["silence_ms"]
-    pre_roll_ms = cfg["pre_roll_ms"]
-    model_dir = cfg["model_dir"]
-    kws_cfg = cfg.get("kws_cfg") or {}
     vad_session = VadSession(
-        backend=backend, threshold=threshold,
-        silence_ms=silence_ms, pre_roll_ms=pre_roll_ms,
+        backend=backend,
+        threshold=threshold,
+        silence_ms=silence_ms,
+        pre_roll_ms=pre_roll_ms,
         model_dir=model_dir,
     )
-    _log.info(f"[vad-worker] VAD initialized (backend={vad_session.backend}, threshold={threshold})")
+    _log.info(
+        f"[vad-worker] VAD initialized (backend={vad_session.backend}, "
+        f"threshold={threshold}, silence_ms={silence_ms})"
+    )
 
-    # KWS init (same as before)
+    # ── Initialize KWS (optional) ──
     kws_spotter = None
     kws_stream = None
     kws_enabled = _is_kws_enabled(kws_cfg)
     if kws_enabled:
-        import sherpa_onnx as _sherpa_onnx_kws
+        import sherpa_onnx
         from utils.model_downloader import ensure_model
+
         kws_model_dir = kws_cfg.get('model_dir', '/models/sherpa-onnx/kws')
         ensure_model("kws", kws_model_dir)
         keywords = kws_cfg.get('keywords', [])
         if keywords:
             import glob as _glob
+            # Find model files (prefer int8 + chunk-8)
             def _find(prefix, prefer_int8=True):
                 pattern = os.path.join(kws_model_dir, f"{prefix}-*.onnx")
                 files = _glob.glob(pattern)
-                if not files: return ""
+                if not files:
+                    return ""
                 chunk8 = [f for f in files if "chunk-8" in f]
                 cands = chunk8 if chunk8 else files
                 if prefer_int8:
@@ -368,81 +375,70 @@ def _vad_worker(pcm_q, result_q, stop_evt, cfg: dict):
                     fp32f = [f for f in cands if "int8" not in f]
                     if fp32f: return fp32f[0]
                 return cands[0]
+
             encoder = _find("encoder", prefer_int8=True)
             decoder = _find("decoder", prefer_int8=False)
             joiner = _find("joiner", prefer_int8=True)
             tokens = os.path.join(kws_model_dir, "tokens.txt")
+
             if encoder and decoder and joiner and os.path.exists(tokens):
+                # Write keywords file
                 kws_keywords_file = os.path.join(kws_model_dir, "keywords.txt")
                 with open(kws_keywords_file, 'w', encoding='utf-8') as f:
-                    for kw in keywords: f.write(f"{kw}\n")
-                kws_spotter = _sherpa_onnx_kws.KeywordSpotter(
-                    tokens=tokens, encoder=encoder, decoder=decoder, joiner=joiner,
-                    keywords_file=kws_keywords_file, num_threads=1, provider="cpu",
-                    keywords_score=1.5, keywords_threshold=0.1)
+                    for kw in keywords:
+                        f.write(f"{kw}\n")
+
+                kws_spotter = sherpa_onnx.KeywordSpotter(
+                    tokens=tokens,
+                    encoder=encoder,
+                    decoder=decoder,
+                    joiner=joiner,
+                    keywords_file=kws_keywords_file,
+                    num_threads=1,
+                    provider="cpu",
+                    keywords_score=1.5,
+                    keywords_threshold=0.1,
+                )
                 kws_stream = kws_spotter.create_stream()
                 _log.info(f"[vad-worker] KWS initialized, keywords={keywords}")
+            else:
+                _log.warning(f"[vad-worker] KWS model files not found in {kws_model_dir}, disabling KWS")
+                kws_enabled = False
+        else:
+            _log.info("[vad-worker] KWS enabled but no keywords configured, disabling")
+            kws_enabled = False
 
+    # ── State machine ──
+    # States: 'waiting_wake' (KWS mode) or 'listening' (direct mode / post-wake)
     state = 'waiting_wake' if kws_enabled else 'listening'
     kws_cooldown_until = 0.0
-    _log.info(f"[vad-worker] thread started (backend={vad_session.backend}, kws={kws_enabled})")
-    audio_count = 0
-    all_pcm = b''
-    first_ts = last_ts = None
-    has_utterance = False
-    fallback_fired = False
-    silence_chunks = 0
 
-    while True:  # 跨 case 常驻，不因 stop_evt 退出
+    _log.info(
+        f"[vad-worker] process started (pid={os.getpid()}, "
+        f"backend={vad_session.backend}, kws={kws_enabled})"
+    )
+    audio_count = 0
+
+    while not stop_evt.is_set():
         try:
             pcm, ts = pcm_q.get(timeout=1)
         except queue.Empty:
             continue
 
-        # 重置哨兵：清空 VAD 状态 + 所有 buffer
-        if isinstance(pcm, bytes) and pcm == b'__RESET__':
-            _log.info("[vad-worker] reset requested")
-            vad_session.init()
-            audio_count = 0; all_pcm = b''; first_ts = last_ts = None
-            has_utterance = False; fallback_fired = False; silence_chunks = 0
-            state = 'waiting_wake' if kws_enabled else 'listening'
-            continue
-
-        # stop_evt 期间只排空队列，不做任何处理
-        if stop_evt.is_set():
-            continue
-
         audio_count += 1
         if audio_count == 1:
             _log.info(f"[vad-worker] first audio chunk received! len={len(pcm)}")
-            first_ts = ts
-
-        is_silent = all(b == 0 for b in pcm)
-        if is_silent:
-            silence_chunks += 1
-        else:
-            silence_chunks = 0
-            all_pcm += pcm
-            last_ts = ts
-
-        if not has_utterance and silence_chunks > 30 and len(all_pcm) > SAMPLE_RATE:
-            _log.info(f"[vad-worker] fallback: VAD silent, flushing {len(all_pcm)} bytes")
-            try:
-                result_q.put((all_pcm, first_ts or 0, ts), timeout=1.0)
-            except queue.Full:
-                _log.warning("[vad-worker] fallback: queue full")
-            has_utterance = True; fallback_fired = True; all_pcm = b''
-            continue
 
         if len(pcm) < 320:
             continue
         float_samples = pcm16_to_float_samples(pcm)
 
-        # KWS state machine (unchanged)
         if state == 'waiting_wake':
+            # Feed KWS continuously (not gated by VAD) to avoid missing wake word onset
             if kws_spotter:
                 kws_stream.accept_waveform(SAMPLE_RATE, float_samples)
-                while kws_spotter.is_ready(kws_stream): kws_spotter.decode_stream(kws_stream)
+                while kws_spotter.is_ready(kws_stream):
+                    kws_spotter.decode_stream(kws_stream)
                 result = kws_spotter.get_result(kws_stream)
                 kw = result.keyword if hasattr(result, 'keyword') else str(result)
                 if kw and kw.strip():
@@ -450,7 +446,8 @@ def _vad_worker(pcm_q, result_q, stop_evt, cfg: dict):
                     if now >= kws_cooldown_until:
                         kws_cooldown_until = now + 2.0
                         _log.info(f"[vad-worker] WAKE WORD detected: {kw.strip()}")
-                        state = 'listening'; kws_stream = kws_spotter.create_stream()
+                        state = 'listening'
+                        kws_stream = kws_spotter.create_stream()
 
         vad_result = vad_session.process_chunk(pcm, ts)
         if vad_result is None or state != 'listening':
@@ -459,17 +456,15 @@ def _vad_worker(pcm_q, result_q, stop_evt, cfg: dict):
         utterance, start_ts, end_ts = vad_result
         if kws_enabled:
             state = 'waiting_wake'
-        if len(utterance) <= SAMPLE_RATE:
-            continue
-        if fallback_fired:
-            _log.info(f"[vad-worker] dropping VAD utterance after fallback, len={len(utterance)}")
+        if len(utterance) <= SAMPLE_RATE:  # 500ms of PCM16
             continue
         _log.info(f"[vad-worker] utterance complete, len={len(utterance)} bytes")
         try:
             result_q.put((utterance, start_ts, end_ts), timeout=0.2)
-            has_utterance = True; all_pcm = b''
         except queue.Full:
             _log.warning("[vad-worker] utterance queue full, dropping segment")
+
+    _log.info("[vad-worker] process exiting")
 
 
 # ── ROS2 Node ─────────────────────────────────────────────────────────────────
@@ -485,7 +480,6 @@ class _ASRNode(Node):
         self._output_topic = _asr_output_topic(input_topic)
         self._adapter  = adapter
         self._language = language
-        
         self.state     = "idle"
         self._sub      = None
         self._pub      = self.create_publisher(String, self._output_topic, _ASR_PUB_QOS)
@@ -496,10 +490,10 @@ class _ASRNode(Node):
         self._vad_pre_roll_ms = vad_pre_roll_ms
         self._vad_model_dir = vad_model_dir
         self._kws_cfg = kws_cfg or {}
-        self._pcm_queue: Optional[queue.Queue] = None
-        self._utterance_queue: Optional[queue.Queue] = None
-        self._vad_stop: Optional[threading.Event] = None
-        self._vad_thread: Optional[threading.Thread] = None
+        self._pcm_queue: Optional[multiprocessing.Queue] = None
+        self._utterance_queue: Optional[multiprocessing.Queue] = None
+        self._vad_stop: Optional[multiprocessing.Event] = None
+        self._vad_proc: Optional[multiprocessing.Process] = None
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._received_chunks = 0
@@ -516,70 +510,61 @@ class _ASRNode(Node):
         if not self._adapter:
             raise RuntimeError("ASR adapter not configured")
         from audio_msgs.msg import AudioChunk
-        # Subscription: destroy on stop so each case's fresh
-        # RosAsrTopicClient always discovers a new subscriber endpoint.
-        # Persistent subscriber breaks discovery when publisher recreates
-        # its own endpoint every case.
-        if self._sub is None:
-            log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
-            self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
-        # VAD thread — created once, kept alive across start/stop cycles.
-        if self._vad_thread is None:
-            vad_config = dict(
-                backend=self._vad_backend, threshold=self._vad_threshold,
-                silence_ms=self._vad_silence_ms, pre_roll_ms=self._vad_pre_roll_ms,
-                model_dir=self._vad_model_dir, kws_cfg=self._kws_cfg,
+        log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
+        self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
+        self._stop_event.clear()
+        # Start VAD in a child process
+        self._pcm_queue = multiprocessing.Queue(maxsize=1000)
+        self._utterance_queue = multiprocessing.Queue(maxsize=100)
+        self._vad_stop = multiprocessing.Event()
+        self._vad_proc = multiprocessing.Process(
+            target=_vad_worker,
+            args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
+                  self._vad_backend, self._vad_threshold, self._vad_silence_ms,
+                  self._vad_pre_roll_ms, self._vad_model_dir, self._kws_cfg),
+            daemon=True, name="vad_worker",
+        )
+        self._vad_proc.start()
+        log.info(f"[asr] VAD worker process started (pid={self._vad_proc.pid}, rss={_rss_mb():.0f}MB)")
+        # Verify VAD worker is alive before returning "running" to caller.
+        # A dead VAD worker silently drops all audio — fail fast so the
+        # evaluation framework knows the instance is broken.
+        time.sleep(1.0)
+        if not self._vad_proc.is_alive():
+            exitcode = self._vad_proc.exitcode
+            self.state = "error"
+            self.destroy_subscription(self._sub); self._sub = None
+            raise RuntimeError(
+                f"VAD worker process died immediately (exitcode={exitcode}). "
+                f"Check that /models/sherpa-onnx/vad/silero_vad.onnx exists "
+                f"or that the COS fallback download succeeded."
             )
-            self._pcm_queue = queue.Queue(maxsize=1000)
-            self._utterance_queue = queue.Queue(maxsize=100)
-            self._vad_stop = threading.Event()
-            self._vad_thread = threading.Thread(
-                target=_vad_worker,
-                args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
-                      vad_config),
-                daemon=True, name="vad_worker",
-            )
-            self._vad_thread.start()
-            log.info(f"[asr] VAD worker thread started (rss={_rss_mb():.0f}MB)")
-        else:
-            # Reuse existing VAD thread: reset state and resume.
-            self._pcm_queue.put((b'__RESET__', 0))
-            time.sleep(0.1)
-        # Clear VAD gate — set in stop() to pause the worker between cases.
-        self._vad_stop.clear()
         # Transcription worker thread (reads from utterance_queue)
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
-        self._stop_event.clear()
         self.state = "running"
         log.info("[asr] started, waiting for audio data...")
         return self._status_dict()
 
     def stop(self) -> dict:
-        # Destroy subscription each case so that the next case's fresh
-        # RosAsrTopicClient always discovers a "new" subscriber — keeping
-        # the subscriber alive breaks discovery when the publisher recreates
-        # its own endpoint every time.
+        # Stop subscription first to prevent new audio_cb calls
         if self._sub:
-            self.destroy_subscription(self._sub)
-            self._sub = None
+            self.destroy_subscription(self._sub); self._sub = None
         self._stop_event.set()
         if self._vad_stop:
             self._vad_stop.set()
-        # Drain queued PCM chunks (VAD thread skips while _vad_stop is set)
-        # and send reset to clear VAD session state for the next case.
-        if self._pcm_queue:
-            try:
-                while True: self._pcm_queue.get_nowait()
-            except queue.Empty: pass
-            try:
-                self._pcm_queue.put((b'__RESET__', 0), timeout=0.5)
-            except queue.Full: pass
-        if self._utterance_queue:
-            try:
-                while True: self._utterance_queue.get_nowait()
-            except queue.Empty: pass
-        # Keep VAD thread alive — do NOT join
+        # Cancel feeder threads immediately — avoids BrokenPipeError spam
+        for q in (self._pcm_queue, self._utterance_queue):
+            if q:
+                try:
+                    q.cancel_join_thread()
+                    q.close()
+                except Exception:
+                    pass
+        if self._vad_proc and self._vad_proc.is_alive():
+            self._vad_proc.join(timeout=5)
+            if self._vad_proc.is_alive():
+                self._vad_proc.terminate()
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=3)
         self.state = "idle"
@@ -587,6 +572,20 @@ class _ASRNode(Node):
 
     def _audio_cb(self, msg):
         if self._stop_event.is_set():
+            return
+        # Detect dead VAD subprocess to avoid BrokenPipeError in queue feeder
+        if self._vad_proc and not self._vad_proc.is_alive():
+            log.warning(f"[asr] VAD worker died (exitcode={self._vad_proc.exitcode}), stopping ASR")
+            self._stop_event.set()
+            # Clean up queues to suppress feeder thread errors
+            for q in (self._pcm_queue, self._utterance_queue):
+                if q:
+                    try:
+                        q.cancel_join_thread()
+                        q.close()
+                    except Exception:
+                        pass
+            self.state = "error"
             return
         pcm = bytes(msg.data)
         ts  = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -678,7 +677,6 @@ class ASRPlugin:
         self._loading      = True
         self._load_error   = None
         self._adapter      = None
-        
         vad_settings       = resolve_vad_settings(plugin_cfg)
         self._vad_backend  = vad_settings['backend']
         self._vad_threshold = vad_settings['threshold']
@@ -825,14 +823,19 @@ class ASRPlugin:
 
         elif action == "stop":
             if instance_id and instance_id in self._nodes:
-                # Node + subscription stay registered with the executor so
-                # DDS discovery persists across cases (see _ASRNode.start).
-                return self._nodes[instance_id].stop()
+                node = self._nodes[instance_id]
+                result = node.stop()
+                self._executor.remove_node(node)
+                del self._nodes[instance_id]
+                return result
             elif not instance_id and self._nodes:
                 # Stop all instances (backward compat / project stop)
                 results = []
                 for key in list(self._nodes.keys()):
-                    self._nodes[key].stop()
+                    node = self._nodes[key]
+                    node.stop()
+                    self._executor.remove_node(node)
+                    del self._nodes[key]
                     results.append(key)
                 return {"state": "idle", "stopped_instances": results}
             return {"state": "idle"}
