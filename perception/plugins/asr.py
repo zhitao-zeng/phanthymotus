@@ -518,13 +518,14 @@ class _ASRNode(Node):
     def __init__(self, input_topic: str, adapter: Optional[ASRAdapter], language: str,
                  vad_backend: str = 'sherpa_onnx', vad_threshold: float = SPEECH_THRESH, vad_silence_ms: int = 400,
                  vad_pre_roll_ms: int = 500, vad_model_dir: str = '/models/sherpa-onnx/vad',
-                 kws_cfg: dict = None, node_suffix: str = ''):
+                 kws_cfg: dict = None, node_suffix: str = '', plugin_ref=None):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
         self._output_topic = _asr_output_topic(input_topic)
         self._adapter  = adapter
         self._language = language
+        self._plugin_ref = plugin_ref
         self.state     = "idle"
         self._sub      = None
         self._pub      = self.create_publisher(String, self._output_topic, _ASR_PUB_QOS)
@@ -567,12 +568,16 @@ class _ASRNode(Node):
         self._pcm_queue = multiprocessing.Queue(maxsize=1000)
         self._utterance_queue = multiprocessing.Queue(maxsize=100)
         self._vad_stop = multiprocessing.Event()
-        # spawn (not fork): forking after the transcription worker has run
-        # onnxruntime inference leaves the child with locked internal
-        # mutexes — the VAD process then hangs forever creating its session
-        # (alive but never segments anything). Spawn starts a clean
-        # interpreter that builds its own onnxruntime state.
-        self._vad_proc = multiprocessing.get_context("spawn").Process(
+
+        # Fork after onnxruntime inference hands the child a locked internal
+        # mutex — VAD process hangs forever. Wait for in-flight transcriptions
+        # to drain before forking, then use fork (spawn segfaults on Jetson).
+        if self._plugin_ref is not None:
+            deadline = time.time() + 0.5
+            while (self._plugin_ref._active_transcriptions > 0
+                   and time.time() < deadline):
+                time.sleep(0.05)
+        self._vad_proc = multiprocessing.Process(
             target=_vad_worker,
             args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
                   self._vad_backend, self._vad_threshold, self._vad_silence_ms,
@@ -673,6 +678,7 @@ class _ASRNode(Node):
                     self._last_error = str(e)
                     log.error(f"[asr] failed to read utterance queue: {e}")
                 continue
+            self._plugin_ref._active_transcriptions += 1
             try:
                 wav   = _pcm16_to_wav(utterance)
                 text  = self._adapter.transcribe(wav, self._language)
@@ -689,6 +695,8 @@ class _ASRNode(Node):
                 self._transcribe_errors += 1
                 self._last_error = str(e)
                 log.error(f"[asr] transcribe error: {e}", exc_info=True)
+            finally:
+                self._plugin_ref._active_transcriptions -= 1
 
     def _status_dict(self) -> dict:
         def _queue_depth(value):
@@ -733,6 +741,7 @@ class ASRPlugin:
         self._loading      = True
         self._load_error   = None
         self._adapter      = None
+        self._active_transcriptions = 0  # fork 前等这个数字归零（避免 fork 撞推理 mutex）
         vad_settings       = resolve_vad_settings(plugin_cfg)
         self._vad_backend  = vad_settings['backend']
         self._vad_threshold = vad_settings['threshold']
@@ -872,7 +881,8 @@ class ASRPlugin:
                                 self._vad_backend, self._vad_threshold, self._vad_silence_ms,
                                 self._vad_pre_roll_ms, self._vad_model_dir,
                                 kws_cfg=self._kws_cfg,
-                                node_suffix=node_key.replace('/', '_').replace('-', '_'))
+                                node_suffix=node_key.replace('/', '_').replace('-', '_'),
+                                plugin_ref=self)
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
             return self._nodes[node_key].start()
