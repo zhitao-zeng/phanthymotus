@@ -523,30 +523,30 @@ class _ASRNode(Node):
         if self._sub is None:
             log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
             self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
-        # Start VAD in a child process (queues must exist before stop_event
-        # is cleared, otherwise early chunks hit put_nowait(None))
-        self._pcm_queue = queue.Queue(maxsize=1000)
-        self._utterance_queue = queue.Queue(maxsize=100)
-        self._vad_stop = threading.Event()
-
-        # onnxruntime inference hands the child a locked internal mutex;
-        # a thread shares the parent's memory and avoids this entirely.
-        self._pcm_queue = queue.Queue(maxsize=1000)
-        self._utterance_queue = queue.Queue(maxsize=100)
-        self._vad_stop = threading.Event()
-        vad_config = dict(
-            backend=self._vad_backend, threshold=self._vad_threshold,
-            silence_ms=self._vad_silence_ms, pre_roll_ms=self._vad_pre_roll_ms,
-            model_dir=self._vad_model_dir, kws_cfg=self._kws_cfg,
-        )
-        self._vad_thread = threading.Thread(
-            target=_vad_worker,
-            args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
-                  vad_config),
-            daemon=True, name="vad_worker",
-        )
-        self._vad_thread.start()
-        log.info(f"[asr] VAD worker thread started (rss={_rss_mb():.0f}MB)")
+        # VAD thread — created once, kept alive across start/stop cycles.
+        if self._vad_thread is None:
+            vad_config = dict(
+                backend=self._vad_backend, threshold=self._vad_threshold,
+                silence_ms=self._vad_silence_ms, pre_roll_ms=self._vad_pre_roll_ms,
+                model_dir=self._vad_model_dir, kws_cfg=self._kws_cfg,
+            )
+            self._pcm_queue = queue.Queue(maxsize=1000)
+            self._utterance_queue = queue.Queue(maxsize=100)
+            self._vad_stop = threading.Event()
+            self._vad_thread = threading.Thread(
+                target=_vad_worker,
+                args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
+                      vad_config),
+                daemon=True, name="vad_worker",
+            )
+            self._vad_thread.start()
+            log.info(f"[asr] VAD worker thread started (rss={_rss_mb():.0f}MB)")
+        else:
+            # Reuse existing VAD thread: reset state and resume.
+            self._pcm_queue.put((b'__RESET__', 0))
+            time.sleep(0.1)
+        # Clear VAD gate — set in stop() to pause the worker between cases.
+        self._vad_stop.clear()
         # Transcription worker thread (reads from utterance_queue)
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
