@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import multiprocessing
 import os
 import queue
 import struct
@@ -320,12 +319,8 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
 
 # ── VAD Worker Process ────────────────────────────────────────────────────────
 
-def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
-                stop_evt: multiprocessing.Event,
-                backend: str, threshold: float, silence_ms: int, pre_roll_ms: int,
-                model_dir: str,
-                kws_cfg: dict = None):
-    """Runs in a child process — sherpa-onnx ONNX VAD + optional KWS gate.
+def _vad_worker(pcm_q, result_q, stop_evt, cfg: dict):
+    """Runs as a daemon thread — sherpa-onnx ONNX VAD + optional KWS gate.
 
     Pipeline: Audio → VAD → (KWS gate) → utterance output
     The process stays alive across start/stop cycles; a reset sentinel
@@ -335,6 +330,12 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                         datefmt='%H:%M:%S')
     _log = logging.getLogger("asr.vad_worker")
 
+    backend = cfg["backend"]
+    threshold = cfg["threshold"]
+    silence_ms = cfg["silence_ms"]
+    pre_roll_ms = cfg["pre_roll_ms"]
+    model_dir = cfg["model_dir"]
+    kws_cfg = cfg.get("kws_cfg") or {}
     vad_session = VadSession(
         backend=backend, threshold=threshold,
         silence_ms=silence_ms, pre_roll_ms=pre_roll_ms,
@@ -384,7 +385,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
 
     state = 'waiting_wake' if kws_enabled else 'listening'
     kws_cooldown_until = 0.0
-    _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend={vad_session.backend}, kws={kws_enabled})")
+    _log.info(f"[vad-worker] thread started (backend={vad_session.backend}, kws={kws_enabled})")
     audio_count = 0
     all_pcm = b''
     first_ts = last_ts = None
@@ -477,14 +478,14 @@ class _ASRNode(Node):
     def __init__(self, input_topic: str, adapter: Optional[ASRAdapter], language: str,
                  vad_backend: str = 'sherpa_onnx', vad_threshold: float = SPEECH_THRESH, vad_silence_ms: int = 400,
                  vad_pre_roll_ms: int = 500, vad_model_dir: str = '/models/sherpa-onnx/vad',
-                 kws_cfg: dict = None, node_suffix: str = '', plugin_ref=None):
+                 kws_cfg: dict = None, node_suffix: str = ''):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
         self._output_topic = _asr_output_topic(input_topic)
         self._adapter  = adapter
         self._language = language
-        self._plugin_ref = plugin_ref
+        
         self.state     = "idle"
         self._sub      = None
         self._pub      = self.create_publisher(String, self._output_topic, _ASR_PUB_QOS)
@@ -495,10 +496,10 @@ class _ASRNode(Node):
         self._vad_pre_roll_ms = vad_pre_roll_ms
         self._vad_model_dir = vad_model_dir
         self._kws_cfg = kws_cfg or {}
-        self._pcm_queue: Optional[multiprocessing.Queue] = None
-        self._utterance_queue: Optional[multiprocessing.Queue] = None
-        self._vad_stop: Optional[multiprocessing.Event] = None
-        self._vad_proc: Optional[multiprocessing.Process] = None
+        self._pcm_queue: Optional[queue.Queue] = None
+        self._utterance_queue: Optional[queue.Queue] = None
+        self._vad_stop: Optional[threading.Event] = None
+        self._vad_thread: Optional[threading.Thread] = None
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._received_chunks = 0
@@ -524,58 +525,28 @@ class _ASRNode(Node):
             self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
         # Start VAD in a child process (queues must exist before stop_event
         # is cleared, otherwise early chunks hit put_nowait(None))
-        self._pcm_queue = multiprocessing.Queue(maxsize=1000)
-        self._utterance_queue = multiprocessing.Queue(maxsize=100)
-        self._vad_stop = multiprocessing.Event()
+        self._pcm_queue = queue.Queue(maxsize=1000)
+        self._utterance_queue = queue.Queue(maxsize=100)
+        self._vad_stop = threading.Event()
 
-        # Fork after onnxruntime inference hands the child a locked internal
-        # mutex — VAD process hangs forever. Wait for in-flight transcriptions
-        # to drain before forking, then use fork (spawn segfaults on Jetson).
-        if self._plugin_ref is not None:
-            deadline = time.time() + 0.5
-            while (self._plugin_ref._active_transcriptions > 0
-                   and time.time() < deadline):
-                time.sleep(0.05)
-        self._vad_proc = multiprocessing.Process(
+        # onnxruntime inference hands the child a locked internal mutex;
+        # a thread shares the parent's memory and avoids this entirely.
+        self._pcm_queue = queue.Queue(maxsize=1000)
+        self._utterance_queue = queue.Queue(maxsize=100)
+        self._vad_stop = threading.Event()
+        vad_config = dict(
+            backend=self._vad_backend, threshold=self._vad_threshold,
+            silence_ms=self._vad_silence_ms, pre_roll_ms=self._vad_pre_roll_ms,
+            model_dir=self._vad_model_dir, kws_cfg=self._kws_cfg,
+        )
+        self._vad_thread = threading.Thread(
             target=_vad_worker,
             args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
-                  self._vad_backend, self._vad_threshold, self._vad_silence_ms,
-                  self._vad_pre_roll_ms, self._vad_model_dir, self._kws_cfg),
+                  vad_config),
             daemon=True, name="vad_worker",
         )
-        # Start VAD in a child process — created once, kept alive across
-        # start/stop cycles. Forking after onnxruntime inference is in
-        # flight hands the child a locked internal mutex (VAD process
-        # hangs forever). A persistent process avoids this entirely.
-        if self._vad_proc is None:
-            self._pcm_queue = multiprocessing.Queue(maxsize=1000)
-            self._utterance_queue = multiprocessing.Queue(maxsize=100)
-            self._vad_stop = multiprocessing.Event()
-            self._vad_proc = multiprocessing.Process(
-                target=_vad_worker,
-                args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
-                      self._vad_backend, self._vad_threshold, self._vad_silence_ms,
-                      self._vad_pre_roll_ms, self._vad_model_dir, self._kws_cfg),
-                daemon=True, name="vad_worker",
-            )
-            self._vad_proc.start()
-            log.info(f"[asr] VAD worker process started (pid={self._vad_proc.pid}, rss={_rss_mb():.0f}MB)")
-            time.sleep(1.0)
-            if not self._vad_proc.is_alive():
-                exitcode = self._vad_proc.exitcode
-                self.state = "error"
-                self._vad_proc = None
-                self.destroy_subscription(self._sub); self._sub = None
-                raise RuntimeError(
-                    f"VAD worker process died immediately (exitcode={exitcode}). "
-                    f"Check that /models/sherpa-onnx/vad/silero_vad.onnx exists "
-                    f"or that the COS fallback download succeeded."
-                )
-        else:
-            # Reset persistent VAD worker state for the new case.
-            self._pcm_queue.put((b'__RESET__', 0))
-            time.sleep(0.1)  # let the worker process the reset
-            self._vad_stop.clear()
+        self._vad_thread.start()
+        log.info(f"[asr] VAD worker thread started (rss={_rss_mb():.0f}MB)")
         # Transcription worker thread (reads from utterance_queue)
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
@@ -595,28 +566,20 @@ class _ASRNode(Node):
         self._stop_event.set()
         if self._vad_stop:
             self._vad_stop.set()
-        # Drain queued PCM chunks (the persistent VAD worker will skip
-        # them while _vad_stop is set) and request a reset so the worker
-        # starts the next case with a clean VAD session.
+        # Drain queued PCM chunks (VAD thread skips while _vad_stop is set)
+        # and send reset to clear VAD session state for the next case.
         if self._pcm_queue:
             try:
-                # Drain pending chunks (non-blocking)
-                while True:
-                    self._pcm_queue.get_nowait()
-            except queue.Empty:
-                pass
+                while True: self._pcm_queue.get_nowait()
+            except queue.Empty: pass
             try:
                 self._pcm_queue.put((b'__RESET__', 0), timeout=0.5)
-            except queue.Full:
-                pass
-        # Drain stale utterance queue entries
+            except queue.Full: pass
         if self._utterance_queue:
             try:
-                while True:
-                    self._utterance_queue.get_nowait()
-            except queue.Empty:
-                pass
-        # Keep VAD process alive — do NOT join/terminate
+                while True: self._utterance_queue.get_nowait()
+            except queue.Empty: pass
+        # Keep VAD thread alive — do NOT join
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=3)
         self.state = "idle"
@@ -624,23 +587,6 @@ class _ASRNode(Node):
 
     def _audio_cb(self, msg):
         if self._stop_event.is_set():
-            return
-        # Detect dead VAD subprocess to avoid BrokenPipeError in queue feeder.
-        # Guard with state==running: during start(), between stop_event.clear()
-        # and the new VAD process spawn, self._vad_proc still references the
-        # previous (stopped) process and must not trigger the dead-worker path.
-        if self.state == "running" and self._vad_proc and not self._vad_proc.is_alive():
-            log.warning(f"[asr] VAD worker died (exitcode={self._vad_proc.exitcode}), stopping ASR")
-            self._stop_event.set()
-            # Clean up queues to suppress feeder thread errors
-            for q in (self._pcm_queue, self._utterance_queue):
-                if q:
-                    try:
-                        q.cancel_join_thread()
-                        q.close()
-                    except Exception:
-                        pass
-            self.state = "error"
             return
         pcm = bytes(msg.data)
         ts  = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -672,7 +618,6 @@ class _ASRNode(Node):
                     self._last_error = str(e)
                     log.error(f"[asr] failed to read utterance queue: {e}")
                 continue
-            self._plugin_ref._active_transcriptions += 1
             try:
                 wav   = _pcm16_to_wav(utterance)
                 text  = self._adapter.transcribe(wav, self._language)
@@ -689,8 +634,6 @@ class _ASRNode(Node):
                 self._transcribe_errors += 1
                 self._last_error = str(e)
                 log.error(f"[asr] transcribe error: {e}", exc_info=True)
-            finally:
-                self._plugin_ref._active_transcriptions -= 1
 
     def _status_dict(self) -> dict:
         def _queue_depth(value):
@@ -735,7 +678,7 @@ class ASRPlugin:
         self._loading      = True
         self._load_error   = None
         self._adapter      = None
-        self._active_transcriptions = 0  # fork 前等这个数字归零（避免 fork 撞推理 mutex）
+        
         vad_settings       = resolve_vad_settings(plugin_cfg)
         self._vad_backend  = vad_settings['backend']
         self._vad_threshold = vad_settings['threshold']
@@ -875,8 +818,7 @@ class ASRPlugin:
                                 self._vad_backend, self._vad_threshold, self._vad_silence_ms,
                                 self._vad_pre_roll_ms, self._vad_model_dir,
                                 kws_cfg=self._kws_cfg,
-                                node_suffix=node_key.replace('/', '_').replace('-', '_'),
-                                plugin_ref=self)
+                                node_suffix=node_key.replace('/', '_').replace('-', '_'))
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
             return self._nodes[node_key].start()
