@@ -146,6 +146,30 @@ class VehicleDistanceTest(unittest.TestCase):
         self.assertAlmostEqual(result, expected)
         self.assertGreater(result, min(expected, 0.5))
 
+    def test_first_percentile_of_many_pixels_is_not_minimum_distance(self):
+        depth = np.full((200, 1), 5.0, dtype=np.float32)
+        depth[0, 0] = 1.0
+        target = np.ones(depth.shape, dtype=bool)
+        simple_calibration = CameraCalibration(
+            fx=1.0,
+            fy=1.0,
+            cx=0.0,
+            cy=0.0,
+            camera_to_ego=CAMERA_TO_EGO,
+            bumper_xy=(0.0, 0.0),
+        )
+
+        result = self.call_distance(
+            depth,
+            instances=[instance(target)],
+            calibration=simple_calibration,
+            percentile=1.0,
+        )
+
+        self.assertAlmostEqual(result, 5.0)
+        self.assertGreater(result, 1.0)
+        self.assertNotEqual(result, float(np.min(depth)))
+
     def test_extrinsic_rotation_and_translation_change_horizontal_distance(self):
         depth = np.array([[2.0, 2.0]], dtype=np.float32)
         right_pixel = np.array([[False, True]], dtype=bool)
