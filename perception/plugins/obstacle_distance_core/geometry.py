@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import warnings
 from numbers import Real
-from typing import Sequence
+from typing import Iterable, Iterator
 
 import numpy as np
 
@@ -14,6 +14,9 @@ from .contracts import (
     ObstacleDistanceError,
 )
 from .postprocess import validate_depth_map
+
+
+_GEOMETRY_CHUNK_ROWS = 64
 
 
 def _invalid_depth(message: str) -> ObstacleDistanceError:
@@ -74,7 +77,7 @@ def _configuration(
 def _valid_target_depth(
     depth_m: object,
     *,
-    instances: Sequence[InstanceMask],
+    instances: Iterable[InstanceMask],
     allowed_classes: object,
     min_confidence: object,
     percentile: object,
@@ -98,7 +101,7 @@ def _valid_target_depth(
 
     try:
         instance_values = tuple(instances)
-    except (TypeError, ValueError):
+    except Exception:
         raise _invalid_depth("instances must contain instance masks") from None
     if any(not isinstance(value, InstanceMask) for value in instance_values):
         raise _invalid_depth("instances must contain instance masks")
@@ -147,6 +150,23 @@ def _valid_target_depth(
             "target masks contain no valid depth pixels",
         )
     return depth_array, valid_mask, percentile_value
+
+
+def _valid_pixel_chunks(
+    depth_array: np.ndarray,
+    valid_mask: np.ndarray,
+) -> Iterator[tuple[int, np.ndarray, np.ndarray, np.ndarray]]:
+    for row_start in range(0, valid_mask.shape[0], _GEOMETRY_CHUNK_ROWS):
+        row_end = min(row_start + _GEOMETRY_CHUNK_ROWS, valid_mask.shape[0])
+        block = valid_mask[row_start:row_end]
+        local_rows, columns = np.nonzero(block)
+        if columns.size:
+            yield (
+                row_start,
+                local_rows,
+                columns,
+                depth_array[row_start + local_rows, columns],
+            )
 
 
 def _rigid_camera_to_ego(calibration: object) -> tuple[np.ndarray, tuple[float, float]]:
@@ -202,7 +222,7 @@ def _finite_percentile(values: np.ndarray, percentile: float) -> float:
 def vehicle_distance_m(
     depth_m: object,
     *,
-    instances: Sequence[InstanceMask],
+    instances: Iterable[InstanceMask],
     calibration: CameraCalibration | None,
     allowed_classes: object,
     min_confidence: object,
@@ -221,29 +241,48 @@ def vehicle_distance_m(
         max_depth_m=max_depth_m,
     )
 
-    rows, columns = np.nonzero(valid_mask)
-    z_camera = depth_array[valid_mask].astype(np.float64, copy=False)
-    x_camera = (
-        (columns.astype(np.float64) - calibration.cx) / calibration.fx
-    ) * z_camera
-    y_camera = (
-        (rows.astype(np.float64) - calibration.cy) / calibration.fy
-    ) * z_camera
-    camera_points = np.vstack(
-        (
-            x_camera,
-            y_camera,
-            z_camera,
-            np.ones(z_camera.shape, dtype=np.float64),
-        )
+    horizontal = np.empty(
+        int(np.count_nonzero(valid_mask)),
+        dtype=np.float32,
     )
-    with np.errstate(over="ignore", invalid="ignore"):
-        ego_points = matrix @ camera_points
-        horizontal = np.hypot(
-            ego_points[0] - bumper_xy[0],
-            ego_points[1] - bumper_xy[1],
-        )
-    horizontal = horizontal[np.isfinite(horizontal)]
+    cursor = 0
+    for row_start, local_rows, columns, block_depth in _valid_pixel_chunks(
+        depth_array,
+        valid_mask,
+    ):
+        z_camera = block_depth.astype(np.float64, copy=False)
+        x_camera = (
+            (columns.astype(np.float64) - calibration.cx) / calibration.fx
+        ) * z_camera
+        rows = local_rows.astype(np.float64)
+        rows += row_start
+        y_camera = ((rows - calibration.cy) / calibration.fy) * z_camera
+        with np.errstate(over="ignore", invalid="ignore"):
+            ego_x = (
+                matrix[0, 0] * x_camera
+                + matrix[0, 1] * y_camera
+                + matrix[0, 2] * z_camera
+                + matrix[0, 3]
+            )
+            ego_y = (
+                matrix[1, 0] * x_camera
+                + matrix[1, 1] * y_camera
+                + matrix[1, 2] * z_camera
+                + matrix[1, 3]
+            )
+            block_horizontal = np.hypot(
+                ego_x - bumper_xy[0],
+                ego_y - bumper_xy[1],
+            )
+        finite = np.isfinite(block_horizontal)
+        finite_count = int(np.count_nonzero(finite))
+        if finite_count:
+            horizontal[cursor : cursor + finite_count] = block_horizontal[
+                finite
+            ]
+            cursor += finite_count
+
+    horizontal = horizontal[:cursor]
     if horizontal.size == 0:
         raise ObstacleDistanceError(
             ErrorCode.NO_VALID_DEPTH,
@@ -255,7 +294,7 @@ def vehicle_distance_m(
 def approximate_vehicle_distance_m(
     depth_m: object,
     *,
-    instances: Sequence[InstanceMask],
+    instances: Iterable[InstanceMask],
     allowed_classes: object,
     min_confidence: object,
     percentile: object,
@@ -280,10 +319,23 @@ def approximate_vehicle_distance_m(
         min_depth_m=min_depth_m,
         max_depth_m=max_depth_m,
     )
-    z_camera = depth_array[valid_mask].astype(np.float64, copy=False)
-    with np.errstate(over="ignore", invalid="ignore"):
-        approximate = np.maximum(z_camera - offset, 0.0)
-    approximate = approximate[np.isfinite(approximate)]
+    approximate = np.empty(
+        int(np.count_nonzero(valid_mask)),
+        dtype=np.float32,
+    )
+    cursor = 0
+    for _, _, _, block_depth in _valid_pixel_chunks(depth_array, valid_mask):
+        with np.errstate(over="ignore", invalid="ignore"):
+            block_approximate = np.maximum(block_depth - offset, 0.0)
+        finite = np.isfinite(block_approximate)
+        finite_count = int(np.count_nonzero(finite))
+        if finite_count:
+            approximate[cursor : cursor + finite_count] = block_approximate[
+                finite
+            ]
+            cursor += finite_count
+
+    approximate = approximate[:cursor]
     if approximate.size == 0:
         raise ObstacleDistanceError(
             ErrorCode.NO_VALID_DEPTH,

@@ -1,9 +1,11 @@
 import math
 import unittest
 import warnings
+from unittest import mock
 
 import numpy as np
 
+from perception.plugins.obstacle_distance_core import geometry
 from perception.plugins.obstacle_distance_core.contracts import (
     CameraCalibration,
     ErrorCode,
@@ -268,6 +270,74 @@ class VehicleDistanceTest(unittest.TestCase):
         self.assertEqual(no_target.exception.code, ErrorCode.NO_TARGET_INSTANCE)
         self.assertEqual(no_valid.exception.code, ErrorCode.NO_VALID_DEPTH)
 
+    def test_accepts_instance_generator(self):
+        mask = np.ones((1, 1), dtype=bool)
+        instances = (value for value in [instance(mask)])
+
+        result = self.call_distance([[3.0]], instances=instances)
+
+        self.assertAlmostEqual(result, math.hypot(2.0, -3.0))
+
+    def test_empty_instance_generator_raises_no_target(self):
+        instances = (value for value in ())
+
+        with self.assertRaises(ObstacleDistanceError) as raised:
+            self.call_distance([[3.0]], instances=instances)
+
+        self.assertEqual(raised.exception.code, ErrorCode.NO_TARGET_INSTANCE)
+
+    def test_instance_generator_runtime_error_is_safe_invalid_depth(self):
+        secret = "private iterator failure detail"
+        mask = np.ones((1, 1), dtype=bool)
+
+        def failing_instances():
+            yield instance(mask)
+            raise RuntimeError(secret)
+
+        with self.assertRaises(ObstacleDistanceError) as raised:
+            self.call_distance([[3.0]], instances=failing_instances())
+
+        self.assertEqual(raised.exception.code, ErrorCode.INVALID_DEPTH)
+        self.assertNotIn(secret, str(raised.exception))
+
+    def test_full_mask_geometry_is_processed_in_row_chunks(self):
+        depth = np.full((9, 64), 3.0, dtype=np.float32)
+        target = np.ones(depth.shape, dtype=bool)
+        block_shapes = []
+        original_nonzero = np.nonzero
+
+        def recording_nonzero(block):
+            block_shapes.append(block.shape)
+            return original_nonzero(block)
+
+        with (
+            mock.patch.object(geometry, "_GEOMETRY_CHUNK_ROWS", 2),
+            mock.patch.object(
+                geometry.np,
+                "nonzero",
+                side_effect=recording_nonzero,
+            ),
+            mock.patch.object(
+                geometry.np,
+                "vstack",
+                side_effect=AssertionError("full point matrix is forbidden"),
+            ),
+        ):
+            result = self.call_distance(
+                depth,
+                instances=[instance(target)],
+                calibration=calibration(bumper_xy=(0.0, 0.0)),
+            )
+
+        per_row = np.hypot(
+            3.0,
+            (np.arange(depth.shape[1], dtype=np.float64) - 1.0) * 3.0,
+        )
+        expected = float(np.percentile(np.tile(per_row, depth.shape[0]), 50.0))
+        self.assertAlmostEqual(result, expected, places=5)
+        self.assertGreater(len(block_shapes), 1)
+        self.assertTrue(all(shape[0] <= 2 for shape in block_shapes))
+
     def test_missing_calibration_has_stable_code(self):
         with self.assertRaises(ObstacleDistanceError) as raised:
             self.call_distance(
@@ -494,6 +564,33 @@ class ApproximateVehicleDistanceTest(unittest.TestCase):
 
         self.assertEqual(no_target.exception.code, ErrorCode.NO_TARGET_INSTANCE)
         self.assertEqual(no_valid.exception.code, ErrorCode.NO_VALID_DEPTH)
+
+    def test_full_mask_approximation_is_processed_in_row_chunks(self):
+        depth = np.full((7, 32), 3.0, dtype=np.float32)
+        target = np.ones(depth.shape, dtype=bool)
+        block_shapes = []
+        original_nonzero = np.nonzero
+
+        def recording_nonzero(block):
+            block_shapes.append(block.shape)
+            return original_nonzero(block)
+
+        with (
+            mock.patch.object(geometry, "_GEOMETRY_CHUNK_ROWS", 2),
+            mock.patch.object(
+                geometry.np,
+                "nonzero",
+                side_effect=recording_nonzero,
+            ),
+        ):
+            result = self.call_distance(
+                depth,
+                instances=[instance(target)],
+            )
+
+        self.assertEqual(result, 2.0)
+        self.assertGreater(len(block_shapes), 1)
+        self.assertTrue(all(shape[0] <= 2 for shape in block_shapes))
 
 
 if __name__ == "__main__":
