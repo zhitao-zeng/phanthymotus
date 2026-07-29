@@ -32,10 +32,17 @@ def resolve_scene(
         return _coerce_scene(scene_hint)
 
     if source_name is not None and suffix_map is not None:
-        source_suffix = Path(source_name).suffix.lower()
+        normalized_suffix_map = []
         for suffix, configured_scene in suffix_map.items():
-            if suffix.lower() == source_suffix:
-                return _coerce_scene(configured_scene)
+            if not isinstance(suffix, str) or not suffix:
+                raise _missing_scene("suffix_map keys must be nonempty strings")
+            normalized_suffix_map.append((suffix.lower(), configured_scene))
+
+        source_suffix = Path(source_name).suffix.lower()
+        if source_suffix:
+            for suffix, configured_scene in normalized_suffix_map:
+                if suffix == source_suffix:
+                    return _coerce_scene(configured_scene)
 
     if fixed_scene is not None:
         return _coerce_scene(fixed_scene)

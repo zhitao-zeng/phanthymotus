@@ -64,6 +64,38 @@ class SceneRoutingTest(unittest.TestCase):
             SceneDomain.VEHICLE,
         )
 
+    def test_source_without_suffix_skips_suffix_routing(self):
+        self.assertEqual(
+            resolve_scene(
+                source_name="README",
+                suffix_map={".png": SceneDomain.INDOOR},
+                fixed_scene=SceneDomain.VEHICLE,
+            ),
+            SceneDomain.VEHICLE,
+        )
+        with self.assertRaises(ObstacleDistanceError) as raised:
+            resolve_scene(
+                source_name="README",
+                suffix_map={".png": SceneDomain.INDOOR},
+            )
+        self.assertEqual(raised.exception.code, ErrorCode.MISSING_SCENE)
+
+    def test_suffix_map_keys_must_be_nonempty_strings(self):
+        source_name = ("private-source-name-" * 400) + ".png"
+        for invalid_key in (None, ""):
+            with self.subTest(invalid_key=invalid_key):
+                with self.assertRaises(ObstacleDistanceError) as raised:
+                    resolve_scene(
+                        source_name=source_name,
+                        suffix_map={invalid_key: SceneDomain.INDOOR},
+                        fixed_scene=SceneDomain.VEHICLE,
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    ErrorCode.MISSING_SCENE,
+                )
+                self.assertNotIn(source_name, str(raised.exception))
+
     def test_missing_scene_raises_stable_error(self):
         with self.assertRaises(ObstacleDistanceError) as raised:
             resolve_scene()
@@ -199,6 +231,10 @@ class InstanceMaskContractTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     InstanceMask("person", confidence, object())
 
+    def test_oversized_integer_confidence_uses_validation_error(self):
+        with self.assertRaises(ValueError):
+            InstanceMask("person", 10**10000, object())
+
     def test_mask_is_required(self):
         with self.assertRaises(ValueError):
             InstanceMask("person", 0.5, None)
@@ -271,6 +307,17 @@ class CameraCalibrationContractTest(unittest.TestCase):
         for bumper in invalid_bumpers:
             with self.subTest(bumper=bumper):
                 self.assert_invalid_calibration(bumper_xy=bumper)
+
+    def test_oversized_integers_use_stable_calibration_error(self):
+        oversized = 10**10000
+        cases = (
+            ("fx", {"fx": oversized}),
+            ("camera_to_ego", {"camera_to_ego": self.matrix[:-1] + (oversized,)}),
+            ("bumper_xy", {"bumper_xy": (1.0, oversized)}),
+        )
+        for field, changes in cases:
+            with self.subTest(field=field):
+                self.assert_invalid_calibration(**changes)
 
 
 class BackendProtocolContractTest(unittest.TestCase):
