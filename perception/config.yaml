@@ -4,13 +4,26 @@ plugins:
   asr:
     enabled: true
     mode: offline               # offline | streaming (online/segmented are legacy aliases)
-    model_path: /models/sherpa-onnx/asr-offline
+    model_path: /models/sherpa-onnx/x_asr_punct_int8
     asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en
     model_dir: /models/sherpa-onnx/asr
     device: cpu
     hw_provider: cpu
     num_threads: 2
     language: zh-CN
+    # x-asr transducer + modified_beam_search(5)：ARM 实测 1-CER 0.8013，
+    # 消除跨平台漂移（greedy 在 ARM case 0 临界崩塌）。
+    # 详见 docs/current-state.md §x-asr transducer 调参结论。
+    sherpa_config:
+      tokens: tokens.txt
+      numThreads: 2
+      provider: cpu
+      debug: false
+      featureConfig:
+        featureDim: 80
+      recognizerConfig:
+        decodingMethod: modified_beam_search
+        maxActivePaths: 5
     vad:
       model: sherpa_onnx    # sherpa_onnx (ONNX, lightweight) | silero (PyTorch) | webrtc
       threshold: 0.5

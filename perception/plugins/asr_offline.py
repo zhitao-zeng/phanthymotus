@@ -95,12 +95,22 @@ def _create_sherpa_recognizer(
     transducer_files = _find_transducer_files(model_root)
     if transducer_files:
         encoder, decoder, joiner = transducer_files
-        log.info(f"[asr-offline] transducer model detected: {model_root}")
+        method = common_kwargs["decoding_method"]
+        log.info(
+            f"[asr-offline] transducer model detected: {model_root} "
+            f"(decoding={method})"
+        )
+        transducer_kwargs = dict(common_kwargs)
+        # modified_beam_search 需显式传 max_active_paths（默认 4），
+        # 允许 config 覆盖以启用 mbs(5) 等配置。
+        if method != "greedy_search":
+            max_active = int(recognizer_config.get("maxActivePaths", 4))
+            transducer_kwargs["max_active_paths"] = max_active
         return sherpa_onnx.OfflineRecognizer.from_transducer(
             encoder=encoder,
             decoder=decoder,
             joiner=joiner,
-            **common_kwargs,
+            **transducer_kwargs,
         )
 
     # Paraformer 单模型文件

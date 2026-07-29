@@ -76,15 +76,16 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
-# ── Offline ASR model (official_paraformer: ARM 实测最优 0.7412) ──
-# 注：x-asr-punct-int8/fp32 在 x86 上 0.8087 但 ARM NEON kernel 数值漂移
-# 导致临界 case 崩塌（0.67），不可用；ARM 上 paraformer 依然最优。
-ARG ASR_OFFLINE_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/official_paraformer
+# ── Offline ASR model (x-asr-punct-int8 transducer + mbs(5)) ──
+# ARM 实测 1-CER 0.8013（mbs(5)），比 official_paraformer 0.6525 高 +15pt；
+# greedy 在 ARM case 0 临界崩塌，mbs(5) 消除跨平台漂移。
+# 详见 docs/current-state.md §x-asr transducer 调参结论。
+ARG ASR_OFFLINE_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/x_asr_punct_int8
 COPY perception/utils/asr_model_downloader.py /tmp/asr_model_downloader.py
 RUN python3 /tmp/asr_model_downloader.py \
     --base-url "${ASR_OFFLINE_MODEL_BASE_URL}" \
-    --output-dir /models/sherpa-onnx/asr-offline \
-    --model paraformer
+    --output-dir /models/sherpa-onnx/x_asr_punct_int8 \
+    --model x_asr
 
 # ── VAD model (sherpa-onnx Silero VAD) ────────────────────────────
 RUN mkdir -p /models/sherpa-onnx/vad && \

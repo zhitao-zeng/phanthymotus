@@ -20,7 +20,7 @@ OFFICIAL_PARAFORMER_FILES = (
 )
 
 # x-asr-zipformer-transducer-zh-en-punct-int8-2026-06-03
-# （本地评测 0.8087，超过 official_paraformer 0.7810；需 transducer 三件套）
+# transducer 三件套（encoder/decoder/joiner），需 asr_offline.py 的 transducer 分支
 X_ASR_PUNCT_INT8_FILES = (
     "encoder-epoch-99-avg-1.int8.onnx",
     "decoder-epoch-99-avg-1.onnx",

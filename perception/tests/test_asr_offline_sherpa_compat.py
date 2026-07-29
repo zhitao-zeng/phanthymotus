@@ -33,6 +33,11 @@ class ASROfflineSherpaCompatTest(unittest.TestCase):
                 calls.append(kwargs)
                 return types.SimpleNamespace(create_stream=lambda: None)
 
+            @classmethod
+            def from_transducer(cls, **kwargs):
+                calls.append(kwargs)
+                return types.SimpleNamespace(create_stream=lambda: None)
+
         sherpa = types.ModuleType("sherpa_onnx")
         sherpa.OfflineRecognizer = OfflineRecognizer
         sys.modules["sherpa_onnx"] = sherpa
@@ -68,6 +73,102 @@ class ASROfflineSherpaCompatTest(unittest.TestCase):
         )
         self.assertEqual(calls[0]["num_threads"], 2)
         self.assertEqual(calls[0]["provider"], "cpu")
+
+    def test_transducer_greedy_omits_max_active_paths(self):
+        calls = []
+
+        class OfflineRecognizer:
+            @classmethod
+            def from_transducer(cls, **kwargs):
+                calls.append(kwargs)
+                return types.SimpleNamespace(create_stream=lambda: None)
+
+            @classmethod
+            def from_paraformer(cls, **kwargs):
+                calls.append(kwargs)
+                return types.SimpleNamespace(create_stream=lambda: None)
+
+        sherpa = types.ModuleType("sherpa_onnx")
+        sherpa.OfflineRecognizer = OfflineRecognizer
+        sys.modules["sherpa_onnx"] = sherpa
+
+        asr_offline = importlib.import_module("plugins.asr_offline")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            # transducer 三件套
+            for name in (
+                "encoder-epoch-99-avg-1.int8.onnx",
+                "decoder-epoch-99-avg-1.onnx",
+                "joiner-epoch-99-avg-1.int8.onnx",
+            ):
+                (model_dir / name).write_bytes(b"")
+            (model_dir / "tokens.txt").write_text("", encoding="utf-8")
+
+            asr_offline._create_sherpa_recognizer(
+                str(model_dir),
+                {
+                    "tokens": "tokens.txt",
+                    "numThreads": 1,
+                    "provider": "cpu",
+                    "debug": False,
+                    "featureConfig": {"featureDim": 80},
+                    "recognizerConfig": {"decodingMethod": "greedy_search"},
+                },
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("max_active_paths", calls[0])
+        self.assertEqual(calls[0]["decoding_method"], "greedy_search")
+
+    def test_transducer_mbs_passes_max_active_paths(self):
+        calls = []
+
+        class OfflineRecognizer:
+            @classmethod
+            def from_transducer(cls, **kwargs):
+                calls.append(kwargs)
+                return types.SimpleNamespace(create_stream=lambda: None)
+
+            @classmethod
+            def from_paraformer(cls, **kwargs):
+                calls.append(kwargs)
+                return types.SimpleNamespace(create_stream=lambda: None)
+
+        sherpa = types.ModuleType("sherpa_onnx")
+        sherpa.OfflineRecognizer = OfflineRecognizer
+        sys.modules["sherpa_onnx"] = sherpa
+
+        asr_offline = importlib.import_module("plugins.asr_offline")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            for name in (
+                "encoder-epoch-99-avg-1.int8.onnx",
+                "decoder-epoch-99-avg-1.onnx",
+                "joiner-epoch-99-avg-1.int8.onnx",
+            ):
+                (model_dir / name).write_bytes(b"")
+            (model_dir / "tokens.txt").write_text("", encoding="utf-8")
+
+            asr_offline._create_sherpa_recognizer(
+                str(model_dir),
+                {
+                    "tokens": "tokens.txt",
+                    "numThreads": 1,
+                    "provider": "cpu",
+                    "debug": False,
+                    "featureConfig": {"featureDim": 80},
+                    "recognizerConfig": {
+                        "decodingMethod": "modified_beam_search",
+                        "maxActivePaths": 5,
+                    },
+                },
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["decoding_method"], "modified_beam_search")
+        self.assertEqual(calls[0]["max_active_paths"], 5)
 
     def test_cached_recognizer_serializes_concurrent_decode_calls(self):
         class Stream:
