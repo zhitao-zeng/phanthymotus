@@ -69,6 +69,29 @@ class FakePlugin:
 
 
 class PluginDispatchTest(unittest.TestCase):
+    def test_same_name_full_name_prefers_longest_prefix_in_any_order(self):
+        full_name = "obstacle_distance_obstacle_distance"
+
+        for prefixes in (
+            ("obstacle", "obstacle_distance"),
+            ("obstacle_distance", "obstacle"),
+        ):
+            with self.subTest(prefixes=prefixes):
+                plugins = {prefix: FakePlugin(prefix) for prefix in prefixes}
+                result = dispatch_plugin(
+                    [plugins[prefix] for prefix in prefixes],
+                    full_name,
+                    {},
+                )
+
+                self.assertEqual(result["prefix"], "obstacle_distance")
+                self.assertEqual(result["name"], "obstacle_distance")
+                self.assertEqual(plugins["obstacle"].calls, [])
+                self.assertEqual(
+                    plugins["obstacle_distance"].calls,
+                    [("obstacle_distance", {})],
+                )
+
     def test_dispatch_prefers_longest_underscored_prefix(self):
         for prefixes in (
             ("obstacle", "obstacle_distance"),

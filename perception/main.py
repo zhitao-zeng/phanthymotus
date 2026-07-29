@@ -36,7 +36,27 @@ import rclpy.executors
 if __package__:
     from .plugin_dispatch import dispatch_plugin, full_tool_name
 else:
-    from plugin_dispatch import dispatch_plugin, full_tool_name
+    try:
+        from plugin_dispatch import dispatch_plugin, full_tool_name
+    except ModuleNotFoundError as exc:
+        if exc.name != "plugin_dispatch":
+            raise
+
+        import importlib.util
+
+        _plugin_dispatch_path = Path(__file__).with_name("plugin_dispatch.py")
+        _plugin_dispatch_spec = importlib.util.spec_from_file_location(
+            "_perception_plugin_dispatch", _plugin_dispatch_path
+        )
+        if _plugin_dispatch_spec is None or _plugin_dispatch_spec.loader is None:
+            raise ImportError(
+                f"cannot load plugin dispatch helper from {_plugin_dispatch_path}"
+            ) from exc
+
+        _plugin_dispatch = importlib.util.module_from_spec(_plugin_dispatch_spec)
+        _plugin_dispatch_spec.loader.exec_module(_plugin_dispatch)
+        dispatch_plugin = _plugin_dispatch.dispatch_plugin
+        full_tool_name = _plugin_dispatch.full_tool_name
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
