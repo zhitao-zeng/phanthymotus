@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from numbers import Real
 from typing import Callable, Mapping
 
+from .backend_loader import (
+    is_valid_depth_backend,
+    is_valid_segmentation_backend,
+)
 from .contracts import (
     CameraCalibration,
     DepthBackend,
@@ -113,12 +117,9 @@ class ObstacleDistanceEstimator:
 
         self._mode = self._config.get("mode", "model")
         if self._mode == "model":
-            if not isinstance(depth_backend, DepthBackend):
+            if not is_valid_depth_backend(depth_backend):
                 raise ValueError("model mode requires a depth backend")
-            if not isinstance(
-                segmentation_backend,
-                InstanceSegmentationBackend,
-            ):
+            if not is_valid_segmentation_backend(segmentation_backend):
                 raise ValueError(
                     "model mode requires a segmentation backend"
                 )

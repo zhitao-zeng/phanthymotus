@@ -1,12 +1,53 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 from typing import Mapping
 
-from .contracts import DepthBackend, InstanceSegmentationBackend
+from .contracts import (
+    DepthBackend,
+    InstanceSegmentationBackend,
+    SceneDomain,
+)
 
 
 _FACTORY_PATH_ERROR = "backend_factory must use module.path:function_name"
+
+
+def _accepts_protocol_call(
+    backend: object,
+    protocol: type,
+    method_name: str,
+    arguments: tuple[object, ...],
+) -> bool:
+    try:
+        if not isinstance(backend, protocol):
+            return False
+        method = getattr(backend, method_name)
+        if not callable(method):
+            return False
+        inspect.signature(method).bind(*arguments)
+    except Exception:
+        return False
+    return True
+
+
+def is_valid_depth_backend(backend: object) -> bool:
+    return _accepts_protocol_call(
+        backend,
+        DepthBackend,
+        "predict_depth",
+        (b"", SceneDomain.INDOOR, 0.0),
+    )
+
+
+def is_valid_segmentation_backend(backend: object) -> bool:
+    return _accepts_protocol_call(
+        backend,
+        InstanceSegmentationBackend,
+        "predict_instances",
+        (b"", 0.0),
+    )
 
 
 def load_backend_factory(path: str):
@@ -32,7 +73,7 @@ def load_backend_factory(path: str):
         raise RuntimeError("backend factory module could not be imported") from None
     try:
         factory = getattr(module, function_name)
-    except AttributeError:
+    except Exception:
         raise RuntimeError("backend factory attribute was not found") from None
     if not callable(factory):
         raise TypeError("backend factory is not callable")
@@ -63,9 +104,9 @@ def create_model_backends(
     if not isinstance(result, (tuple, list)) or len(result) != 2:
         raise TypeError("backend factory must return exactly two backends")
     depth_backend, segmentation_backend = result
-    if not isinstance(depth_backend, DepthBackend):
+    if not is_valid_depth_backend(depth_backend):
         raise TypeError("backend factory returned an invalid depth backend")
-    if not isinstance(segmentation_backend, InstanceSegmentationBackend):
+    if not is_valid_segmentation_backend(segmentation_backend):
         raise TypeError(
             "backend factory returned an invalid segmentation backend"
         )

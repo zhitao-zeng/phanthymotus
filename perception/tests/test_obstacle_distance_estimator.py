@@ -124,6 +124,24 @@ class _SegmentationBackend:
         return self.instances
 
 
+class _NonCallableDepthBackend:
+    predict_depth = 1
+
+
+class _WrongSignatureDepthBackend:
+    def predict_depth(self, image_bytes, domain):
+        raise AssertionError("must not be called")
+
+
+class _NonCallableSegmentationBackend:
+    predict_instances = 1
+
+
+class _WrongSignatureSegmentationBackend:
+    def predict_instances(self, image_bytes):
+        raise AssertionError("must not be called")
+
+
 def target_instance(shape=(2, 2)):
     return InstanceMask("car", 0.9, np.ones(shape, dtype=bool))
 
@@ -170,6 +188,10 @@ class EstimatorInitializationTest(unittest.TestCase):
             (depth, None),
             (object(), segmentation),
             (depth, object()),
+            (_NonCallableDepthBackend(), segmentation),
+            (_WrongSignatureDepthBackend(), segmentation),
+            (depth, _NonCallableSegmentationBackend()),
+            (depth, _WrongSignatureSegmentationBackend()),
         )
         for depth_backend, segmentation_backend in invalid_pairs:
             with self.subTest(
@@ -513,6 +535,19 @@ class BackendLoaderTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             load_backend_factory(f"{self.module_name}:factory")
 
+    def test_dynamic_module_attribute_exception_is_sanitized(self):
+        secret = "dynamic-module-secret"
+
+        def fail_attribute(name):
+            raise RuntimeError(secret)
+
+        self.module.__getattr__ = fail_attribute
+        with self.assertRaises(RuntimeError) as raised:
+            load_backend_factory(f"{self.module_name}:dynamic_factory")
+
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertNotIn("dynamic_factory", str(raised.exception))
+
     def test_loads_callable(self):
         self.module.factory = lambda config: (object(), object())
         self.assertIs(
@@ -545,6 +580,10 @@ class BackendLoaderTest(unittest.TestCase):
             (),
             (object(),),
             (object(), object()),
+            (_NonCallableDepthBackend(), _SegmentationBackend()),
+            (_WrongSignatureDepthBackend(), _SegmentationBackend()),
+            (_DepthBackend([[1.0]]), _NonCallableSegmentationBackend()),
+            (_DepthBackend([[1.0]]), _WrongSignatureSegmentationBackend()),
             (
                 _DepthBackend([[1.0]]),
                 _SegmentationBackend(),
