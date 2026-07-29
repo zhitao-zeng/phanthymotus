@@ -24,6 +24,16 @@ class FailingDepthConversion:
         raise TypeError("private conversion detail")
 
 
+class WarningDepthConversion:
+    def __init__(self):
+        self.called = False
+
+    def __float__(self):
+        self.called = True
+        warnings.warn("private conversion warning", UserWarning)
+        return 1.0
+
+
 class ValidateDepthMapTest(unittest.TestCase):
     def test_returns_two_dimensional_float32_array(self):
         result = validate_depth_map([[1, 2], [3, 4]])
@@ -96,6 +106,31 @@ class ValidateDepthMapTest(unittest.TestCase):
             validate_depth_map([[1.0], [2.0, 3.0]])
 
         self.assertEqual(raised.exception.code, ErrorCode.INVALID_DEPTH)
+
+    def test_object_array_with_zero_dimensional_complex_array_is_rejected_safely(self):
+        depth = np.empty((1, 1), dtype=object)
+        depth[0, 0] = np.array(1.0 + 2.0j)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with self.assertRaises(ObstacleDistanceError) as raised:
+                validate_depth_map(depth)
+
+        self.assertEqual(raised.exception.code, ErrorCode.INVALID_DEPTH)
+        self.assertEqual(caught, [])
+
+    def test_object_array_is_rejected_before_element_float_conversion(self):
+        value = WarningDepthConversion()
+        depth = np.array([[value]], dtype=object)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with self.assertRaises(ObstacleDistanceError) as raised:
+                validate_depth_map(depth)
+
+        self.assertEqual(raised.exception.code, ErrorCode.INVALID_DEPTH)
+        self.assertFalse(value.called)
+        self.assertEqual(caught, [])
 
 
 class ScaledRoiTest(unittest.TestCase):

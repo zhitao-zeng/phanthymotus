@@ -67,11 +67,9 @@ def validate_depth_map(depth: object) -> np.ndarray:
     except Exception:
         raise _invalid_depth("depth map must be convertible to a numeric array") from None
 
-    contains_complex_object = source_array.dtype.kind == "O" and any(
-        isinstance(value, (complex, np.complexfloating))
-        for value in source_array.flat
-    )
-    if np.iscomplexobj(source_array) or contains_complex_object:
+    if source_array.dtype.kind == "O":
+        raise _invalid_depth("depth map must use a real numeric dtype")
+    if np.iscomplexobj(source_array):
         raise _invalid_depth("depth map must contain real-valued depths")
 
     try:
