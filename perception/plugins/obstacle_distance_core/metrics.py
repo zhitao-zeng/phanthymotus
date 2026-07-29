@@ -252,6 +252,11 @@ def evaluate_grouped_predictions(
     threshold_m: object,
     failed: object | None = None,
 ) -> dict[str, EvaluationMetrics]:
+    threshold = _finite_real(
+        threshold_m,
+        name="threshold_m",
+        positive=True,
+    )
     ground_truth, predictions, failure_flags = _validated_inputs(
         gt,
         pred,
@@ -273,7 +278,7 @@ def evaluate_grouped_predictions(
         label: evaluate_predictions(
             [ground_truth[index] for index in indices],
             [predictions[index] for index in indices],
-            threshold_m,
+            threshold,
             failed=[failure_flags[index] for index in indices],
         )
         for label, indices in indices_by_label.items()

@@ -57,31 +57,7 @@ _DEFAULT_CONFIG = {
         "max_depth_m": 80.0,
         "allow_approximate_geometry": False,
         "camera_to_bumper_offset_m": 1.0,
-        "calibration": {
-            "fx": 600.0,
-            "fy": 600.0,
-            "cx": 320.0,
-            "cy": 240.0,
-            "camera_to_ego": [
-                1.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                1.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                1.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                1.0,
-            ],
-            "bumper_xy": [3.412, 0.0],
-        },
+        "calibration": {},
     },
 }
 
@@ -97,7 +73,9 @@ def _recursive_merge(
     merged = deepcopy(dict(base))
     for key, value in override.items():
         current = merged.get(key)
-        if isinstance(current, Mapping) and isinstance(value, Mapping):
+        if isinstance(value, Mapping) and not value:
+            merged[key] = {}
+        elif isinstance(current, Mapping) and isinstance(value, Mapping):
             merged[key] = _recursive_merge(current, value)
         else:
             merged[key] = deepcopy(value)

@@ -240,6 +240,15 @@ class GroupedMetricsTest(unittest.TestCase):
                 failed=[1],
             )
 
+    def test_empty_groups_still_validate_threshold(self):
+        with self.assertRaises(ValueError):
+            evaluate_grouped_predictions(
+                [0.5],
+                [0.5],
+                [None],
+                math.nan,
+            )
+
 
 class _DepthBackend:
     def __init__(self):
@@ -446,6 +455,73 @@ class EvaluationCliTest(unittest.TestCase):
             loader.assert_called_once_with("tests.fake:create")
             fake_factory.assert_called_once()
             self.assertEqual(depth_backend.calls[0][0], b"rgb")
+
+    def test_default_model_vehicle_without_calibration_is_failed_fallback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "frame.bin").write_bytes(b"rgb")
+            manifest = self._write_manifest(
+                root,
+                [
+                    {
+                        "image_path": "frame.bin",
+                        "scene": "vehicle",
+                        "gt_distance_m": "2.0",
+                    }
+                ],
+            )
+            output = root / "report.json"
+            fake_factory = mock.Mock(
+                return_value=(_DepthBackend(), _SegmentationBackend())
+            )
+
+            with mock.patch(
+                "perception.plugins.obstacle_distance_core.backend_loader."
+                "load_backend_factory",
+                return_value=fake_factory,
+            ):
+                exit_code = evaluate_obstacle_distance.main(
+                    [
+                        "--manifest",
+                        str(manifest),
+                        "--mode",
+                        "model",
+                        "--backend-factory",
+                        "tests.fake:create",
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(report["overall"]["failures"], 1)
+            self.assertTrue(report["predictions"][0]["fallback"])
+            self.assertEqual(
+                report["predictions"][0]["error_code"],
+                "missing_calibration",
+            )
+
+    def test_explicit_empty_calibration_clears_existing_mapping(self):
+        merged = evaluate_obstacle_distance._recursive_merge(
+            {
+                "vehicle": {
+                    "calibration": {
+                        "fx": 600.0,
+                        "private_file_value": "must-be-cleared",
+                    }
+                }
+            },
+            {"vehicle": {"calibration": {}}},
+        )
+
+        self.assertEqual(merged["vehicle"]["calibration"], {})
+        self.assertEqual(
+            evaluate_obstacle_distance._DEFAULT_CONFIG["vehicle"][
+                "calibration"
+            ],
+            {},
+        )
 
     def test_model_mode_without_factory_returns_nonzero(self):
         with tempfile.TemporaryDirectory() as temp_dir:
