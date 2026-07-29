@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+from copy import deepcopy
 from typing import Mapping
 
 from .contracts import (
@@ -97,7 +98,8 @@ def create_model_backends(
         raise ValueError("backend_factory is required in model mode")
     factory = load_backend_factory(path)
     try:
-        result = factory(config)
+        factory_config = deepcopy(dict(config))
+        result = factory(factory_config)
     except Exception:
         raise RuntimeError("backend factory failed") from None
 

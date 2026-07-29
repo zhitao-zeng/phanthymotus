@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from numbers import Real
@@ -15,6 +16,7 @@ from .contracts import (
     CameraCalibration,
     DepthBackend,
     ErrorCode,
+    InstanceMask,
     InstanceSegmentationBackend,
     ObstacleDistanceError,
     SceneDomain,
@@ -62,6 +64,27 @@ def _finite_number(
 
 def _invalid_calibration(message: str) -> ObstacleDistanceError:
     return ObstacleDistanceError(ErrorCode.INVALID_CALIBRATION, message)
+
+
+def _time_value(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ObstacleDistanceError(
+            ErrorCode.MODEL_ERROR,
+            "time source returned an invalid value",
+        )
+    try:
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ObstacleDistanceError(
+            ErrorCode.MODEL_ERROR,
+            "time source returned an invalid value",
+        ) from None
+    if not math.isfinite(converted):
+        raise ObstacleDistanceError(
+            ErrorCode.MODEL_ERROR,
+            "time source returned an invalid value",
+        )
+    return converted
 
 
 def _camera_calibration(value: object) -> CameraCalibration:
@@ -140,12 +163,25 @@ class ObstacleDistanceEstimator:
         self._depth_backend = depth_backend
         self._segmentation_backend = segmentation_backend
 
-    def _latency_ms(self, started_monotonic: float) -> float:
-        try:
-            elapsed = (float(self._monotonic()) - started_monotonic) * 1000.0
-        except Exception:
+    def _latency_ms(
+        self,
+        started_monotonic: float | None,
+        *,
+        suppress_clock_errors: bool,
+    ) -> float:
+        if started_monotonic is None:
             return 0.0
-        if not math.isfinite(elapsed) or elapsed < 0:
+        try:
+            finished_monotonic = _time_value(self._monotonic())
+        except Exception:
+            if suppress_clock_errors:
+                return 0.0
+            raise ObstacleDistanceError(
+                ErrorCode.MODEL_ERROR,
+                "time source failed",
+            ) from None
+        elapsed = (finished_monotonic - started_monotonic) * 1000.0
+        if elapsed < 0:
             return 0.0
         return elapsed
 
@@ -158,7 +194,7 @@ class ObstacleDistanceEstimator:
         error_code: str | None,
         fallback: bool,
         approximate_geometry: bool,
-        started_monotonic: float,
+        started_monotonic: float | None,
         timestamp: float,
     ) -> DistanceResult:
         return DistanceResult(
@@ -170,7 +206,10 @@ class ObstacleDistanceEstimator:
             error_code=error_code,
             fallback=fallback,
             approximate_geometry=approximate_geometry,
-            latency_ms=self._latency_ms(started_monotonic),
+            latency_ms=self._latency_ms(
+                started_monotonic,
+                suppress_clock_errors=fallback,
+            ),
             timestamp=timestamp,
         )
 
@@ -179,26 +218,55 @@ class ObstacleDistanceEstimator:
         *,
         code: ErrorCode,
         scene: str,
-        started_monotonic: float,
+        started_monotonic: float | None,
         timestamp: float,
     ) -> DistanceResult:
+        safe_code = code if isinstance(code, ErrorCode) else ErrorCode.MODEL_ERROR
+        try:
+            safe_timestamp = _time_value(timestamp)
+        except Exception:
+            safe_timestamp = 0.0
         return self._result(
             distance_m=self._fallback_distance_m,
             scene=scene,
             status="error",
-            error_code=code.value,
+            error_code=safe_code.value,
             fallback=True,
             approximate_geometry=False,
             started_monotonic=started_monotonic,
-            timestamp=timestamp,
+            timestamp=safe_timestamp,
         )
 
     def _check_deadline(self, deadline_monotonic: float) -> None:
-        if self._monotonic() >= deadline_monotonic:
+        if _time_value(self._monotonic()) >= deadline_monotonic:
             raise ObstacleDistanceError(
                 ErrorCode.TIMEOUT,
                 "obstacle distance inference timed out",
             )
+
+    @staticmethod
+    def _validated_instances(value: object) -> tuple[InstanceMask, ...]:
+        if (
+            isinstance(value, (str, bytes, bytearray, memoryview, Mapping))
+            or not isinstance(value, Sequence)
+        ):
+            raise ObstacleDistanceError(
+                ErrorCode.MODEL_ERROR,
+                "segmentation output is invalid",
+            )
+        try:
+            instances = tuple(value[index] for index in range(len(value)))
+        except Exception:
+            raise ObstacleDistanceError(
+                ErrorCode.MODEL_ERROR,
+                "segmentation output is invalid",
+            ) from None
+        if any(not isinstance(instance, InstanceMask) for instance in instances):
+            raise ObstacleDistanceError(
+                ErrorCode.MODEL_ERROR,
+                "segmentation output is invalid",
+            )
+        return instances
 
     def _indoor_distance(self, prediction) -> float:
         config = self._config.get("indoor")
@@ -297,13 +365,15 @@ class ObstacleDistanceEstimator:
         source_name: str | None = None,
         timestamp: float | None = None,
     ) -> DistanceResult:
-        started_monotonic = float(self._monotonic())
-        result_timestamp = (
-            timestamp if timestamp is not None else float(self._wall_time())
-        )
-        deadline_monotonic = started_monotonic + self._soft_timeout_s
+        started_monotonic = None
+        result_timestamp = 0.0
         scene = "unknown"
         try:
+            started_monotonic = _time_value(self._monotonic())
+            result_timestamp = _time_value(
+                timestamp if timestamp is not None else self._wall_time()
+            )
+            deadline_monotonic = started_monotonic + self._soft_timeout_s
             if not isinstance(image_bytes, bytes) or not image_bytes:
                 raise ObstacleDistanceError(
                     ErrorCode.INVALID_IMAGE,
@@ -350,11 +420,13 @@ class ObstacleDistanceEstimator:
                     deadline_monotonic,
                 )
                 self._check_deadline(deadline_monotonic)
+                instances = self._validated_instances(instances)
                 distance, approximate_geometry = self._vehicle_distance(
                     prediction,
                     instances,
                 )
             distance = self._validated_distance(distance)
+            self._check_deadline(deadline_monotonic)
             return self._result(
                 distance_m=distance,
                 scene=scene,

@@ -229,7 +229,7 @@ class EstimatorInitializationTest(unittest.TestCase):
             _DepthBackend([[2.0, 2.0], [2.0, 2.0]]),
             _SegmentationBackend(),
             config,
-            monotonic=_Clock([0.0, 0.0, 0.1]),
+            monotonic=_Clock([0.0, 0.0, 0.1, 0.1, 0.1]),
             wall_time=lambda: 10.0,
         )
         config["indoor"]["roi"] = [0, 1, 0, 1]
@@ -273,7 +273,9 @@ class EstimatorInferenceTest(unittest.TestCase):
             segmentation or _SegmentationBackend([target_instance()]),
             config or model_config(),
             monotonic=monotonic
-            or _Clock([10.0, 10.0, 10.1, 10.1, 10.2, 10.2]),
+            or _Clock(
+                [10.0, 10.0, 10.1, 10.1, 10.2, 10.2, 10.2]
+            ),
             wall_time=wall_time or (lambda: 1000.0),
         )
 
@@ -464,9 +466,47 @@ class EstimatorInferenceTest(unittest.TestCase):
         ).estimate(b"rgb", scene_hint="vehicle")
         self.assertEqual(result.error_code, ErrorCode.TIMEOUT.value)
 
+    def test_indoor_deadline_is_rechecked_after_final_distance_validation(self):
+        result = self.make_estimator(
+            monotonic=_Clock([10.0, 10.0, 10.5, 12.0, 12.0]),
+        ).estimate(b"rgb", scene_hint="indoor")
+
+        self.assertEqual(result.error_code, ErrorCode.TIMEOUT.value)
+        self.assertTrue(result.fallback)
+
+    def test_vehicle_deadline_is_rechecked_after_geometry_and_validation(self):
+        result = self.make_estimator(
+            monotonic=_Clock(
+                [10.0, 10.0, 10.1, 10.1, 10.2, 12.0, 12.0]
+            ),
+        ).estimate(b"rgb", scene_hint="vehicle")
+
+        self.assertEqual(result.error_code, ErrorCode.TIMEOUT.value)
+        self.assertTrue(result.fallback)
+
+    def test_segmentation_output_must_be_bounded_instance_sequence(self):
+        invalid_outputs = (
+            "car",
+            b"car",
+            {"instance": target_instance()},
+            (value for value in [target_instance()]),
+            ["not-an-instance"],
+        )
+        for output in invalid_outputs:
+            with self.subTest(output_type=type(output)):
+                result = self.make_estimator(
+                    segmentation=_SegmentationBackend(output),
+                ).estimate(b"rgb", scene_hint="vehicle")
+
+                self.assertEqual(
+                    result.error_code,
+                    ErrorCode.MODEL_ERROR.value,
+                )
+                self.assertTrue(result.fallback)
+
     def test_latency_is_nonnegative_and_explicit_timestamp_wins(self):
         result = self.make_estimator(
-            monotonic=_Clock([10.0, 10.0, 10.1, 9.0]),
+            monotonic=_Clock([10.0, 10.0, 10.1, 10.1, 9.0]),
             wall_time=lambda: 777.0,
         ).estimate(
             b"rgb",
@@ -496,6 +536,106 @@ class EstimatorInferenceTest(unittest.TestCase):
         self.assertIsNone(result.error_code)
         self.assertFalse(result.fallback)
         self.assertEqual(result.timestamp, 22.0)
+
+
+class EstimatorTimeBoundaryTest(unittest.TestCase):
+    def make_estimator(self, *, monotonic, wall_time):
+        return ObstacleDistanceEstimator(
+            _DepthBackend([[1.0]]),
+            _SegmentationBackend(),
+            model_config(
+                indoor={
+                    "roi": [0, 1, 0, 1],
+                    "min_depth_m": 0.0,
+                    "max_depth_m": 10.0,
+                    "percentile": 1.0,
+                    "min_valid_pixels": 1,
+                }
+            ),
+            monotonic=monotonic,
+            wall_time=wall_time,
+        )
+
+    def test_initial_monotonic_exception_is_structured_model_error(self):
+        secret = "private-monotonic-failure"
+
+        def failing_monotonic():
+            raise RuntimeError(secret)
+
+        result = self.make_estimator(
+            monotonic=failing_monotonic,
+            wall_time=lambda: 100.0,
+        ).estimate(b"rgb", scene_hint="indoor")
+
+        self.assertEqual(result.error_code, ErrorCode.MODEL_ERROR.value)
+        self.assertEqual(result.timestamp, 0.0)
+        self.assertEqual(result.latency_ms, 0.0)
+        self.assertNotIn(secret, repr(result))
+
+    def test_initial_monotonic_must_be_finite_real_and_not_bool(self):
+        for value in (True, math.nan, math.inf, -math.inf, "private-clock"):
+            with self.subTest(value=value):
+                result = self.make_estimator(
+                    monotonic=lambda value=value: value,
+                    wall_time=lambda: 100.0,
+                ).estimate(b"rgb", scene_hint="indoor")
+
+                self.assertEqual(
+                    result.error_code,
+                    ErrorCode.MODEL_ERROR.value,
+                )
+                self.assertEqual(result.timestamp, 0.0)
+                self.assertEqual(result.latency_ms, 0.0)
+                self.assertNotIn("private-clock", repr(result))
+
+    def test_wall_time_failure_or_invalid_value_uses_safe_timestamp(self):
+        secret = "private-wall-time"
+
+        def failing_wall_time():
+            raise RuntimeError(secret)
+
+        wall_times = (
+            failing_wall_time,
+            lambda: True,
+            lambda: math.nan,
+            lambda: math.inf,
+            lambda: secret,
+        )
+        for wall_time in wall_times:
+            with self.subTest(wall_time=wall_time):
+                result = self.make_estimator(
+                    monotonic=lambda: 10.0,
+                    wall_time=wall_time,
+                ).estimate(b"rgb", scene_hint="indoor")
+
+                self.assertEqual(
+                    result.error_code,
+                    ErrorCode.MODEL_ERROR.value,
+                )
+                self.assertEqual(result.timestamp, 0.0)
+                self.assertNotIn(secret, repr(result))
+
+    def test_explicit_timestamp_must_be_finite_real_and_not_bool(self):
+        secret = "private-timestamp"
+        for value in (True, math.nan, math.inf, -math.inf, secret):
+            with self.subTest(value=value):
+                result = self.make_estimator(
+                    monotonic=lambda: 10.0,
+                    wall_time=lambda: (_ for _ in ()).throw(
+                        AssertionError("wall_time must not be called")
+                    ),
+                ).estimate(
+                    b"rgb",
+                    scene_hint="indoor",
+                    timestamp=value,
+                )
+
+                self.assertEqual(
+                    result.error_code,
+                    ErrorCode.MODEL_ERROR.value,
+                )
+                self.assertEqual(result.timestamp, 0.0)
+                self.assertNotIn(secret, repr(result))
 
 
 class BackendLoaderTest(unittest.TestCase):
@@ -626,15 +766,19 @@ class BackendLoaderTest(unittest.TestCase):
 
         def factory(config):
             received.append(config)
+            config["nested"]["value"] = "factory-mutated"
             return expected
 
         self.module.factory = factory
         config = {
             "mode": "model",
             "backend_factory": f"{self.module_name}:factory",
+            "nested": {"value": "caller-owned"},
         }
         self.assertEqual(create_model_backends(config), expected)
-        self.assertIs(received[0], config)
+        self.assertIsNot(received[0], config)
+        self.assertIsNot(received[0]["nested"], config["nested"])
+        self.assertEqual(config["nested"]["value"], "caller-owned")
 
 
 if __name__ == "__main__":
