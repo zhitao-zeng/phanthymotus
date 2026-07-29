@@ -243,7 +243,7 @@ def vehicle_distance_m(
 
     horizontal = np.empty(
         int(np.count_nonzero(valid_mask)),
-        dtype=np.float32,
+        dtype=np.float64,
     )
     cursor = 0
     for row_start, local_rows, columns, block_depth in _valid_pixel_chunks(
@@ -321,12 +321,13 @@ def approximate_vehicle_distance_m(
     )
     approximate = np.empty(
         int(np.count_nonzero(valid_mask)),
-        dtype=np.float32,
+        dtype=np.float64,
     )
     cursor = 0
     for _, _, _, block_depth in _valid_pixel_chunks(depth_array, valid_mask):
+        z_camera = block_depth.astype(np.float64, copy=False)
         with np.errstate(over="ignore", invalid="ignore"):
-            block_approximate = np.maximum(block_depth - offset, 0.0)
+            block_approximate = np.maximum(z_camera - offset, 0.0)
         finite = np.isfinite(block_approximate)
         finite_count = int(np.count_nonzero(finite))
         if finite_count:

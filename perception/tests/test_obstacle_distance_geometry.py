@@ -233,6 +233,42 @@ class VehicleDistanceTest(unittest.TestCase):
         self.assertAlmostEqual(transformed_result, math.hypot(5.0, 0.0))
         self.assertNotEqual(identity_result, transformed_result)
 
+    def test_finite_huge_translation_preserves_float64_distance_without_warning(self):
+        huge_translation = 1e100
+        translated_identity = (
+            1.0,
+            0.0,
+            0.0,
+            huge_translation,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = self.call_distance(
+                [[1.0]],
+                instances=[instance([[True]])],
+                calibration=calibration(
+                    camera_to_ego=translated_identity,
+                    bumper_xy=(0.0, 0.0),
+                ),
+            )
+
+        self.assertTrue(math.isfinite(result))
+        self.assertAlmostEqual(result / huge_translation, 1.0)
+        self.assertEqual(caught, [])
+
     def test_rejects_invalid_selected_mask_shapes_and_dtypes(self):
         invalid_masks = (
             np.ones((2, 2), dtype=bool),
