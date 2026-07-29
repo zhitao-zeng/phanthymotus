@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
@@ -32,6 +33,12 @@ import yaml
 
 import rclpy
 import rclpy.executors
+
+_PERCEPTION_ROOT = str(Path(__file__).resolve().parent)
+if _PERCEPTION_ROOT not in sys.path:
+    sys.path.insert(0, _PERCEPTION_ROOT)
+
+from plugin_dispatch import dispatch_plugin, full_tool_name
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
@@ -96,17 +103,11 @@ class PerceptionBundle:
         tools = []
         for p in self._plugins:
             for t in p.get_tools():
-                full_name = t['name'] if t['name'] == p.PREFIX else f"{p.PREFIX}_{t['name']}"
-                tools.append({**t, "name": full_name})
+                tools.append({**t, "name": full_tool_name(p.PREFIX, t["name"])})
         return tools
 
     def dispatch(self, full_name: str, args: dict) -> dict | None:
-        prefix, sep, tool_name = full_name.partition("_")
-        name = tool_name if sep else prefix
-        for p in self._plugins:
-            if p.PREFIX == prefix:
-                return p.dispatch(name, args)
-        return None
+        return dispatch_plugin(self._plugins, full_name, args)
 
     def tts_synthesize_raw(self, text: str) -> bytes:
         for p in self._plugins:
