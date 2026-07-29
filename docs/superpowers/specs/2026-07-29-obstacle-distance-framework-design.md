@@ -235,6 +235,7 @@ ROS 输出 topic：
   "decision_threshold_m": 1.0,
   "scene": "indoor",
   "status": "ok",
+  "error_code": null,
   "fallback": false,
   "approximate_geometry": false,
   "latency_ms": 42.5,
@@ -258,7 +259,7 @@ ROS 输出 topic：
 - 室外缺少标定或坐标变换失败。
 - 最终结果为 NaN、Inf、负数或超出配置范围。
 
-兜底输出默认 `3.0 m`，状态必须包含机器可读错误码，例如
+兜底输出默认 `3.0 m`，独立的 `error_code` 必须包含机器可读错误码，例如
 `invalid_image`、`missing_scene`、`model_error`、`no_valid_depth`、
 `no_target_instance` 或 `missing_calibration`。兜底不会伪装成正常模型输出。
 
