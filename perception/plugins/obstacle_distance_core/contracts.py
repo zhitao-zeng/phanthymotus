@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
+from numbers import Real
 from typing import Protocol, Sequence, runtime_checkable
 
 
@@ -31,7 +32,7 @@ class ObstacleDistanceError(Exception):
 
 
 def _is_finite_number(value: object) -> bool:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, Real):
         return False
     try:
         return math.isfinite(value)

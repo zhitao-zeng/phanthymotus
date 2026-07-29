@@ -17,6 +17,11 @@ from perception.plugins.obstacle_distance_core import (
 from perception.plugins.obstacle_distance_core.routing import resolve_scene
 
 
+class FloatLike:
+    def __float__(self):
+        return 0.5
+
+
 class SceneRoutingTest(unittest.TestCase):
     def test_scene_hint_takes_priority_over_suffix_and_fixed_scene(self):
         self.assertEqual(
@@ -235,6 +240,10 @@ class InstanceMaskContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             InstanceMask("person", 10**10000, object())
 
+    def test_non_real_float_like_confidence_uses_validation_error(self):
+        with self.assertRaises(ValueError):
+            InstanceMask("person", FloatLike(), object())
+
     def test_mask_is_required(self):
         with self.assertRaises(ValueError):
             InstanceMask("person", 0.5, None)
@@ -314,6 +323,16 @@ class CameraCalibrationContractTest(unittest.TestCase):
             ("fx", {"fx": oversized}),
             ("camera_to_ego", {"camera_to_ego": self.matrix[:-1] + (oversized,)}),
             ("bumper_xy", {"bumper_xy": (1.0, oversized)}),
+        )
+        for field, changes in cases:
+            with self.subTest(field=field):
+                self.assert_invalid_calibration(**changes)
+
+    def test_non_real_float_like_uses_stable_calibration_error(self):
+        value = FloatLike()
+        cases = (
+            ("fx", {"fx": value}),
+            ("camera_to_ego", {"camera_to_ego": (value,) + self.matrix[1:]}),
         )
         for field, changes in cases:
             with self.subTest(field=field):
