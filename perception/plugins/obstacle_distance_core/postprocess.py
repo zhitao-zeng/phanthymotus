@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from numbers import Integral, Real
 
 import numpy as np
@@ -62,7 +63,22 @@ def _finite_number(value: object, name: str) -> float:
 
 def validate_depth_map(depth: object) -> np.ndarray:
     try:
-        depth_array = np.asarray(depth, dtype=np.float32)
+        source_array = np.asarray(depth)
+    except Exception:
+        raise _invalid_depth("depth map must be convertible to a numeric array") from None
+
+    contains_complex_object = source_array.dtype.kind == "O" and any(
+        isinstance(value, (complex, np.complexfloating))
+        for value in source_array.flat
+    )
+    if np.iscomplexobj(source_array) or contains_complex_object:
+        raise _invalid_depth("depth map must contain real-valued depths")
+
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                depth_array = np.asarray(source_array, dtype=np.float32)
     except Exception:
         raise _invalid_depth("depth map must be convertible to a numeric array") from None
 
@@ -160,7 +176,7 @@ def indoor_distance_m(
     if valid_count < required_count:
         raise ObstacleDistanceError(
             ErrorCode.NO_VALID_DEPTH,
-            f"found {valid_count} valid depth pixels; require at least {required_count}",
+            f"found {valid_count} valid depth pixels",
         )
 
     result = float(np.percentile(valid_depth, percentile_value))

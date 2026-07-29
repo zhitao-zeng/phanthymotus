@@ -1,5 +1,6 @@
 import math
 import unittest
+import warnings
 
 import numpy as np
 
@@ -66,6 +67,35 @@ class ValidateDepthMapTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, ErrorCode.INVALID_DEPTH)
         self.assertNotIn("private conversion detail", str(raised.exception))
         self.assertLess(len(str(raised.exception)), 200)
+
+    def test_rejects_complex_values_without_leaking_conversion_warning(self):
+        complex_depths = (
+            [[complex(1.0, 2.0)]],
+            np.array([[1.0 + 2.0j]], dtype=np.complex64),
+        )
+        for depth in complex_depths:
+            with self.subTest(depth_type=type(depth)):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    with self.assertRaises(ObstacleDistanceError) as raised:
+                        validate_depth_map(depth)
+                self.assertEqual(raised.exception.code, ErrorCode.INVALID_DEPTH)
+                self.assertEqual(caught, [])
+
+    def test_float32_overflow_is_nonfinite_without_leaking_warning(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = validate_depth_map([[1e100, 2.0]])
+
+        self.assertEqual(caught, [])
+        self.assertTrue(np.isinf(result[0, 0]))
+        self.assertEqual(result[0, 1], 2.0)
+
+    def test_ragged_depth_uses_stable_invalid_depth_error(self):
+        with self.assertRaises(ObstacleDistanceError) as raised:
+            validate_depth_map([[1.0], [2.0, 3.0]])
+
+        self.assertEqual(raised.exception.code, ErrorCode.INVALID_DEPTH)
 
 
 class ScaledRoiTest(unittest.TestCase):
@@ -222,6 +252,17 @@ class IndoorDistanceTest(unittest.TestCase):
         self.assertIn("2", str(raised.exception))
         self.assertNotIn("99999", str(raised.exception))
         self.assertNotIn("[", str(raised.exception))
+
+    def test_huge_min_valid_pixels_is_not_rendered_in_error_message(self):
+        huge_minimum = 10**5000
+
+        with self.assertRaises(ObstacleDistanceError) as raised:
+            self.call_distance([[1.0]], min_valid_pixels=huge_minimum)
+
+        message = str(raised.exception)
+        self.assertEqual(raised.exception.code, ErrorCode.NO_VALID_DEPTH)
+        self.assertLess(len(message), 200)
+        self.assertNotIn("1" + ("0" * 5000), message)
 
     def test_rejects_invalid_percentile(self):
         for percentile in (-0.1, 100.1, math.nan, math.inf, -math.inf, "1", True):
