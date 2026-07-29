@@ -14,9 +14,12 @@ def _load_main_module():
     rclpy.executors = types.ModuleType("rclpy.executors")
     yaml = types.ModuleType("yaml")
     yaml.safe_load = mock.Mock()
-    with mock.patch.dict(
-        sys.modules,
-        {"rclpy": rclpy, "rclpy.executors": rclpy.executors, "yaml": yaml},
+    with (
+        mock.patch.object(sys, "path", [str(PERCEPTION_ROOT), *sys.path]),
+        mock.patch.dict(
+            sys.modules,
+            {"rclpy": rclpy, "rclpy.executors": rclpy.executors, "yaml": yaml},
+        ),
     ):
         spec = importlib.util.spec_from_file_location(
             "perception_main_lifecycle", PERCEPTION_ROOT / "main.py"

@@ -19,7 +19,6 @@ import json
 import logging
 import os
 import signal
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
@@ -34,11 +33,10 @@ import yaml
 import rclpy
 import rclpy.executors
 
-_PERCEPTION_ROOT = str(Path(__file__).resolve().parent)
-if _PERCEPTION_ROOT not in sys.path:
-    sys.path.insert(0, _PERCEPTION_ROOT)
-
-from plugin_dispatch import dispatch_plugin, full_tool_name
+if __package__:
+    from .plugin_dispatch import dispatch_plugin, full_tool_name
+else:
+    from plugin_dispatch import dispatch_plugin, full_tool_name
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
