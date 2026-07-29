@@ -57,6 +57,38 @@ def _find_transducer_files(model_root: Path) -> tuple[str, str, str] | None:
     return None
 
 
+def _prepare_hotwords_file(
+    hotwords_path: Path, tmp_dir: Path
+) -> tuple[Path, str]:
+    """把热词原文转成 sherpa bpe 模式可编码的逐字空格格式。
+
+    x-asr 的 tokens.txt 4000 个中文 token 全是 ▁X（▁+单字），没有裸字符。
+    bpe.model 整词编码会产出 tokens.txt 里没有的多字 piece（如 "尼模式"），
+    sherpa 直接丢弃。逐字喂入让 bpe 把每个字编码成 ▁X，230/234 可编码。
+
+    输入原文（hotwords.txt，每行一个短语）：
+        阻尼模式
+        举双手
+    输出（char-separated + :score）：
+        阻 尼 模 式 :2.0
+        举 双 手 :2.0
+
+    返回 (转换后文件路径, modeling_unit)。
+    """
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    out_path = tmp_dir / "hotwords_char_bpe.txt"
+    with hotwords_path.open("r", encoding="utf-8") as src, out_path.open(
+        "w", encoding="utf-8"
+    ) as dst:
+        for line in src:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            chars = list(line.replace(" ", ""))
+            dst.write(" ".join(chars) + " :2.0\n")
+    return out_path, "bpe"
+
+
 def _create_sherpa_recognizer(
     model_path: str,
     config: dict,
@@ -106,6 +138,37 @@ def _create_sherpa_recognizer(
         if method != "greedy_search":
             max_active = int(recognizer_config.get("maxActivePaths", 4))
             transducer_kwargs["max_active_paths"] = max_active
+
+        # hotwords 偏置：仅在 modified_beam_search 下生效（greedy 不走 context
+        # graph）。x-asr 的 tokens.txt 全是 ▁X 单字 token，整词 BPE 编码会失败，
+        # 所以把 hotwordsFile 原文转成逐字空格格式让 bpe 逐字编码。
+        hotwords_file = recognizer_config.get("hotwordsFile")
+        if hotwords_file and method != "greedy_search":
+            hw_path = Path(hotwords_file)
+            if not hw_path.is_absolute():
+                hw_path = model_root / hw_path
+            hw_path = hw_path.resolve()
+            if hw_path.is_file():
+                tmp_dir = Path("/tmp/asr_hotwords") if Path("/tmp").is_dir() else model_root.parent
+                encoded_path, modeling_unit = _prepare_hotwords_file(hw_path, tmp_dir)
+                transducer_kwargs["hotwords_file"] = str(encoded_path)
+                transducer_kwargs["hotwords_score"] = float(
+                    recognizer_config.get("hotwordsScore", 2.0)
+                )
+                transducer_kwargs["modeling_unit"] = modeling_unit
+                bpe_vocab = recognizer_config.get("bpeVocab")
+                if bpe_vocab:
+                    bpe_path = Path(bpe_vocab)
+                    if not bpe_path.is_absolute():
+                        bpe_path = model_root / bpe_path
+                    transducer_kwargs["bpe_vocab"] = str(bpe_path.resolve())
+                log.info(
+                    f"[asr-offline] hotwords enabled: {hw_path} "
+                    f"-> {encoded_path} (score={transducer_kwargs['hotwords_score']})"
+                )
+            else:
+                log.warning(f"[asr-offline] hotwordsFile not found: {hw_path}, skip")
+
         return sherpa_onnx.OfflineRecognizer.from_transducer(
             encoder=encoder,
             decoder=decoder,

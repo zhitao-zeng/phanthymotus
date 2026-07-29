@@ -21,12 +21,15 @@ OFFICIAL_PARAFORMER_FILES = (
 
 # x-asr-zipformer-transducer-zh-en-punct-int8-2026-06-03
 # transducer 三件套（encoder/decoder/joiner），需 asr_offline.py 的 transducer 分支
+# bpe.vocab + hotwords.txt 为 hotwords 偏置所需（asr_offline.py 加载时逐字编码）
 X_ASR_PUNCT_INT8_FILES = (
     "encoder-epoch-99-avg-1.int8.onnx",
     "decoder-epoch-99-avg-1.onnx",
     "joiner-epoch-99-avg-1.int8.onnx",
     "tokens.txt",
     "bpe.model",
+    "bpe.vocab",
+    "hotwords.txt",
 )
 
 

@@ -76,10 +76,11 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
-# ── Offline ASR model (x-asr-punct-int8 transducer + mbs(5)) ──
-# ARM 实测 1-CER 0.8013（mbs(5)），比 official_paraformer 0.6525 高 +15pt；
-# greedy 在 ARM case 0 临界崩塌，mbs(5) 消除跨平台漂移。
-# 详见 docs/current-state.md §x-asr transducer 调参结论。
+# ── Offline ASR model (x-asr-punct-int8 transducer + mbs(5) + hotwords) ──
+# ARM 实测 1-CER 0.8388（mbs(5)+hotwords），比 official_paraformer 0.6525 高 +18pt；
+# greedy 在 ARM case 0 临界崩塌，mbs(5) 消除跨平台漂移，hotwords 偏置机器人动作术语再 +3.8pt。
+# bpe.vocab + hotwords.txt 由 asr_model_downloader.py 随模型一起下载。
+# 详见 docs/current-state.md §x-asr hotwords 调参结论。
 ARG ASR_OFFLINE_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/x_asr_punct_int8
 COPY perception/utils/asr_model_downloader.py /tmp/asr_model_downloader.py
 RUN python3 /tmp/asr_model_downloader.py \
