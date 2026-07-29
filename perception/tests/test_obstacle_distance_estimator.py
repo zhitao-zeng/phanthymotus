@@ -484,6 +484,15 @@ class EstimatorInferenceTest(unittest.TestCase):
         self.assertEqual(result.error_code, ErrorCode.TIMEOUT.value)
         self.assertTrue(result.fallback)
 
+    def test_success_latency_reuses_final_deadline_check_time(self):
+        result = self.make_estimator(
+            monotonic=_Clock([10.0, 10.0, 10.5, 11.5, 99.0]),
+        ).estimate(b"rgb", scene_hint="indoor")
+
+        self.assertEqual(result.status, "ok")
+        self.assertAlmostEqual(result.latency_ms, 1500.0)
+        self.assertLess(result.latency_ms, 2000.0)
+
     def test_segmentation_output_must_be_bounded_instance_sequence(self):
         invalid_outputs = (
             "car",
@@ -513,7 +522,7 @@ class EstimatorInferenceTest(unittest.TestCase):
             scene_hint="indoor",
             timestamp=123.5,
         )
-        self.assertEqual(result.latency_ms, 0.0)
+        self.assertAlmostEqual(result.latency_ms, 100.0)
         self.assertEqual(result.timestamp, 123.5)
 
     def test_diagnostic_mode_is_explicit_and_skips_backends(self):
@@ -571,6 +580,33 @@ class EstimatorTimeBoundaryTest(unittest.TestCase):
         self.assertEqual(result.timestamp, 0.0)
         self.assertEqual(result.latency_ms, 0.0)
         self.assertNotIn(secret, repr(result))
+
+    def test_input_and_scene_errors_take_priority_without_reading_clock(self):
+        secret = "private-clock-must-not-run"
+        cases = (
+            (b"", {"scene_hint": "indoor"}, ErrorCode.INVALID_IMAGE),
+            (b"rgb", {}, ErrorCode.MISSING_SCENE),
+        )
+        for image_bytes, estimate_kwargs, expected_code in cases:
+            calls = []
+
+            def failing_monotonic():
+                calls.append(True)
+                raise RuntimeError(secret)
+
+            with self.subTest(expected_code=expected_code):
+                result = self.make_estimator(
+                    monotonic=failing_monotonic,
+                    wall_time=lambda: (_ for _ in ()).throw(
+                        AssertionError("wall_time must not be called")
+                    ),
+                ).estimate(image_bytes, **estimate_kwargs)
+
+                self.assertEqual(result.error_code, expected_code.value)
+                self.assertEqual(result.timestamp, 0.0)
+                self.assertEqual(result.latency_ms, 0.0)
+                self.assertEqual(calls, [])
+                self.assertNotIn(secret, repr(result))
 
     def test_initial_monotonic_must_be_finite_real_and_not_bool(self):
         for value in (True, math.nan, math.inf, -math.inf, "private-clock"):
