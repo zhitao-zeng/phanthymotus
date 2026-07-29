@@ -524,7 +524,21 @@ class _ASRNode(Node):
                   self._vad_pre_roll_ms, self._vad_model_dir, self._kws_cfg),
             daemon=True, name="vad_worker",
         )
-        self._vad_proc.start()
+        # Fork barrier: if another instance's worker thread is mid-inference,
+        # onnxruntime holds internal mutexes that fork() would inherit locked
+        # → VAD child deadlocks (3-10% timeout pattern, see
+        # docs/session-2026-07-28.md §3). Acquiring the shared adapter's
+        # decode_lock blocks until any in-flight transcribe() finishes, so
+        # fork() lands when onnxruntime is idle. acquire+release is a no-op
+        # when no one holds the lock.
+        decode_lock = getattr(self._adapter, "_decode_lock", None)
+        if decode_lock is not None:
+            decode_lock.acquire()
+        try:
+            self._vad_proc.start()
+        finally:
+            if decode_lock is not None:
+                decode_lock.release()
         log.info(f"[asr] VAD worker process started (pid={self._vad_proc.pid}, rss={_rss_mb():.0f}MB)")
         # Verify VAD worker is alive before returning "running" to caller.
         # A dead VAD worker silently drops all audio — fail fast so the
