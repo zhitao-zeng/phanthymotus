@@ -245,11 +245,13 @@ def _build_report(
             ground_truth,
             predictions,
             failed=failures,
+            ground_truth_threshold_m=threshold_m,
         )
     except ValueError:
         best_threshold = None
     else:
         best_threshold = {
+            "ground_truth_threshold_m": threshold_m,
             "threshold_m": scan.threshold_m,
             "metrics": asdict(scan.metrics),
         }
@@ -299,7 +301,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--constant-distance-m", type=float)
     parser.add_argument("--backend-factory")
     parser.add_argument("--config", type=Path)
-    parser.add_argument("--threshold-m", type=float)
+    parser.add_argument(
+        "--threshold-m",
+        type=float,
+        help=(
+            "fixed ground-truth cutoff for F1; best-threshold scanning "
+            "varies only the prediction cutoff"
+        ),
+    )
     parser.add_argument("--output", type=Path)
     return parser
 

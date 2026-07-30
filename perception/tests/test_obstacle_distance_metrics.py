@@ -204,7 +204,13 @@ class EvaluationMetricsTest(unittest.TestCase):
 
 class ThresholdScanTest(unittest.TestCase):
     @staticmethod
-    def _brute_scan(gt, pred, failed):
+    def _brute_scan(
+        gt,
+        pred,
+        failed,
+        *,
+        ground_truth_threshold_m=1.0,
+    ):
         valid_predictions = [
             value
             for value, is_failed in zip(pred, failed, strict=True)
@@ -229,24 +235,80 @@ class ThresholdScanTest(unittest.TestCase):
         if math.isfinite(upper):
             candidates.append(upper)
 
-        results = [
-            ThresholdScanResult(
-                threshold,
-                evaluate_predictions(
+        baseline = evaluate_predictions(
+            gt,
+            pred,
+            ground_truth_threshold_m,
+            failed=failed,
+        )
+        results = []
+        for threshold in dict.fromkeys(candidates):
+            valid_records = [
+                (truth, prediction)
+                for truth, prediction, is_failed in zip(
                     gt,
                     pred,
-                    threshold,
-                    failed=failed,
-                ),
+                    failed,
+                    strict=True,
+                )
+                if not is_failed
+                and isinstance(prediction, (int, float))
+                and not isinstance(prediction, bool)
+                and math.isfinite(prediction)
+                and prediction >= 0
+            ]
+            tp = sum(
+                truth < ground_truth_threshold_m
+                and prediction < threshold
+                for truth, prediction in valid_records
             )
-            for threshold in dict.fromkeys(candidates)
-        ]
+            fp = sum(
+                truth >= ground_truth_threshold_m
+                and prediction < threshold
+                for truth, prediction in valid_records
+            )
+            fn = sum(
+                truth < ground_truth_threshold_m
+                and prediction >= threshold
+                for truth, prediction in valid_records
+            )
+            precision = tp / (tp + fp) if tp + fp else 0.0
+            recall = tp / (tp + fn) if tp + fn else 0.0
+            f1 = (
+                2.0 * precision * recall / (precision + recall)
+                if precision + recall
+                else 0.0
+            )
+            results.append(
+                ThresholdScanResult(
+                    threshold,
+                    EvaluationMetrics(
+                        samples=baseline.samples,
+                        valid_predictions=baseline.valid_predictions,
+                        failures=baseline.failures,
+                        failure_rate=baseline.failure_rate,
+                        tp=tp,
+                        fp=fp,
+                        fn=fn,
+                        precision=precision,
+                        recall=recall,
+                        f1=f1,
+                        rmse=baseline.rmse,
+                        positive_rate=sum(
+                            truth < ground_truth_threshold_m for truth in gt
+                        )
+                        / len(gt),
+                    ),
+                )
+            )
         return max(
             results,
             key=lambda result: (
                 result.metrics.f1,
                 result.metrics.precision,
-                -abs(result.threshold_m - 1.0),
+                -abs(
+                    result.threshold_m - ground_truth_threshold_m
+                ),
                 -result.threshold_m,
             ),
         )
@@ -266,7 +328,37 @@ class ThresholdScanTest(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             result.threshold_m = 2.0
 
-    def test_ties_prefer_precision_then_distance_to_one_then_smaller(self):
+    def test_scan_keeps_ground_truth_labels_fixed_at_one_meter(self):
+        result = scan_thresholds(
+            [0.1, 0.5],
+            [0.1, 0.1],
+        )
+
+        self.assertEqual((result.metrics.tp, result.metrics.fp), (2, 0))
+        self.assertEqual(result.metrics.f1, 1.0)
+        self.assertEqual(result.metrics.positive_rate, 1.0)
+
+    def test_scan_accepts_an_explicit_fixed_ground_truth_threshold(self):
+        result = scan_thresholds(
+            [0.1, 0.5],
+            [0.1, 0.1],
+            ground_truth_threshold_m=0.25,
+        )
+
+        self.assertEqual((result.metrics.tp, result.metrics.fp), (1, 1))
+        self.assertAlmostEqual(result.metrics.f1, 2 / 3)
+        self.assertEqual(result.metrics.positive_rate, 0.5)
+
+        for invalid in (0, -1, math.nan, math.inf, True, "1"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    scan_thresholds(
+                        [0.1],
+                        [0.1],
+                        ground_truth_threshold_m=invalid,
+                    )
+
+    def test_ties_prefer_precision_then_distance_to_cutoff_then_smaller(self):
         precision_winner = scan_thresholds(
             [0.1, 2.0, 2.0, 0.1],
             [0.2, 0.4, 0.6, 0.8],
@@ -278,10 +370,17 @@ class ThresholdScanTest(unittest.TestCase):
         self.assertEqual(distance_winner.threshold_m, 2.0)
 
         smaller_winner = scan_thresholds(
-            [0.2, 0.2, 0.8, 0.8, 1.6, 1.6],
-            [0.2, 0.4, 0.8, 1.2, 1.6, 1.8],
+            [2.0, 2.0, 2.0],
+            [0.0, 1.0, 2.0],
         )
-        self.assertAlmostEqual(smaller_winner.threshold_m, 0.6)
+        self.assertEqual(smaller_winner.threshold_m, 0.5)
+
+        custom_anchor_winner = scan_thresholds(
+            [2.0, 2.0, 2.0],
+            [0.0, 0.25, 0.5],
+            ground_truth_threshold_m=0.25,
+        )
+        self.assertEqual(custom_anchor_winner.threshold_m, 0.125)
 
     def test_scan_ignores_failures_and_rejects_no_valid_prediction(self):
         result = scan_thresholds(
@@ -512,6 +611,54 @@ class EvaluationCliTest(unittest.TestCase):
                 "timestamp",
             ):
                 self.assertIn(result_field, prediction)
+
+    def test_cli_uses_threshold_m_as_the_fixed_ground_truth_cutoff(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "first.bin").write_bytes(b"rgb")
+            (root / "second.bin").write_bytes(b"rgb")
+            manifest = self._write_manifest(
+                root,
+                [
+                    {
+                        "image_path": "first.bin",
+                        "scene": "indoor",
+                        "gt_distance_m": "0.1",
+                    },
+                    {
+                        "image_path": "second.bin",
+                        "scene": "indoor",
+                        "gt_distance_m": "0.5",
+                    },
+                ],
+            )
+            output = root / "report.json"
+
+            exit_code = evaluate_obstacle_distance.main(
+                [
+                    "--manifest",
+                    str(manifest),
+                    "--mode",
+                    "diagnostic_constant",
+                    "--constant-distance-m",
+                    "0.1",
+                    "--threshold-m",
+                    "0.25",
+                    "--output",
+                    str(output),
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            best = json.loads(output.read_text(encoding="utf-8"))[
+                "best_threshold"
+            ]
+            self.assertEqual(
+                (best["metrics"]["tp"], best["metrics"]["fp"]),
+                (1, 1),
+            )
+            self.assertEqual(best["metrics"]["positive_rate"], 0.5)
+            self.assertEqual(best["ground_truth_threshold_m"], 0.25)
 
     def test_missing_image_becomes_failed_fallback_and_batch_continues(self):
         with tempfile.TemporaryDirectory() as temp_dir:

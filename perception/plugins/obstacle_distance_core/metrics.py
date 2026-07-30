@@ -221,7 +221,14 @@ def scan_thresholds(
     gt: object,
     pred: object,
     failed: object | None = None,
+    *,
+    ground_truth_threshold_m: object = 1.0,
 ) -> ThresholdScanResult:
+    ground_truth_threshold = _finite_real(
+        ground_truth_threshold_m,
+        name="ground_truth_threshold_m",
+        positive=True,
+    )
     ground_truth, predictions, _ = _validated_inputs(
         gt,
         pred,
@@ -243,21 +250,16 @@ def scan_thresholds(
         raise ValueError("threshold scan requires a valid prediction")
 
     candidates = _threshold_candidates(valid_predictions)
-    truth_events = sorted(
-        (truth, index)
-        for index, (truth, _) in enumerate(valid_records)
-    )
     prediction_events = sorted(
         (prediction, index)
         for index, (_, prediction) in enumerate(valid_records)
     )
-    sorted_ground_truth = sorted(ground_truth)
-    truth_positive = [False] * len(valid_records)
-    prediction_positive = [False] * len(valid_records)
-    truth_event_index = 0
+    truth_positive = [
+        truth < ground_truth_threshold for truth, _ in valid_records
+    ]
     prediction_event_index = 0
-    ground_truth_index = 0
-    tp = fp = fn = 0
+    tp = fp = 0
+    fn = sum(truth_positive)
 
     errors = [
         prediction - truth for truth, prediction in valid_records
@@ -266,41 +268,25 @@ def scan_thresholds(
     valid_count = len(valid_records)
     failures = samples - valid_count
     rmse = _stable_rmse(errors)
+    positive_rate = (
+        sum(truth < ground_truth_threshold for truth in ground_truth)
+        / samples
+    )
 
     best: ThresholdScanResult | None = None
     best_key: tuple[float, float, float, float] | None = None
     for threshold in candidates:
         while (
-            truth_event_index < valid_count
-            and truth_events[truth_event_index][0] < threshold
-        ):
-            _, index = truth_events[truth_event_index]
-            truth_positive[index] = True
-            if prediction_positive[index]:
-                fp -= 1
-                tp += 1
-            else:
-                fn += 1
-            truth_event_index += 1
-
-        while (
             prediction_event_index < valid_count
             and prediction_events[prediction_event_index][0] < threshold
         ):
             _, index = prediction_events[prediction_event_index]
-            prediction_positive[index] = True
             if truth_positive[index]:
                 fn -= 1
                 tp += 1
             else:
                 fp += 1
             prediction_event_index += 1
-
-        while (
-            ground_truth_index < samples
-            and sorted_ground_truth[ground_truth_index] < threshold
-        ):
-            ground_truth_index += 1
 
         precision = tp / (tp + fp) if tp + fp else 0.0
         recall = tp / (tp + fn) if tp + fn else 0.0
@@ -321,12 +307,12 @@ def scan_thresholds(
             recall=recall,
             f1=f1,
             rmse=rmse,
-            positive_rate=ground_truth_index / samples,
+            positive_rate=positive_rate,
         )
         key = (
             metrics.f1,
             metrics.precision,
-            -abs(threshold - 1.0),
+            -abs(threshold - ground_truth_threshold),
             -threshold,
         )
         if best_key is None or key > best_key:
