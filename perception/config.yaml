@@ -79,3 +79,33 @@ plugins:
       global_pass: true
       dedup_iou: 0.5
       dedup_text_similarity: 0.8
+
+  obstacle_distance:
+    enabled: false
+    mode: model
+    backend_factory: ""
+    scene_mode: metadata
+    fixed_scene: ""
+    depth_backend: lifelong_nk
+    segmentation_backend: yolo26n_seg
+    depth_model_dir: /models/obstacle-distance/lifelong-nk
+    segmentation_model_dir: /models/obstacle-distance/yolo26n-seg
+    decision_threshold_m: 1.0
+    fallback_distance_m: 3.0
+    soft_timeout_s: 2.5
+    min_interval_ms: 0
+    indoor:
+      roi: [0, 300, 213, 426]
+      min_depth_m: 0.3
+      max_depth_m: 10.0
+      percentile: 1.0
+      min_valid_pixels: 64
+    vehicle:
+      allowed_classes: [person, car, truck, bus, motorcycle, bicycle]
+      min_confidence: 0.25
+      percentile: 1.0
+      min_depth_m: 0.3
+      max_depth_m: 80.0
+      camera_to_bumper_offset_m: 1.0
+      allow_approximate_geometry: false
+      calibration: {}

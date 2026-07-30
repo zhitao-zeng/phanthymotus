@@ -2,6 +2,10 @@
 
 Modular ASR/TTS perception plugins running as an MCP HTTP server. Connects to Agent Core via MCP tool calls and exchanges audio/text over ROS2 DDS topics.
 
+## Obstacle Distance
+
+模型交接、配置、ROS/MCP 调用和离线验收见[障碍物距离模型交接](docs/obstacle_distance.md)。
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.
