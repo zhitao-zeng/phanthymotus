@@ -343,8 +343,15 @@ ${PYTHON} \
 字段。
 
 任何 `fallback: true` 的预测都标为失败，不进入 RMSE，也不进入有效预测的
-precision/recall/F1 计数；失败率单独报告。`best_threshold` 只使用有效预测，阈值扫描
-通过排序事件实现 O(n log n)，不是对每个候选重新全量扫描。
+precision/recall/F1 计数；失败率单独报告。`--threshold-m` 默认沿用配置中的
+`decision_threshold_m`（默认 `1.0 m`）：`overall` 和分组指标用它同时判定真值与预测，
+而 `best_threshold` 扫描始终用它固定真值正例标签，只改变预测阈值，避免扫描时改写
+F1@1m 的真值定义。`best_threshold.ground_truth_threshold_m` 记录该固定真值阈值，
+`best_threshold.threshold_m` 是选出的预测阈值。
+
+`best_threshold` 只使用有效预测，阈值扫描通过排序事件实现 O(n log n)，不是对每个
+候选重新全量扫描。F1 相同时依次优先 precision 更高、预测阈值更接近固定真值阈值、
+预测阈值更小。
 
 ## 7. 外部模型目录与挂载
 
