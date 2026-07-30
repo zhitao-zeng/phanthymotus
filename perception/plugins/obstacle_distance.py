@@ -246,15 +246,32 @@ class _ObstacleDistanceNode(Node):
                     _CAMERA_QOS,
                 )
             self.state = "running"
-            worker = threading.Thread(
-                target=self._worker,
-                args=(generation, stop_event, frame_queue),
-                daemon=True,
-                name=f"{self.name}_worker",
-            )
-            self._worker_thread = worker
-            self._worker_threads.append(worker)
-            worker.start()
+            worker = None
+            try:
+                worker = threading.Thread(
+                    target=self._worker,
+                    args=(generation, stop_event, frame_queue),
+                    daemon=True,
+                    name=f"{self.name}_worker",
+                )
+                self._worker_thread = worker
+                self._worker_threads.append(worker)
+                worker.start()
+            except Exception:
+                self.state = "idle"
+                self._generation += 1
+                stop_event.set()
+                self._clear_queue(frame_queue)
+                if worker is not None:
+                    self._worker_threads = [
+                        item
+                        for item in self._worker_threads
+                        if item is not worker
+                    ]
+                self._worker_thread = None
+                raise RuntimeError(
+                    "obstacle distance worker could not start"
+                ) from None
             return self._status_dict()
 
     @staticmethod
@@ -410,22 +427,18 @@ class _ObstacleDistanceNode(Node):
                 allow_nan=False,
             )
 
-    def _publish_if_active(
+    def _publish_is_authorized(
         self,
         generation: int,
         stop_event: threading.Event,
-        message: String,
     ) -> bool:
         with self._lifecycle_lock:
-            if (
+            return not (
                 self.state != "running"
                 or self._generation != generation
                 or self._stop_event is not stop_event
                 or stop_event.is_set()
-            ):
-                return False
-            self._pub.publish(message)
-            return True
+            )
 
     def _worker(
         self,
@@ -456,9 +469,16 @@ class _ObstacleDistanceNode(Node):
 
             if not self._is_generation_active(generation, stop_event):
                 continue
-            message = String()
-            message.data = self._serialized_result(result, timestamp)
-            if not self._publish_if_active(generation, stop_event, message):
+            try:
+                message = String()
+                message.data = self._serialized_result(result, timestamp)
+                if not self._publish_is_authorized(
+                    generation, stop_event
+                ):
+                    continue
+                self._pub.publish(message)
+            except Exception:
+                log.error("obstacle distance result publication failed")
                 continue
 
             if self._min_interval > 0:
@@ -586,8 +606,33 @@ class ObstacleDistancePlugin:
         identity = id(node)
         if identity not in executor_nodes:
             return
+        try:
+            removed = self._executor.remove_node(node)
+        except Exception:
+            raise RuntimeError(
+                "obstacle distance executor removal failed"
+            ) from None
+        if removed is False:
+            raise RuntimeError("obstacle distance executor removal failed")
         executor_nodes.pop(identity, None)
-        self._executor.remove_node(node)
+
+    def _remember_retired(self, node: _ObstacleDistanceNode) -> None:
+        if node not in self._retired_nodes:
+            self._retired_nodes.append(node)
+
+    def _destroy_unregistered_node(
+        self, node: _ObstacleDistanceNode
+    ) -> None:
+        identity = id(node)
+        try:
+            destroyed = node.destroy_node()
+            if destroyed is False:
+                raise RuntimeError("node destruction returned false")
+        except Exception:
+            log.error("obstacle distance node destruction failed")
+            self._remember_retired(node)
+            return
+        self._destroyed_node_ids.add(identity)
 
     def _retire_node(self, node_key: str) -> None:
         node = self._nodes.pop(node_key)
@@ -597,8 +642,7 @@ class ObstacleDistancePlugin:
             try:
                 self._remove_executor_node(node)
             finally:
-                if node not in self._retired_nodes:
-                    self._retired_nodes.append(node)
+                self._remember_retired(node)
 
     def _configure_node(
         self,
@@ -649,14 +693,45 @@ class ObstacleDistancePlugin:
                 decision_threshold_m=decision_threshold,
             )
             node._instance_id = instance_id
-            self._executor.add_node(node)
+            try:
+                added = self._executor.add_node(node)
+                if added is False:
+                    raise RuntimeError("executor add returned false")
+            except Exception:
+                self._destroy_unregistered_node(node)
+                raise RuntimeError(
+                    "obstacle distance executor add failed"
+                ) from None
             self._executor_nodes[id(node)] = node
             self._nodes[node_key] = node
             existing = node
-        elif existing._scene_hint != scene:
+            created = True
+        else:
+            created = False
+        if not created and existing._scene_hint != scene:
             existing.stop()
             self._configure_node(existing, instance_id, scene)
-        return existing.start()
+        try:
+            return existing.start()
+        except Exception:
+            if created:
+                self._nodes.pop(node_key, None)
+                try:
+                    existing.stop()
+                except Exception:
+                    log.error(
+                        "obstacle distance failed node stop failed"
+                    )
+                try:
+                    self._remove_executor_node(existing)
+                except Exception:
+                    log.error(
+                        "obstacle distance executor removal failed"
+                    )
+                self._remember_retired(existing)
+            raise RuntimeError(
+                "obstacle distance node could not start"
+            ) from None
 
     def _stop(self, args: Mapping) -> dict:
         instance_id = args.get("instance_id", "")
@@ -669,7 +744,7 @@ class ObstacleDistancePlugin:
             try:
                 node.stop()
             except Exception:
-                log.exception("obstacle distance node stop failed")
+                log.error("obstacle distance node stop failed")
         return {"state": "idle"}
 
     def _info(self, args: Mapping) -> dict:
@@ -780,7 +855,7 @@ class ObstacleDistancePlugin:
                 try:
                     node.stop()
                 except Exception:
-                    log.exception("obstacle distance shutdown stop failed")
+                    log.error("obstacle distance shutdown stop failed")
 
     def destroy_nodes(self) -> None:
         with self._lifecycle_lock:
@@ -789,23 +864,33 @@ class ObstacleDistancePlugin:
             )
             destroyed = getattr(self, "_destroyed_node_ids", set())
             self._destroyed_node_ids = destroyed
+            pending = []
             for node in nodes:
-                try:
-                    node.stop()
-                except Exception:
-                    log.exception("obstacle distance final stop failed")
-                try:
-                    self._remove_executor_node(node)
-                except Exception:
-                    log.exception("obstacle distance executor removal failed")
                 identity = id(node)
                 if identity in destroyed:
                     continue
-                destroyed.add(identity)
                 try:
-                    node.destroy_node()
+                    node.stop()
                 except Exception:
-                    log.exception("obstacle distance node destruction failed")
+                    log.error("obstacle distance final stop failed")
+                    pending.append(node)
+                    continue
+                try:
+                    self._remove_executor_node(node)
+                except Exception:
+                    log.error("obstacle distance executor removal failed")
+                    pending.append(node)
+                    continue
+                try:
+                    result = node.destroy_node()
+                    if result is False:
+                        raise RuntimeError(
+                            "node destruction returned false"
+                        )
+                except Exception:
+                    log.error("obstacle distance node destruction failed")
+                    pending.append(node)
+                    continue
+                destroyed.add(identity)
             self._nodes.clear()
-            self._retired_nodes.clear()
-            getattr(self, "_executor_nodes", {}).clear()
+            self._retired_nodes = self._unique_nodes(pending)

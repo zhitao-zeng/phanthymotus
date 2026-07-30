@@ -382,6 +382,108 @@ class ObstacleDistanceNodeTest(unittest.TestCase):
         self.assertTrue(payloads[0]["fallback"])
         self.assertEqual(payloads[1]["distance_m"], 2.0)
 
+    def test_result_pipeline_failure_drops_one_frame_and_worker_continues(self):
+        for failure_point in ("serialize", "publish"):
+            with self.subTest(failure_point=failure_point):
+                node = self._node()
+                if failure_point == "serialize":
+                    original = node._serialized_result
+                    effects = [
+                        RuntimeError("secret serialization failure"),
+                        lambda result, timestamp: original(result, timestamp),
+                    ]
+
+                    def serialize(result, timestamp):
+                        effect = effects.pop(0)
+                        if isinstance(effect, Exception):
+                            raise effect
+                        return effect(result, timestamp)
+
+                    node._serialized_result = mock.Mock(side_effect=serialize)
+                else:
+                    node._pub.publish.side_effect = [
+                        RuntimeError("secret publish failure"),
+                        None,
+                    ]
+
+                node.start()
+                try:
+                    with self.assertLogs(
+                        "plugins.obstacle_distance", level="ERROR"
+                    ) as captured:
+                        node._image_cb(types.SimpleNamespace(data=b"frame1"))
+                        expected_calls = 0 if failure_point == "serialize" else 1
+                        self.assertTrue(
+                            _wait_for(
+                                lambda: (
+                                    node._serialized_result.call_count >= 1
+                                    if failure_point == "serialize"
+                                    else node._pub.publish.call_count >= expected_calls
+                                )
+                            )
+                        )
+                    self.assertNotIn("secret", "\n".join(captured.output))
+                    node._image_cb(types.SimpleNamespace(data=b"frame2"))
+                    expected_publishes = (
+                        1 if failure_point == "serialize" else 2
+                    )
+                    self.assertTrue(
+                        _wait_for(
+                            lambda: (
+                                node._pub.publish.call_count
+                                >= expected_publishes
+                            )
+                        )
+                    )
+                    self.assertTrue(node.worker_alive)
+                finally:
+                    node.stop()
+
+    def test_blocking_publisher_does_not_block_stop_state_transition(self):
+        entered = threading.Event()
+        release = threading.Event()
+        node = self._node()
+
+        def publish(_message):
+            entered.set()
+            release.wait(timeout=1)
+
+        node._pub.publish.side_effect = publish
+        node.start()
+        node._image_cb(types.SimpleNamespace(data=b"frame"))
+        self.assertTrue(entered.wait(timeout=1))
+        worker = node._worker_thread
+        try:
+            with mock.patch.object(worker, "join", return_value=None):
+                started = time.monotonic()
+                status = node.stop()
+                elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            self.assertTrue(_wait_for(lambda: not worker.is_alive()))
+
+        self.assertLess(elapsed, 0.2)
+        self.assertEqual(status["state"], "idle")
+        self.assertTrue(node._stop_event.is_set())
+
+    def test_worker_start_failure_rolls_back_node_state_without_secret(self):
+        node = self._node()
+        worker = mock.Mock()
+        worker.start.side_effect = RuntimeError("secret worker failure")
+        worker.is_alive.return_value = False
+
+        with mock.patch.object(
+            self.plugin_module.threading, "Thread", return_value=worker
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                node.start()
+
+        self.assertNotIn("secret", str(raised.exception))
+        self.assertEqual(node.state, "idle")
+        self.assertTrue(node._stop_event.is_set())
+        self.assertIsNone(node._worker_thread)
+        self.assertEqual(node._worker_threads, [])
+
     def test_callback_and_json_never_emit_nonfinite_values(self):
         node = self._node()
         node.start()
@@ -630,6 +732,105 @@ class ObstacleDistancePluginLifecycleTest(unittest.TestCase):
         self.assertEqual(plugin._nodes, {})
         self.assertEqual(plugin._retired_nodes, [])
 
+    def test_cleanup_retries_transient_remove_and_destroy_failures(self):
+        plugin = object.__new__(self.plugin_module.ObstacleDistancePlugin)
+        plugin._lifecycle_lock = threading.RLock()
+        plugin._executor = mock.Mock()
+        remove_retry = mock.Mock(name="remove_retry")
+        destroy_retry = mock.Mock(name="destroy_retry")
+        healthy = mock.Mock(name="healthy")
+        nodes = [remove_retry, destroy_retry, healthy]
+        plugin._nodes = {str(index): node for index, node in enumerate(nodes)}
+        plugin._retired_nodes = []
+        plugin._executor_nodes = {id(node): node for node in nodes}
+        plugin._destroyed_node_ids = set()
+        remove_attempts = {id(node): 0 for node in nodes}
+
+        def remove(node):
+            remove_attempts[id(node)] += 1
+            if node is remove_retry and remove_attempts[id(node)] == 1:
+                raise RuntimeError("secret remove failure")
+            return True
+
+        plugin._executor.remove_node.side_effect = remove
+        destroy_retry.destroy_node.side_effect = [
+            RuntimeError("secret destroy failure"),
+            True,
+        ]
+
+        with self.assertLogs(
+            "plugins.obstacle_distance", level="ERROR"
+        ) as captured:
+            plugin.destroy_nodes()
+
+        self.assertNotIn("secret", "\n".join(captured.output))
+        self.assertIn(id(remove_retry), plugin._executor_nodes)
+        remove_retry.destroy_node.assert_not_called()
+        self.assertNotIn(id(destroy_retry), plugin._executor_nodes)
+        self.assertIn(remove_retry, plugin._retired_nodes)
+        self.assertIn(destroy_retry, plugin._retired_nodes)
+        healthy.destroy_node.assert_called_once_with()
+
+        plugin.destroy_nodes()
+
+        self.assertEqual(plugin._executor_nodes, {})
+        self.assertEqual(plugin._retired_nodes, [])
+        remove_retry.destroy_node.assert_called_once_with()
+        self.assertEqual(destroy_retry.destroy_node.call_count, 2)
+
+    def test_executor_add_failure_destroys_new_node_without_leaking_secret(self):
+        executor = mock.Mock()
+        executor.add_node.side_effect = RuntimeError("secret add failure")
+        plugin = self.plugin_module.ObstacleDistancePlugin(
+            _diagnostic_config(), executor
+        )
+        node = mock.Mock()
+        node.destroy_node.return_value = True
+
+        with mock.patch.object(
+            self.plugin_module, "_ObstacleDistanceNode", return_value=node
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                plugin.dispatch(
+                    "start",
+                    {"input_topic": "/camera", "scene_hint": "indoor"},
+                )
+
+        self.assertNotIn("secret", str(raised.exception))
+        node.destroy_node.assert_called_once_with()
+        self.assertEqual(plugin._nodes, {})
+        self.assertEqual(plugin._executor_nodes, {})
+        self.assertEqual(plugin._retired_nodes, [])
+
+    def test_new_node_start_failure_is_removed_and_retired_for_cleanup(self):
+        executor = mock.Mock()
+        plugin = self.plugin_module.ObstacleDistancePlugin(
+            _diagnostic_config(), executor
+        )
+        node = mock.Mock(
+            _input_topic="/camera",
+            _scene_hint="indoor",
+            state="idle",
+        )
+        node.start.side_effect = RuntimeError("secret start failure")
+
+        with mock.patch.object(
+            self.plugin_module, "_ObstacleDistanceNode", return_value=node
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                plugin.dispatch(
+                    "start",
+                    {"input_topic": "/camera", "scene_hint": "indoor"},
+                )
+
+        self.assertNotIn("secret", str(raised.exception))
+        executor.remove_node.assert_called_once_with(node)
+        self.assertEqual(plugin._nodes, {})
+        self.assertEqual(plugin._executor_nodes, {})
+        self.assertEqual(plugin._retired_nodes, [node])
+        plugin.destroy_nodes()
+        node.destroy_node.assert_called_once_with()
+
     def test_config_validates_fields_stops_running_node_and_changes_threshold(self):
         plugin = self.plugin_module.ObstacleDistancePlugin(
             _diagnostic_config(), mock.Mock()
@@ -712,10 +913,16 @@ class ObstacleDistancePluginLifecycleTest(unittest.TestCase):
         with self.assertLogs("plugins.obstacle_distance", level="ERROR"):
             plugin.prepare_shutdown()
             plugin.destroy_nodes()
-        plugin.destroy_nodes()
 
         healthy.stop.assert_called()
         healthy.destroy_node.assert_called_once_with()
+        broken.destroy_node.assert_not_called()
+        self.assertEqual(plugin._retired_nodes, [broken])
+
+        broken.stop.side_effect = None
+        broken.destroy_node.side_effect = None
+        plugin.destroy_nodes()
+
         broken.destroy_node.assert_called_once_with()
         self.assertEqual(plugin._nodes, {})
         self.assertEqual(plugin._retired_nodes, [])
