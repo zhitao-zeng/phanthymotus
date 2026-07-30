@@ -466,6 +466,51 @@ class ObstacleDistanceNodeTest(unittest.TestCase):
         self.assertEqual(status["state"], "idle")
         self.assertTrue(node._stop_event.is_set())
 
+    def test_stop_cancels_publish_after_initial_gate_check(self):
+        at_final_check = threading.Barrier(2)
+        release_final_check = threading.Barrier(2)
+        node = self._node()
+        node.start()
+        worker = node._worker_thread
+        stop_event = node._stop_event
+        original_is_set = stop_event.is_set
+
+        def pause_before_final_check():
+            caller = sys._getframe(1).f_code.co_name
+            if (
+                threading.current_thread() is worker
+                and caller == "_publish_if_active"
+            ):
+                at_final_check.wait(timeout=1)
+                release_final_check.wait(timeout=1)
+            return original_is_set()
+
+        stop_event.is_set = pause_before_final_check
+        try:
+            node._image_cb(types.SimpleNamespace(data=b"frame"))
+            try:
+                at_final_check.wait(timeout=1)
+            except threading.BrokenBarrierError:
+                self.fail(
+                    "worker did not reach the final publish cancellation check"
+                )
+
+            with mock.patch.object(worker, "join", return_value=None):
+                status = node.stop()
+            release_final_check.wait(timeout=1)
+            self.assertTrue(_wait_for(lambda: not worker.is_alive()))
+        finally:
+            for barrier in (at_final_check, release_final_check):
+                try:
+                    barrier.abort()
+                except threading.BrokenBarrierError:
+                    pass
+            if node.state == "running":
+                node.stop()
+
+        self.assertEqual(status["state"], "idle")
+        self.assertEqual(node._pub.publish.call_count, 0)
+
     def test_worker_start_failure_rolls_back_node_state_without_secret(self):
         node = self._node()
         worker = mock.Mock()

@@ -191,6 +191,7 @@ class _ObstacleDistanceNode(Node):
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self._queue_lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
+        self._publish_gate = threading.Lock()
         self._stop_event = threading.Event()
         self._stop_event.set()
         self._generation = 0
@@ -427,18 +428,26 @@ class _ObstacleDistanceNode(Node):
                 allow_nan=False,
             )
 
-    def _publish_is_authorized(
+    def _publish_if_active(
         self,
+        message: String,
         generation: int,
         stop_event: threading.Event,
     ) -> bool:
-        with self._lifecycle_lock:
-            return not (
-                self.state != "running"
-                or self._generation != generation
-                or self._stop_event is not stop_event
-                or stop_event.is_set()
-            )
+        with self._publish_gate:
+            with self._lifecycle_lock:
+                if (
+                    self.state != "running"
+                    or self._generation != generation
+                    or self._stop_event is not stop_event
+                ):
+                    return False
+            # An external publish already in progress cannot be cancelled.
+            # This final token check prevents starting one after stop().
+            if stop_event.is_set():
+                return False
+            self._pub.publish(message)
+            return True
 
     def _worker(
         self,
@@ -472,11 +481,7 @@ class _ObstacleDistanceNode(Node):
             try:
                 message = String()
                 message.data = self._serialized_result(result, timestamp)
-                if not self._publish_is_authorized(
-                    generation, stop_event
-                ):
-                    continue
-                self._pub.publish(message)
+                self._publish_if_active(message, generation, stop_event)
             except Exception:
                 log.error("obstacle distance result publication failed")
                 continue
