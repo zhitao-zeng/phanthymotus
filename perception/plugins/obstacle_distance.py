@@ -501,6 +501,11 @@ class ObstacleDistancePlugin:
         self._depth_backend, self._segmentation_backend = (
             backend_loader.create_model_backends(self._plugin_cfg)
         )
+        self._base_estimator = ObstacleDistanceEstimator(
+            self._depth_backend,
+            self._segmentation_backend,
+            deepcopy(self._plugin_cfg),
+        )
 
     def get_tools(self) -> list:
         return TOOLS

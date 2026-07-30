@@ -489,6 +489,30 @@ class ObstacleDistancePluginLifecycleTest(unittest.TestCase):
                     mock.Mock(),
                 )
 
+    def test_diagnostic_mode_without_constant_fails_during_plugin_initialization(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "diagnostic_constant mode requires constant_distance_m",
+        ):
+            self.plugin_module.ObstacleDistancePlugin(
+                {"mode": "diagnostic_constant"},
+                mock.Mock(),
+            )
+
+    def test_invalid_top_level_estimator_config_fails_during_plugin_initialization(self):
+        invalid = (
+            {"decision_threshold_m": 0},
+            {"soft_timeout_s": 0},
+            {"fallback_distance_m": math.nan},
+        )
+        for override in invalid:
+            with self.subTest(override=override):
+                with self.assertRaises(ValueError):
+                    self.plugin_module.ObstacleDistancePlugin(
+                        _diagnostic_config(**override),
+                        mock.Mock(),
+                    )
+
     def test_start_requires_topic_and_explicit_metadata_scene(self):
         plugin = self.plugin_module.ObstacleDistancePlugin(
             _diagnostic_config(), mock.Mock()
