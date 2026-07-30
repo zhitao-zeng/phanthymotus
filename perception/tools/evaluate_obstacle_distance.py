@@ -69,14 +69,27 @@ class _CliError(Exception):
 def _recursive_merge(
     base: Mapping[str, object],
     override: Mapping[str, object],
+    *,
+    _path: tuple[str, ...] = (),
 ) -> dict[str, object]:
     merged = deepcopy(dict(base))
     for key, value in override.items():
         current = merged.get(key)
-        if isinstance(value, Mapping) and not value:
+        path = (*_path, key)
+        if (
+            isinstance(value, Mapping)
+            and not value
+            and path == ("vehicle", "calibration")
+        ):
             merged[key] = {}
         elif isinstance(current, Mapping) and isinstance(value, Mapping):
-            merged[key] = _recursive_merge(current, value)
+            merged[key] = _recursive_merge(
+                current,
+                value,
+                _path=path,
+            )
+        elif isinstance(value, Mapping) and not value:
+            merged[key] = {}
         else:
             merged[key] = deepcopy(value)
     return merged

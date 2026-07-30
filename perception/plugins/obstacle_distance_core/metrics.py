@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sized
 from dataclasses import dataclass
 from numbers import Real
 
@@ -28,12 +29,22 @@ class ThresholdScanResult:
 
 
 def _values(value: object, *, name: str) -> tuple[object, ...]:
-    if isinstance(value, (str, bytes, bytearray, memoryview)):
+    if (
+        isinstance(value, (str, bytes, bytearray, memoryview, Mapping))
+        or not isinstance(value, Sized)
+    ):
         raise ValueError(f"{name} must be a sequence")
     try:
-        return tuple(value)
+        expected_length = len(value)
     except Exception:
         raise ValueError(f"{name} must be a sequence") from None
+    try:
+        values = tuple(value)
+    except Exception:
+        raise ValueError(f"{name} must be a sequence") from None
+    if len(values) != expected_length:
+        raise ValueError(f"{name} must be a sequence")
+    return values
 
 
 def _finite_real(
@@ -211,25 +222,106 @@ def scan_thresholds(
     pred: object,
     failed: object | None = None,
 ) -> ThresholdScanResult:
-    ground_truth, predictions, failure_flags = _validated_inputs(
+    ground_truth, predictions, _ = _validated_inputs(
         gt,
         pred,
         failed,
     )
+    valid_records = [
+        (truth, prediction)
+        for truth, prediction in zip(
+            ground_truth,
+            predictions,
+            strict=True,
+        )
+        if prediction is not None
+    ]
     valid_predictions = tuple(
-        value for value in predictions if value is not None
+        prediction for _, prediction in valid_records
     )
     if not valid_predictions:
         raise ValueError("threshold scan requires a valid prediction")
 
+    candidates = _threshold_candidates(valid_predictions)
+    truth_events = sorted(
+        (truth, index)
+        for index, (truth, _) in enumerate(valid_records)
+    )
+    prediction_events = sorted(
+        (prediction, index)
+        for index, (_, prediction) in enumerate(valid_records)
+    )
+    sorted_ground_truth = sorted(ground_truth)
+    truth_positive = [False] * len(valid_records)
+    prediction_positive = [False] * len(valid_records)
+    truth_event_index = 0
+    prediction_event_index = 0
+    ground_truth_index = 0
+    tp = fp = fn = 0
+
+    errors = [
+        prediction - truth for truth, prediction in valid_records
+    ]
+    samples = len(ground_truth)
+    valid_count = len(valid_records)
+    failures = samples - valid_count
+    rmse = _stable_rmse(errors)
+
     best: ThresholdScanResult | None = None
     best_key: tuple[float, float, float, float] | None = None
-    for threshold in _threshold_candidates(valid_predictions):
-        metrics = evaluate_predictions(
-            ground_truth,
-            predictions,
-            threshold,
-            failed=failure_flags,
+    for threshold in candidates:
+        while (
+            truth_event_index < valid_count
+            and truth_events[truth_event_index][0] < threshold
+        ):
+            _, index = truth_events[truth_event_index]
+            truth_positive[index] = True
+            if prediction_positive[index]:
+                fp -= 1
+                tp += 1
+            else:
+                fn += 1
+            truth_event_index += 1
+
+        while (
+            prediction_event_index < valid_count
+            and prediction_events[prediction_event_index][0] < threshold
+        ):
+            _, index = prediction_events[prediction_event_index]
+            prediction_positive[index] = True
+            if truth_positive[index]:
+                fn -= 1
+                tp += 1
+            else:
+                fp += 1
+            prediction_event_index += 1
+
+        while (
+            ground_truth_index < samples
+            and sorted_ground_truth[ground_truth_index] < threshold
+        ):
+            ground_truth_index += 1
+
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = (
+            2.0 * precision * recall / (precision + recall)
+            if precision + recall
+            else 0.0
+        )
+        metrics = EvaluationMetrics(
+            samples=samples,
+            valid_predictions=valid_count,
+            failures=failures,
+            failure_rate=failures / samples,
+            tp=tp,
+            fp=fp,
+            fn=fn,
+            precision=precision,
+            recall=recall,
+            f1=f1,
+            rmse=rmse,
+            positive_rate=ground_truth_index / samples,
         )
         key = (
             metrics.f1,

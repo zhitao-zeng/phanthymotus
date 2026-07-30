@@ -1,13 +1,19 @@
 import contextlib
 import io
+import itertools
 import json
 import math
+import random
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
+from types import MappingProxyType
 from unittest import mock
 
+import numpy as np
+
+from perception.plugins.obstacle_distance_core import metrics as metrics_module
 from perception.plugins.obstacle_distance_core.contracts import DepthPrediction
 from perception.plugins.obstacle_distance_core.metrics import (
     EvaluationMetrics,
@@ -155,8 +161,96 @@ class EvaluationMetricsTest(unittest.TestCase):
 
         self.assertTrue(math.isfinite(result.rmse))
 
+    def test_inputs_reject_mappings_and_iterables_without_reliable_length(self):
+        secret = "private-iterable-value-" * 100
+
+        class UnreliableLength:
+            def __len__(self):
+                raise RuntimeError(secret)
+
+            def __iter__(self):
+                return iter([0.5])
+
+        invalid_inputs = (
+            (value for value in [0.5]),
+            itertools.repeat(0.5, 1),
+            {0.5: secret},
+            UnreliableLength(),
+        )
+        for invalid in invalid_inputs:
+            with self.subTest(input_type=type(invalid).__name__):
+                with self.assertRaises(ValueError) as raised:
+                    evaluate_predictions(invalid, [0.5], 1.0)
+                self.assertNotIn(secret, str(raised.exception))
+                self.assertLess(len(str(raised.exception)), 200)
+
+    def test_finite_sized_sequence_inputs_remain_supported(self):
+        cases = (
+            ([0.5], [0.5]),
+            ((0.5,), (0.5,)),
+            (range(1), range(1)),
+            (np.array([0.5]), np.array([0.5])),
+        )
+        for ground_truth, predictions in cases:
+            with self.subTest(input_type=type(ground_truth).__name__):
+                result = evaluate_predictions(
+                    ground_truth,
+                    predictions,
+                    1.0,
+                )
+                self.assertEqual(result.samples, 1)
+                self.assertEqual(result.valid_predictions, 1)
+
 
 class ThresholdScanTest(unittest.TestCase):
+    @staticmethod
+    def _brute_scan(gt, pred, failed):
+        valid_predictions = [
+            value
+            for value, is_failed in zip(pred, failed, strict=True)
+            if not is_failed
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value >= 0
+        ]
+        unique = sorted(set(valid_predictions))
+        candidates = [
+            unique[0]
+            if unique[0] > 0
+            else math.nextafter(0.0, math.inf)
+        ]
+        for low, high in zip(unique, unique[1:]):
+            midpoint = low + (high - low) / 2.0
+            candidates.append(
+                midpoint if low < midpoint < high else high
+            )
+        upper = math.nextafter(unique[-1], math.inf)
+        if math.isfinite(upper):
+            candidates.append(upper)
+
+        results = [
+            ThresholdScanResult(
+                threshold,
+                evaluate_predictions(
+                    gt,
+                    pred,
+                    threshold,
+                    failed=failed,
+                ),
+            )
+            for threshold in dict.fromkeys(candidates)
+        ]
+        return max(
+            results,
+            key=lambda result: (
+                result.metrics.f1,
+                result.metrics.precision,
+                -abs(result.threshold_m - 1.0),
+                -result.threshold_m,
+            ),
+        )
+
     def test_contract_is_frozen_and_known_optimum_is_found(self):
         self.assertEqual(
             [field.name for field in fields(ThresholdScanResult)],
@@ -210,6 +304,75 @@ class ThresholdScanTest(unittest.TestCase):
 
         self.assertTrue(math.isfinite(result.threshold_m))
         self.assertGreater(result.threshold_m, 0.0)
+
+    def test_scan_matches_brute_force_for_randomized_edge_cases(self):
+        maximum = float.fromhex("0x1.fffffffffffffp+1023")
+        cases = [
+            (
+                [0.0, 0.0, 1.0, maximum, maximum],
+                [0.0, 0.0, None, math.inf, maximum],
+                [False, True, False, False, False],
+            )
+        ]
+        randomizer = random.Random(20260730)
+        truth_pool = [0.0, 0.25, 1.0, 2.0, maximum]
+        prediction_pool = [
+            0.0,
+            0.0,
+            0.5,
+            1.0,
+            2.0,
+            maximum,
+            None,
+            math.nan,
+        ]
+        for _ in range(100):
+            size = randomizer.randint(1, 12)
+            gt = [randomizer.choice(truth_pool) for _ in range(size)]
+            pred = [
+                randomizer.choice(prediction_pool) for _ in range(size)
+            ]
+            failed = [
+                randomizer.random() < 0.2 for _ in range(size)
+            ]
+            if not any(
+                not is_failed
+                and isinstance(value, (int, float))
+                and math.isfinite(value)
+                and value >= 0
+                for value, is_failed in zip(pred, failed, strict=True)
+            ):
+                pred[0] = 0.0
+                failed[0] = False
+            cases.append((gt, pred, failed))
+
+        for gt, pred, failed in cases:
+            with self.subTest(size=len(gt)):
+                expected = self._brute_scan(gt, pred, failed)
+                actual = scan_thresholds(gt, pred, failed=failed)
+                self.assertEqual(actual, expected)
+
+    def test_large_scan_does_not_re_evaluate_each_candidate(self):
+        size = 2500
+        ground_truth = [
+            float(index % 17) / 4.0 for index in range(size)
+        ]
+        predictions = [
+            float(index) / size * 4.0 for index in range(size)
+        ]
+
+        with mock.patch.object(
+            metrics_module,
+            "evaluate_predictions",
+            side_effect=AssertionError(
+                "scan must not re-evaluate every candidate"
+            ),
+        ) as evaluate:
+            result = scan_thresholds(ground_truth, predictions)
+
+        evaluate.assert_not_called()
+        self.assertEqual(result.metrics.samples, size)
+        self.assertEqual(result.metrics.valid_predictions, size)
 
 
 class GroupedMetricsTest(unittest.TestCase):
@@ -522,6 +685,28 @@ class EvaluationCliTest(unittest.TestCase):
             ],
             {},
         )
+
+    def test_empty_mapping_clear_is_limited_to_vehicle_calibration(self):
+        base = {
+            "indoor": {"roi": [1, 2, 3, 4], "percentile": 1.0},
+            "vehicle": {
+                "min_confidence": 0.25,
+                "calibration": {"fx": 600.0},
+            },
+        }
+
+        merged = evaluate_obstacle_distance._recursive_merge(
+            base,
+            {
+                "indoor": {},
+                "vehicle": {},
+                "new_section": MappingProxyType({}),
+            },
+        )
+
+        self.assertEqual(merged["indoor"], base["indoor"])
+        self.assertEqual(merged["vehicle"], base["vehicle"])
+        self.assertEqual(merged["new_section"], {})
 
     def test_model_mode_without_factory_returns_nonzero(self):
         with tempfile.TemporaryDirectory() as temp_dir:
