@@ -440,3 +440,6 @@ ${PYTHON} \
 最后执行 `git diff --check`。打包守卫以基点 `241b72d` 为边界，检查分支 HEAD、
 index、工作树和未跟踪新增/修改文件：每个 blob 必须小于 1 MiB，且不得是模型制品或
 Git LFS 权重指针。Dockerfile 守卫同时拒绝会把模型目录带入镜像的宽范围 COPY/ADD。
+
+CI 最好先 `fetch` 到该基点；也可以通过 `OBSTACLE_DISTANCE_BASE_REVISION` 指定可用
+基点。若浅克隆中找不到基点，守卫会安全降级为从空树开始的全仓扫描，而不是跳过检查。

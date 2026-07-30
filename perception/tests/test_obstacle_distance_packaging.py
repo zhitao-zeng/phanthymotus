@@ -1,5 +1,6 @@
 import json
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -7,6 +8,7 @@ import tempfile
 import unittest
 from fnmatch import fnmatchcase
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -41,8 +43,42 @@ def _git(repo: Path, *args: str | bytes) -> bytes:
     return result.stdout
 
 
+def _init_test_repo(directory: str) -> Path:
+    repo = Path(directory)
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Packaging Test")
+    _git(repo, "config", "user.email", "packaging@example.test")
+    return repo
+
+
 def _nul_paths(repo: Path, *args: str | bytes) -> tuple[bytes, ...]:
     return tuple(path for path in _git(repo, *args).split(b"\0") if path)
+
+
+def _object_exists(repo: Path, revision: str) -> bool:
+    result = subprocess.run(
+        [b"git", b"cat-file", b"-e", os.fsencode(f"{revision}^{{tree}}")],
+        cwd=os.fsencode(repo),
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def _diff_base(repo: Path, requested: str | None) -> str:
+    revision = (
+        os.environ.get("OBSTACLE_DISTANCE_BASE_REVISION")
+        or requested
+        or BASE_REVISION
+    )
+    if _object_exists(repo, revision):
+        return revision
+    return subprocess.run(
+        [b"git", b"mktree"],
+        cwd=os.fsencode(repo),
+        input=b"",
+        check=True,
+        capture_output=True,
+    ).stdout.strip().decode("ascii")
 
 
 def _object_id_from_tree(
@@ -97,9 +133,10 @@ def _worktree_blob(repo: Path, path: bytes) -> bytes:
 
 def _branch_blob_candidates(
     repo: Path,
-    base_revision: str,
+    base_revision: str | None = None,
 ) -> tuple[tuple[str, bytes, bytes], ...]:
     candidates: list[tuple[str, bytes, bytes]] = []
+    base_tree = _diff_base(repo, base_revision)
 
     head_paths = _nul_paths(
         repo,
@@ -108,7 +145,7 @@ def _branch_blob_candidates(
         "-z",
         "--no-renames",
         "--diff-filter=AM",
-        f"{base_revision}..HEAD",
+        f"{base_tree}..HEAD",
     )
     for path in head_paths:
         object_id = _object_id_from_tree(repo, "HEAD", path)
@@ -160,7 +197,21 @@ def _branch_blob_violations(
     forbidden = tuple(os.fsencode(value) for value in FORBIDDEN_MODEL_SUFFIXES)
     for source, path, blob in candidates:
         normalized_path = path.lower()
-        if normalized_path.endswith(forbidden):
+        model_path = posixpath.normpath(
+            os.fsdecode(normalized_path).replace("\\", "/")
+        ).lstrip("/")
+        path_parts = model_path.split("/")
+        model_directory = any(
+            path_parts[index : index + 2] == [
+                "models",
+                "obstacle-distance",
+            ]
+            for index in range(len(path_parts) - 1)
+        )
+        if (
+            model_directory
+            and normalized_path.endswith(forbidden)
+        ):
             violations.append(("forbidden_model_artifact", source, path))
         if len(blob) >= ONE_MIB:
             violations.append(("file_too_large", source, path))
@@ -219,10 +270,9 @@ def _docker_instruction_sources(arguments: str) -> tuple[str, ...]:
 def _source_may_include_obstacle_models(source: str) -> bool:
     if re.match(r"^[a-z][a-z0-9+.-]*://", source, flags=re.IGNORECASE):
         return False
-    normalized = source.strip().replace("\\", "/")
-    while normalized.startswith("./"):
-        normalized = normalized[2:]
-    normalized = normalized.lstrip("/").rstrip("/")
+    normalized = posixpath.normpath(
+        source.strip().replace("\\", "/")
+    ).lstrip("/")
     if "$" in normalized:
         return True
     if normalized in {
@@ -263,10 +313,44 @@ def _source_may_include_obstacle_models(source: str) -> bool:
     }
 
 
+def _docker_escape_character(source: str) -> str:
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = re.match(
+            r"^#\s*escape\s*=\s*([\\`])\s*$",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+        if match is not None:
+            return match.group(1)
+        if not stripped.startswith("#"):
+            break
+    return "\\"
+
+
+def _docker_logical_lines(source: str) -> tuple[str, ...]:
+    escape = _docker_escape_character(source)
+    logical: list[str] = []
+    pending = ""
+    for line in source.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        stripped_right = line.rstrip()
+        if stripped_right.endswith(escape):
+            pending += stripped_right[:-1] + " "
+            continue
+        logical.append(pending + line)
+        pending = ""
+    if pending:
+        logical.append(pending)
+    return tuple(logical)
+
+
 def _dockerfile_model_sources(source: str) -> tuple[str, ...]:
-    normalized = re.sub(r"\\[ \t]*\r?\n", " ", source)
     dangerous: list[str] = []
-    for line in normalized.splitlines():
+    for line in _docker_logical_lines(source):
         match = re.match(
             r"^\s*(?:copy|add)\s+(.+)$",
             line,
@@ -280,40 +364,68 @@ def _dockerfile_model_sources(source: str) -> tuple[str, ...]:
     return tuple(dangerous)
 
 
-def _dockerfile_candidates(repo: Path) -> tuple[tuple[bytes, bytes], ...]:
-    tracked = _nul_paths(repo, "ls-files", "-z")
-    modified = set(
-        _nul_paths(
-            repo,
-            "diff",
-            "--name-only",
-            "-z",
-            "--no-renames",
-            "--diff-filter=AM",
-        )
+def _dockerfile_candidates(
+    repo: Path,
+) -> tuple[tuple[str, bytes, bytes], ...]:
+    candidates: list[tuple[str, bytes, bytes]] = []
+    head_paths = _nul_paths(
+        repo,
+        "ls-tree",
+        "-r",
+        "--name-only",
+        "-z",
+        "HEAD",
     )
-    untracked = _nul_paths(
+    for path in head_paths:
+        if not _is_dockerfile_path(path):
+            continue
+        object_id = _object_id_from_tree(repo, "HEAD", path)
+        if object_id is not None:
+            candidates.append(("head", path, _git_blob(repo, object_id)))
+
+    index_paths = _nul_paths(
+        repo,
+        "diff",
+        "--cached",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        "--diff-filter=AM",
+        "HEAD",
+    )
+    for path in index_paths:
+        if not _is_dockerfile_path(path):
+            continue
+        object_id = _object_id_from_index(repo, path)
+        if object_id is not None:
+            candidates.append(("index", path, _git_blob(repo, object_id)))
+
+    worktree_paths = _nul_paths(
+        repo,
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        "--diff-filter=AM",
+    )
+    for path in worktree_paths:
+        if _is_dockerfile_path(path):
+            candidates.append(
+                ("worktree", path, _worktree_blob(repo, path))
+            )
+
+    untracked_paths = _nul_paths(
         repo,
         "ls-files",
         "--others",
         "--exclude-standard",
         "-z",
     )
-    candidates: list[tuple[bytes, bytes]] = []
-    for path in tracked:
-        if not _is_dockerfile_path(path):
-            continue
-        if path in modified:
-            blob = _worktree_blob(repo, path)
-        else:
-            object_id = _object_id_from_index(repo, path)
-            if object_id is None:
-                continue
-            blob = _git_blob(repo, object_id)
-        candidates.append((path, blob))
-    for path in untracked:
+    for path in untracked_paths:
         if _is_dockerfile_path(path):
-            candidates.append((path, _worktree_blob(repo, path)))
+            candidates.append(
+                ("untracked", path, _worktree_blob(repo, path))
+            )
     return tuple(candidates)
 
 
@@ -428,6 +540,9 @@ class ObstacleDistancePackagingTest(unittest.TestCase):
             "3 failures",
             "1 error",
             "codex-primary-runtime",
+            "OBSTACLE_DISTANCE_BASE_REVISION",
+            "fetch",
+            "全仓扫描",
         )
         for text in required:
             with self.subTest(text=text):
@@ -447,35 +562,23 @@ class ObstacleDistancePackagingTest(unittest.TestCase):
             return
 
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-
-            def git(*args: str) -> bytes:
-                return subprocess.run(
-                    ["git", *args],
-                    cwd=repo,
-                    check=True,
-                    capture_output=True,
-                ).stdout
-
-            git("init", "-q")
-            git("config", "user.name", "Packaging Test")
-            git("config", "user.email", "packaging@example.test")
+            repo = _init_test_repo(directory)
             (repo / "legacy.onnx").write_bytes(b"legacy model")
-            git("add", "legacy.onnx")
-            git("commit", "-qm", "base")
-            base = git("rev-parse", "HEAD").strip().decode("ascii")
+            _git(repo, "add", "legacy.onnx")
+            _git(repo, "commit", "-qm", "base")
+            base = _git(repo, "rev-parse", "HEAD").strip().decode("ascii")
 
             (repo / "branch.txt").write_bytes(b"head version")
             (repo / "sparse.txt").write_bytes(b"sparse blob")
             os.symlink("missing-target", repo / "branch-link")
-            git("add", "branch.txt", "sparse.txt", "branch-link")
-            git("commit", "-qm", "branch")
-            git("update-index", "--skip-worktree", "sparse.txt")
+            _git(repo, "add", "branch.txt", "sparse.txt", "branch-link")
+            _git(repo, "commit", "-qm", "branch")
+            _git(repo, "update-index", "--skip-worktree", "sparse.txt")
             (repo / "sparse.txt").unlink()
 
             (repo / "branch.txt").write_bytes(b"worktree version")
             (repo / "staged.plan").write_bytes(b"staged engine")
-            git("add", "staged.plan")
+            _git(repo, "add", "staged.plan")
             object_id = subprocess.run(
                 [b"git", b"hash-object", b"-w", b"--stdin"],
                 cwd=os.fsencode(repo),
@@ -530,6 +633,48 @@ class ObstacleDistancePackagingTest(unittest.TestCase):
                 b"untracked weight",
             )
 
+    def test_missing_base_revision_falls_back_to_full_head_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = _init_test_repo(directory)
+            (repo / "existing.txt").write_bytes(b"shallow checkout content")
+            _git(repo, "add", "existing.txt")
+            _git(repo, "commit", "-qm", "depth-one head")
+            valid_base = _git(repo, "rev-parse", "HEAD").strip().decode("ascii")
+            (repo / "branch.txt").write_bytes(b"branch content")
+            _git(repo, "add", "branch.txt")
+            _git(repo, "commit", "-qm", "branch head")
+
+            with mock.patch.dict(
+                os.environ,
+                {"OBSTACLE_DISTANCE_BASE_REVISION": valid_base},
+            ):
+                candidates = _branch_blob_candidates(
+                    repo,
+                    "also-missing-explicit-base",
+                )
+            self.assertNotIn(
+                b"existing.txt",
+                {path for _, path, _ in candidates},
+            )
+            self.assertIn(
+                ("head", b"branch.txt", b"branch content"),
+                candidates,
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {"OBSTACLE_DISTANCE_BASE_REVISION": "missing-base-revision"},
+            ):
+                try:
+                    candidates = _branch_blob_candidates(repo, None)
+                except subprocess.CalledProcessError as error:
+                    self.fail(f"missing base must use a safe fallback: {error}")
+
+            self.assertIn(
+                ("head", b"existing.txt", b"shallow checkout content"),
+                candidates,
+            )
+
     def test_branch_blob_policy_rejects_only_changed_blob_violations(self):
         violations = globals().get("_branch_blob_violations")
         self.assertIsNotNone(
@@ -541,7 +686,17 @@ class ObstacleDistancePackagingTest(unittest.TestCase):
 
         candidates = (
             ("head", b"docs/ok.md", b"ok"),
-            ("index", b"models/NK.pth.tar", b"weight"),
+            ("head", b"fixtures/tiny.onnx", b"small fixture"),
+            (
+                "index",
+                b"perception/models/obstacle-distance/NK.pth.tar",
+                b"weight",
+            ),
+            (
+                "head",
+                b"models/obstacle-distance/runtime.engine",
+                b"engine",
+            ),
             ("worktree", b"large.bin", b"x" * ONE_MIB),
             (
                 "untracked",
@@ -554,6 +709,67 @@ class ObstacleDistancePackagingTest(unittest.TestCase):
             {kind for kind, _, _ in found},
             {"forbidden_model_artifact", "file_too_large", "git_lfs_pointer"},
         )
+        self.assertFalse(
+            any(path == b"fixtures/tiny.onnx" for _, _, path in found)
+        )
+        self.assertTrue(
+            any(
+                path == b"models/obstacle-distance/runtime.engine"
+                for _, _, path in found
+            )
+        )
+
+    def test_dockerfile_candidates_preserve_head_index_and_worktree_versions(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = _init_test_repo(directory)
+            dockerfile = repo / "DockerFile"
+            dockerfile.write_text("COPY safe.txt /work/\n", encoding="utf-8")
+            _git(repo, "add", "DockerFile")
+            _git(repo, "commit", "-qm", "base")
+            dockerfile.write_text("COPY perception /work/\n", encoding="utf-8")
+            _git(repo, "add", "DockerFile")
+            _git(repo, "commit", "-qm", "dangerous head")
+            dockerfile.write_text(
+                "COPY perception/models /models/\n",
+                encoding="utf-8",
+            )
+            _git(repo, "add", "DockerFile")
+            dockerfile.write_text(
+                "COPY perception/plugins /work/plugins/\n",
+                encoding="utf-8",
+            )
+            (repo / "dockerfile.extra").write_text(
+                "ADD . /context/\n",
+                encoding="utf-8",
+            )
+
+            candidates = _dockerfile_candidates(repo)
+            self.assertTrue(
+                all(len(candidate) == 3 for candidate in candidates),
+                "each Dockerfile Git state must remain independently visible",
+            )
+            if not all(len(candidate) == 3 for candidate in candidates):
+                return
+            versions = {
+                (source, path): blob
+                for source, path, blob in candidates
+            }
+            self.assertIn(("head", b"DockerFile"), versions)
+            self.assertIn(("index", b"DockerFile"), versions)
+            self.assertIn(("worktree", b"DockerFile"), versions)
+            self.assertIn(("untracked", b"dockerfile.extra"), versions)
+            self.assertTrue(
+                _dockerfile_model_sources(
+                    versions[("index", b"DockerFile")].decode("utf-8")
+                )
+            )
+            self.assertFalse(
+                _dockerfile_model_sources(
+                    versions[("worktree", b"DockerFile")].decode("utf-8")
+                )
+            )
 
     def test_dockerfile_parser_rejects_broad_and_model_copy_sources(self):
         detector = globals().get("_dockerfile_model_sources")
@@ -575,6 +791,14 @@ class ObstacleDistancePackagingTest(unittest.TestCase):
             'ADD --chown=robot:robot ["models/obstacle-distance", "/models"]',
             "COPY * /work",
             "COPY perception/model* /work",
+            "# escape=`\n"
+            "COPY --chown=robot:robot `\n"
+            "  foo/../perception/models/obstacle-distance `\n"
+            "  /models",
+            "# escape=\\\n"
+            "ADD \\\n"
+            "  ./perception/models/obstacle-distance \\\n"
+            "  /models",
         )
         for source in dangerous:
             with self.subTest(source=source):
@@ -592,7 +816,7 @@ class ObstacleDistancePackagingTest(unittest.TestCase):
 
     def test_branch_delta_blobs_are_small_plain_source_files(self):
         violations = _branch_blob_violations(
-            _branch_blob_candidates(REPO_ROOT, BASE_REVISION)
+            _branch_blob_candidates(REPO_ROOT)
         )
         rendered = [
             f"{kind}: {source}: {os.fsdecode(path)}"
@@ -603,9 +827,12 @@ class ObstacleDistancePackagingTest(unittest.TestCase):
     def test_dockerfiles_do_not_copy_sources_containing_obstacle_models(self):
         dockerfiles = _dockerfile_candidates(REPO_ROOT)
         self.assertTrue(dockerfiles)
-        for path, blob in dockerfiles:
+        for source_name, path, blob in dockerfiles:
             source = blob.decode("utf-8", errors="replace")
-            with self.subTest(path=os.fsdecode(path)):
+            with self.subTest(
+                source=source_name,
+                path=os.fsdecode(path),
+            ):
                 self.assertEqual((), _dockerfile_model_sources(source))
 
 
