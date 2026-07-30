@@ -289,10 +289,10 @@ metadata 场景启动：
 
 deadline 是单调时钟软期限。通用 Python 层不会创建不可取消线程来伪装硬超时；底层
 若无法中断已提交的 GPU kernel，只能在调用返回后发布 `timeout` 兜底。一个插件对象
-共享一把推理锁，因此其全部实例单插件串行推理；每个节点仅保留最新一帧，忙时不堆积
-请求。`stop` 会取消队列中尚未推理/发布的帧。若外部 ROS `publish()` 已经开始则无法
-撤回；发布门在调用前做最终 generation/stop token 检查，保证 stop 边界之后不再发起
-新的 publish。
+共享一把推理锁，因此其全部实例单插件串行推理。每个节点的队列最多保留一帧，另有一帧
+可能正在等待推理锁或执行推理，所以总在途帧数有界，忙时不会形成无界堆积。`stop` 会
+取消队列中尚未推理/发布的帧。若外部 ROS `publish()` 已经开始则无法撤回；发布门在
+调用前做最终 generation/stop token 检查，保证 stop 边界之后不再发起新的 publish。
 
 ## 6. 离线 CLI
 
@@ -307,10 +307,13 @@ frames/000002.jpg,vehicle,4.30
 相对 `image_path` 以 manifest 所在目录为基准；`scene` 只能是 `indoor` 或
 `vehicle`；真值必须是有限非负米数。
 
+下列命令使用 `${PYTHON}`，可先执行 `PYTHON=python3`。正式验收推荐把 `PYTHON`
+指向团队提供的 bundled `codex-primary-runtime` Python，但文档不绑定个人机器路径。
+
 链路正例诊断：
 
 ```bash
-/Users/4paradigm/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 \
+${PYTHON} \
   perception/tools/evaluate_obstacle_distance.py \
   --manifest /data/obstacle/manifest.csv \
   --mode diagnostic_constant \
@@ -321,7 +324,7 @@ frames/000002.jpg,vehicle,4.30
 链路负例诊断时把常数改为 `5.0`。正式模型评测：
 
 ```bash
-/Users/4paradigm/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 \
+${PYTHON} \
   perception/tools/evaluate_obstacle_distance.py \
   --manifest /data/obstacle/manifest.csv \
   --mode model \
@@ -413,7 +416,7 @@ Lifelong-MonoDepth 与 YOLO26n-seg 的组合约 24.9M 参数只是参数量估�
 任务 2–8 的障碍距离新增套件与相关生命周期测试：
 
 ```bash
-/Users/4paradigm/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 \
+${PYTHON} \
   -m unittest \
   perception/tests/test_plugin_dispatch.py \
   perception/tests/test_obstacle_distance_contracts.py \
@@ -430,10 +433,10 @@ Lifelong-MonoDepth 与 YOLO26n-seg 的组合约 24.9M 参数只是参数量估�
 前述 OCR 基线，不能为追求全绿而修改 OCR：
 
 ```bash
-/Users/4paradigm/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 \
+${PYTHON} \
   -m unittest discover -s perception/tests -p 'test_*.py'
 ```
 
-最后执行 `git diff --check`，使用 `git ls-files` 检查 Git 追踪内容，确认新增文件均小于
-1 MiB、没有模型制品或 Git LFS 权重指针，并确认所有 Dockerfile 都未 COPY
-`perception/models/obstacle-distance`。
+最后执行 `git diff --check`。打包守卫以基点 `241b72d` 为边界，检查分支 HEAD、
+index、工作树和未跟踪新增/修改文件：每个 blob 必须小于 1 MiB，且不得是模型制品或
+Git LFS 权重指针。Dockerfile 守卫同时拒绝会把模型目录带入镜像的宽范围 COPY/ADD。
