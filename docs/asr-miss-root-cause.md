@@ -271,5 +271,20 @@ if flushed and len(flushed) > SAMPLE_RATE:
 - 使用本地 FireRed ONNX 对 12 条评测 WAV 跑 VAD：正常顺序 12/12 有 segment；
 - 每条 WAV 前先注入 1 秒静音，使首次检测为空，再发送真实音频：12/12 均能在后续端点恢复 segment。
 
-**尚未验证**：Jetson ARM/ROS2/DDS 多实例与平台分数。该修复是否清除历史 4/120 空结果，必须走
-Jetson 和平台链路确认，不能由 x86 离线结果替代。
+**Jetson 验证（develop，commit `c71a51d`）**：
+
+- Docker build 成功：镜像 `phanthymotus-perception-asr:c71a51d`，image ID `e6c58aed5dab`；
+- 本地 base `local/phanthy-motus/jetson-base:jp6-torch` 不含 `/opt/ros/humble`，传
+  `BASE_IMAGE` 会在编译 `audio_msgs` 时失败；不传该参数、使用 Dockerfile 自带且已有缓存的
+  `jp6-torch-apt-ros` stage 后成功；
+- ARM 镜像内 7 个 ASR 单测通过；真实 FireRed ONNX 的 12 条 VAD 正常顺序与“先空检测、后迟到语音”
+  顺序均为 12/12 有 segment；
+- 独立容器使用 `MCP_PORT=18720` / `WS_PORT=18721` 正确启动，x-asr、hotwords 和 FireRedVAD
+  加载成功，MCP `tools/list` 正常；
+- 平台模拟链路（MCP `config/start` → ROS2 1024-byte 实时音频 → 1500ms 静音 → DDS 结果 →
+  `stop`）12/12 非空，mean 1-CER **0.8338**，最大单条耗时 43.4s；结果原件保存在本机
+  `/mnt/disk2/zengzhitao/tmp/asr-c71a51d-jetson-results.json`；
+- 测试容器与 Jetson 临时结果已清理，构建镜像保留供后续多实例复测。
+
+**尚未验证**：Jetson 10 实例并发和平台分数。单实例 12/12 非空支持修复方向，但能否彻底清除历史
+4/120 空结果仍需多实例或平台链路确认，不能由本轮单实例结果替代。
