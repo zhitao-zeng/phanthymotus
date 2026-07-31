@@ -243,3 +243,33 @@ if flushed and len(flushed) > SAMPLE_RATE:
 - `perception/utils/asr_model_downloader.py` — `--model x_asr` 下载 transducer 三件套 + hotwords，原子替换
 - `perception/plugins/firered_vad.py` — vendor FireRedVAD ONNX runtime（DFSMN，无 torch），`FireRedVadOnnx.detect()`
 - `perception/config.yaml` — `mode/model_path/device/vad_pre_roll_ms/silence_ms=400` + `sherpa_config`（mbs/hotwords/bpe）+ `vad.model=firered`
+
+---
+
+## 2026-08-01：FireRedVAD 空检测不再锁死 session
+
+**基线**：`01c868f`（代码路径等价于历史最高分 `42534d7`，另含安全下载与 CI）。
+
+**问题**：`_FireRedVadSession._run_detect()` 在 FireRedVAD 返回空 segment 时仍设置
+`_detected=True`。Judge 多实例下如果 1 秒零包先于乱序/延迟语音包到达，第一次检测只看到静音并返回空；
+后续 `process_chunk()` 因 `_detected` 提前返回，迟到语音不会加入 buffer，`notify_idle()` 也被同一状态挡住，
+最终形成空结果。
+
+**修复**：
+
+- 只有检测到真实 segment 后才设置 `_detected=True`；空检测保持 session 可接收后续音频；
+- 记录上次已检测的 buffer 字节数，同一份 idle buffer 不重复推理；
+- 空检测后重置连续静音计数，新增音频到达后需重新累计端点，避免每个零包都触发推理；
+- 补上 FireRedVAD 检测异常日志所需的 `logging` import，异常保持可重试；
+- CI 扩展为运行全部 `test_asr_*.py`，覆盖空检测后迟到音频、idle 去重和临时检测失败。
+
+未恢复 `89850d6/4e38ac6` 的 whole-buffer fallback 或 pause 强制输出；这两条路径已有 Judge 退化证据。
+
+**本地验证**：
+
+- 7 个 ASR 单测通过，相关 Python 源码 `py_compile` 通过；
+- 使用本地 FireRed ONNX 对 12 条评测 WAV 跑 VAD：正常顺序 12/12 有 segment；
+- 每条 WAV 前先注入 1 秒静音，使首次检测为空，再发送真实音频：12/12 均能在后续端点恢复 segment。
+
+**尚未验证**：Jetson ARM/ROS2/DDS 多实例与平台分数。该修复是否清除历史 4/120 空结果，必须走
+Jetson 和平台链路确认，不能由 x86 离线结果替代。
