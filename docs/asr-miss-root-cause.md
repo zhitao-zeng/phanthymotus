@@ -167,6 +167,73 @@ if flushed and len(flushed) > SAMPLE_RATE:
 
 ---
 
+## 后续优化（631cc3d → 3162397，10 commits）
+
+### A. 评测机端口冲突二次修复（631cc3d）
+
+**问题**：820b4a6 合并 `origin/main` 时把 `main.py` 的端口读取改成只读 `config.yaml`，丢了 `os.environ.get("MCP_PORT"/"WS_PORT")`。评测平台 `run_for_darwin.py` 给 10 个 host-network 实例通过 `-e MCP_PORT=15720+i*100` 分配独立端口，改后全部无视 env、齐抢 config 写死的 15720 → 实例 1-9 `OSError [Errno 98] Address already in use` 崩溃，平台 `wait_mcp_ready` 连 15820+ 永远超时。**这是 820b4a6 在 judge 上的新失败根因。**
+
+**修复**：恢复 `61b7ca6` 的 env-first 写法（env 读不到才 fallback config）。
+
+### B. Transducer 尾部静音 padding（c65038a + 544033b + 265e32b + ed83cad）
+
+**问题**：Transducer 解码器需要尾部静音来正确 emit 末尾 token。无 tail pad 时短句（case 0 "进入零力矩模式"）仅解码开头几帧 → 输出英文乱码 `"I'll shi"`。
+
+**修复链**：
+- `c65038a` `OfflineASRAdapter.transcribe()` 加 0.5s 尾部静音 — ARM 1-CER 0.7130 → 0.8388
+- `544033b` `pcm16_to_float_samples` 结果转 list 再 extend（numpy 数组不可 `.extend`）
+- `ed83cad` VAD `silence_ms` 700→400，避免 VAD 提前截断弱尾音节
+- `265e32b` VAD segment 再补 300ms tail pad（`_SherpaVadSession`），保护 case 7 "举双手" 尾 144ms 被 VAD 误判静音而截断
+
+**配套**：`69ac49a` 关掉 tts/htmsg/vop 插件，ASR-only eval 降 OOM（10 实例 × ~125MB）。
+
+### C. FireRedVAD 新后端（a86c6a4 + e3f228a + 821078f + 3162397）
+
+**动机**：silero VAD 在 case 7 等短句上仍会截断弱尾音节。FireRedVAD（DFSMN，F1 97.57 vs silero 95.95）更稳。
+
+**实现**：
+- `a86c6a4` vendor `plugins/firered_vad.py`（259 行）— ONNX runtime + `kaldi_native_fbank` + numpy，**无 torch**（torch 会给每个 VAD worker 加 0.5-1GB RSS，重触发 69ac49a 修过的 10-实例 OOM）。ONNX 导出与 torch parity < 1e-7
+- 新 `_FireRedVadSession`（`asr_runtime.py:371`）：buffer-and-flush — 非 streaming，攒 PCM 到尾部 ≥1s 静音再一次性 `detect()`，避免增量 re-detect 的 segment 边界漂移。每个 segment 前 `pre_roll_s` + 后 300ms tail pad
+- `e3f228a` pip install `onnxruntime`（sherpa-onnx 无 py binding）
+- `821078f` 简化为 buffer-and-flush，避免增量 detect 漂移
+- `3162397` 尾部静音 1s 触发 one-shot detect
+
+**Dockerfile**（`Dockerfile.jetson:79-92`）：
+- `pip install kaldi_native_fbank onnxruntime`
+- `asr_model_downloader.py --model firered_vad` 下载 `firered_vad.onnx` + `.onnx.data`（external weights）+ `cmvn.npz` 到 `/models/firered_vad`
+- 保留 silero VAD 下载作为 fallback
+
+**config.yaml**：`vad.model: firered`，threshold 0.4，silence_ms 400，pre_roll_ms 500，`model_dir: /models/firered_vad`。
+
+**本地 e2e（x-asr mbs5 + hotwords）**：firered-crop 1-CER **0.8393** vs full-file 0.8451；case 7 不再被截断（silero 会截）。
+
+---
+
+## 当前分支状态（截至 3162397）
+
+`feat/asr-integrate` 共 13 commits ahead of `origin/main`：
+- 5895407 ASR port（VadSession + x-asr + stop() 顺序修复）
+- 820b4a6 JP6 镜像烘焙 x-asr+VAD
+- ccc4ce2 文档
+- 631cc3d 端口 env override
+- c65038a/544033b/265e32b/ed83cad tail padding 链
+- 69ac49a 关其他插件
+- a86c6a4/e3f228a/821078f/3162397 FireRedVAD 后端
+
+**改了 7 个文件**：Dockerfile.jetson / config.yaml / main.py / asr_offline.py / asr_runtime.py / **新 firered_vad.py** / asr_model_downloader.py（+418 / -17）。
+
+**当前 config 状态**：
+- ASR：x-asr transducer + modified_beam_search(5) + hotwords(2.0) + 0.5s tail pad
+- VAD：**firered**（DFSMN ONNX，F1 97.57），threshold 0.4，silence_ms 400，pre_roll_ms 500
+- tts/htmsg/vop 全 disabled（ASR-only eval）
+
+**回滚点**：
+- 回 FireRedVAD 之前：`git revert a86c6a4`（保留 silero VAD）
+- 回 tail padding 之前：`git revert c65038a`（1-CER 降回 0.7130）
+- 回 stock ASR：`git revert 5895407`（仅 `perception/`）
+
+---
+
 ## 相关文件
 
 - `perception/plugins/asr.py` — 主插件，含 stop() 顺序修复 + drain+flush 尾路径 + lifecycle_lock
@@ -174,4 +241,5 @@ if flushed and len(flushed) > SAMPLE_RATE:
 - `perception/plugins/asr_offline.py` — `OfflineASRAdapter` 支持 x-asr transducer + paraformer fallback + hotwords + mbs(5)
 - `perception/Dockerfile.jetson` — JP6 镜像，build 时烘焙 x-asr + VAD，消除评测机 volume mount 依赖
 - `perception/utils/asr_model_downloader.py` — `--model x_asr` 下载 transducer 三件套 + hotwords，原子替换
-- `perception/config.yaml` — `mode/model_path/device/vad_pre_roll_ms/silence_ms=700` + `sherpa_config`（mbs/hotwords/bpe）
+- `perception/plugins/firered_vad.py` — vendor FireRedVAD ONNX runtime（DFSMN，无 torch），`FireRedVadOnnx.detect()`
+- `perception/config.yaml` — `mode/model_path/device/vad_pre_roll_ms/silence_ms=400` + `sherpa_config`（mbs/hotwords/bpe）+ `vad.model=firered`
