@@ -101,6 +101,24 @@ plugins:
       percentile: 1.0
       min_valid_pixels: 64
     vehicle:
+      # allowed_classes 填的是【运行时分割模型输出的类名】(不是 nuScenes 真值类名);
+      # estimator 按 class_name 字符串精确匹配、不认数字 id。填什么取决于下载的
+      # YOLO26n-seg 版本 —— nuScenes 真值类别 -> 运行时类名 对应关系:
+      #   vehicle.car               -> car
+      #   vehicle.truck             -> truck
+      #   vehicle.bus.rigid         -> bus
+      #   vehicle.motorcycle        -> motorcycle
+      #   vehicle.bicycle           -> bicycle
+      #   human.pedestrian.adult    -> person
+      # 挑战微调版额外支持(需下载对应微调权重):
+      #   vehicle.construction              -> construction_vehicle
+      #   movable_object.trafficcone        -> traffic_cone
+      #   movable_object.barrier            -> barrier
+      #   movable_object.pushable_pullable  -> pushable_pullable
+      #   debris                            -> debris
+      # 下载挑战版权重后,可整体替换为超集:
+      #   [person, car, truck, bus, motorcycle, bicycle,
+      #    construction_vehicle, traffic_cone, barrier, pushable_pullable, debris]
       allowed_classes: [person, car, truck, bus, motorcycle, bicycle]
       min_confidence: 0.25
       percentile: 1.0
