@@ -353,7 +353,93 @@ F1@1m 的真值定义。`best_threshold.ground_truth_threshold_m` 记录该固�
 候选重新全量扫描。F1 相同时依次优先 precision 更高、预测阈值更接近固定真值阈值、
 预测阈值更小。
 
-## 7. 外部模型目录与挂载
+## 7. 评测真值(ground-truth)距离定义
+
+本节定义第 6 节 manifest 中 `gt_distance_m` 的标注口径。真值在仓库外由 3D 标注或实测
+深度生成,`gt_distance_m` 仅作为标量喂入离线 CLI;运行时插件只产出预测 `distance_m`
+再与之比较。真值与预测共享“参考点 → 最近障碍物表面距离”的语义,但室外真值取自 3D 有向框
+(OBB),与运行时的分割 mask + 单目深度逐像素反投影是两种不同实现,评测时按
+`gt_distance_m` 对齐。
+
+### 7.1 室内机器人场景
+
+评测距离 = 相机光心到正前方最近障碍物表面的距离(米),沿相机光轴取深度(Z 距离)。
+真值与运行时后处理一致:同一 ROI、同一 P1 分位、同一有效深度范围。
+
+- 参考点:相机光心(深度图投影原点)。
+- 障碍物面:ROI 内有效深度最近的物体表面像素。
+- 障碍物:机器人正前方、除地面外的任何实体——墙/柱/门/柜等固定结构,行人/桌椅等动或
+  半固定物体,以及正前方路径上的任何遮挡。
+- 不计入:地面(可正常行驶,不构成碰撞)、ROI 外(图像左右边缘、上方天花板)的物体。
+
+ROI 固定为源图 `640 × 480`(宽 × 高)的正前方中心区域,与 `config.yaml` 的
+`roi: [0, 300, 213, 426]` 一致——列 213~426(宽度 1/3~2/3),行 0~300(上 5/8,
+排除下 3/8 地面):
+
+```
+col:  0        213              426              640
+row 0 ├────────┼████████████████┼────────────────┤
+      │  排除  │   ROI 正前方    │      排除       │
+row300│        │████████████████│                 │
+      ├────────┴────────────────┴────────────────┤ ← 地面分界线(row 300)
+      │              地面区域(排除)               │
+row480└───────────────────────────────────────────┘
+```
+
+有效深度范围 `[0.3, 10.0] m`,P1 分位对应像素即最近障碍点。示例:室内柱子,ROI 内 P1
+像素约 `row 297, col 250`,相机到柱面 `1.7172 m`。
+
+### 7.2 无人车场景
+
+评测距离 = 自车前保险杠到最近障碍物表面的水平距离(米),只取 ego 系 x-y 平面欧氏距离,
+不含高度分量。
+
+- 参考点:前保险杠,ego 系 `x = 3.412 m, y = 0`(与 `vehicle.calibration.bumper_xy:
+  [3.412, 0.0]` 一致)。
+- 障碍物面:障碍物 3D 有向框(OBB)的最近表面点,通常落在两个最近面交线(最近角点/竖棱)
+  上。例:公交车取前端面(局部 `lx = +l/2`)与右侧面(`ly = +w/2`)交线上的最近角
+  (`9.072 m`);行人若车头在其正后偏右,`lx` 落在框内、`ly` 大幅越界,最近面为右侧面
+  (`2.498 m`)。
+
+真值类别采用 nuScenes 命名体系。纳入计算:
+
+| 真值类别(nuScenes) | 说明 |
+| --- | --- |
+| `vehicle.car` | 小型乘用车 |
+| `vehicle.truck` | 卡车 |
+| `vehicle.bus.rigid` | 公交车 |
+| `vehicle.motorcycle` | 摩托车 |
+| `vehicle.bicycle` | 自行车 |
+| `vehicle.construction` | 工程车辆 |
+| `human.pedestrian.adult` | 行人 |
+| `movable_object.trafficcone` | 交通锥 |
+| `movable_object.barrier` | 隔离墩/护栏 |
+| `movable_object.pushable_pullable` / `debris` | 可移动障碍物 |
+
+不计入:`static_object.*`(电线杆、建筑等静态固定物)、`flat.*`(路面、斑马线、人行道等
+地面标注)、`vehicle.ego`(自车本身)。
+
+### 7.3 与运行时类别体系的映射
+
+运行时 `config.yaml` 的 `vehicle.allowed_classes` 使用检测器输出的类名(首版为 COCO 名),
+estimator 按 `class_name` 字符串精确匹配、不认数字 id。接入真实分割 backend 时,必须把
+上表 nuScenes 真值类别映射到检测器实际输出的类名并据此配置 `allowed_classes`,否则目标会
+全部落入 `no_target_instance` 兜底。示例映射(最终以检测器实际输出为准):
+
+| nuScenes 真值类别 | 运行时类名(示例) |
+| --- | --- |
+| `vehicle.car` | `car` |
+| `vehicle.truck` | `truck` |
+| `vehicle.bus.rigid` | `bus` |
+| `vehicle.motorcycle` | `motorcycle` |
+| `vehicle.bicycle` | `bicycle` |
+| `human.pedestrian.adult` | `person` |
+| `movable_object.trafficcone` | `traffic_cone`(挑战类别微调版) |
+| `movable_object.barrier` | `barrier`(挑战类别微调版) |
+| `vehicle.construction` | `construction_vehicle`(挑战类别微调版) |
+| `movable_object.pushable_pullable` / `debris` | `pushable_pullable` / `debris`(挑战类别微调版) |
+
+## 8. 外部模型目录与挂载
 
 容器内预期目录为：
 
@@ -383,7 +469,7 @@ services:
 制品也可以由受控模型制品仓库在部署阶段提供，但本项目不提供下载脚本。训练、模型转换、
 TensorRT engine 构建和 INT8 校准均应在模型流水线中完成。
 
-## 8. 参数量、文件体积与 Git 禁令
+## 9. 参数量、文件体积与 Git 禁令
 
 Lifelong-MonoDepth 与 YOLO26n-seg 的组合约 24.9M 参数只是参数量估算，不是文件体积
 证明。若验收规则是单个或组合产物不得超过 30 MB，FP32 和 FP16 都可能超限；模型侧
@@ -406,7 +492,7 @@ Lifelong-MonoDepth 与 YOLO26n-seg 的组合约 24.9M 参数只是参数量估�
 应使用只读挂载或模型制品仓库交付。不要把 Git LFS pointer 当成“未提交权重”，也不要
 在本仓库新增权重下载脚本。
 
-## 9. 已知 OCR 基线问题
+## 10. 已知 OCR 基线问题
 
 基点 `fork/feat/zengzhitao@241b72d` 在本插件开始前已有以下问题，本任务没有修复：
 
@@ -418,7 +504,7 @@ Lifelong-MonoDepth 与 YOLO26n-seg 的组合约 24.9M 参数只是参数量估�
 因此不要把这些旧问题描述为已修复。使用 bundled Python 运行本分支新增套件应为全绿；
 仓库全量测试仍可能呈现既有 `3 failures` + `1 error`，必须在报告中与本插件回归分开。
 
-## 10. 验收命令
+## 11. 验收命令
 
 任务 2–8 的障碍距离新增套件与相关生命周期测试：
 
