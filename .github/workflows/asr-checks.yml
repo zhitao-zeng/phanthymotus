@@ -1,0 +1,41 @@
+name: asr-checks
+
+on:
+  push:
+    branches: [feat/zengzhitao-asr]
+    paths:
+      - "perception/**"
+      - ".github/workflows/asr-checks.yml"
+  pull_request:
+    paths:
+      - "perception/**"
+      - ".github/workflows/asr-checks.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lightweight-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Compile ASR Python sources
+        run: >-
+          python -m py_compile
+          perception/main.py
+          perception/plugins/asr.py
+          perception/plugins/asr_offline.py
+          perception/plugins/asr_runtime.py
+          perception/plugins/firered_vad.py
+          perception/utils/asr_model_downloader.py
+      - name: Run downloader safety tests
+        run: >-
+          python -m unittest discover
+          -s perception/tests
+          -p "test_asr_model_downloader.py"
+          -v
