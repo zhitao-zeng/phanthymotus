@@ -42,7 +42,7 @@ class _SequenceDetector:
 
 
 class FireRedVadSessionTest(unittest.TestCase):
-    def _session(self, detector):
+    def _session(self, detector, *, silence_ms=400, pre_roll_ms=0):
         fake_module = types.ModuleType("plugins.firered_vad")
         fake_module.FireRedVadOnnx = mock.Mock(return_value=detector)
         modules = mock.patch.dict(
@@ -55,13 +55,41 @@ class FireRedVadSessionTest(unittest.TestCase):
         self.addCleanup(numpy.stop)
         return asr_runtime._FireRedVadSession(
             threshold=0.4,
-            silence_ms=400,
-            pre_roll_ms=0,
+            silence_ms=silence_ms,
+            pre_roll_ms=pre_roll_ms,
             model_dir="/unused",
         )
 
+    def test_preserves_one_continuous_span_across_detected_segments(self):
+        detector = _SequenceDetector([[(0.4, 1.0), (1.2, 1.8)]])
+        session = self._session(detector, pre_roll_ms=500)
+        session._pcm.extend(b"\x01\x00" * int(asr_runtime.SAMPLE_RATE * 3.0))
+
+        session._run_detect()
+
+        utterance, _, _ = session._completed.popleft()
+        # 0.0s start (0.4 - 0.5 pre-roll), 1.7s end
+        # (1.8 - 0.4 possible silence + 0.3 tail).
+        self.assertEqual(
+            len(utterance), int(asr_runtime.SAMPLE_RATE * 1.7) * 2
+        )
+
+    def test_does_not_trim_segment_that_reaches_buffer_end(self):
+        detector = _SequenceDetector([[(0.5, 2.0)]])
+        session = self._session(detector)
+        session._pcm.extend(b"\x01\x00" * int(asr_runtime.SAMPLE_RATE * 2.0))
+
+        session._run_detect()
+
+        utterance, _, _ = session._completed.popleft()
+        self.assertEqual(
+            len(utterance), int(asr_runtime.SAMPLE_RATE * 1.5) * 2
+        )
+
     def test_empty_detection_keeps_session_open_for_late_audio(self):
-        detector = _SequenceDetector([[], [(1.0, 1.6)]])
+        # FireRed reports the completed segment after the configured 400ms
+        # possible-silence run: speech is [1.0, 1.6], segment is [1.0, 2.0].
+        detector = _SequenceDetector([[], [(1.0, 2.0)]])
         session = self._session(detector)
         silence = b"\x00\x00" * asr_runtime.SAMPLE_RATE
         speech = b"\x01\x00" * int(asr_runtime.SAMPLE_RATE * 0.6)
