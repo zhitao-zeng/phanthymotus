@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 class OfflineASRHotwordsTest(unittest.TestCase):
-    def test_prepares_char_bpe_and_adds_domain_terms_once(self):
+    def test_prepares_only_configured_hotwords_as_char_bpe(self):
         from plugins.asr_offline import _prepare_hotwords_file
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -23,9 +23,8 @@ class OfflineASRHotwordsTest(unittest.TestCase):
 
             self.assertEqual(modeling_unit, "bpe")
             self.assertIn("举 双 手 :2.0", lines)
-            self.assertIn("来 个 飞 吻 :2.0", lines)
-            self.assertIn("高 举 你 的 双 手 :2.0", lines)
             self.assertEqual(lines.count("大 疆 :2.0"), 1)
+            self.assertFalse(any("飞 吻" in line for line in lines))
             self.assertFalse(any("comment" in line for line in lines))
 
             rescored_output, _ = _prepare_hotwords_file(
@@ -34,7 +33,7 @@ class OfflineASRHotwordsTest(unittest.TestCase):
             rescored_lines = rescored_output.read_text(
                 encoding="utf-8"
             ).splitlines()
-            self.assertIn("进 入 零 力 矩 模 式 :2.5", rescored_lines)
+            self.assertIn("举 双 手 :2.5", rescored_lines)
             self.assertTrue(all(line.endswith(":2.5") for line in rescored_lines))
 
 
