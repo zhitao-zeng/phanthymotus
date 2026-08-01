@@ -238,7 +238,7 @@ if flushed and len(flushed) > SAMPLE_RATE:
 
 - `perception/plugins/asr.py` — 主插件，含 stop() 顺序修复 + drain+flush 尾路径 + lifecycle_lock
 - `perception/plugins/asr_runtime.py` — `VadSession` + `_SherpaVadSession`（pre_roll 500ms + `_TimedPcmHistory` + drain + flush）
-- `perception/plugins/asr_offline.py` — `OfflineASRAdapter` 支持 x-asr transducer + paraformer fallback + hotwords + mbs(5)
+- `perception/plugins/asr_offline.py` — `OfflineASRAdapter` 支持 x-asr transducer + paraformer fallback + hotwords + mbs(10)
 - `perception/Dockerfile.jetson` — JP6 镜像，build 时烘焙 x-asr + VAD，消除评测机 volume mount 依赖
 - `perception/utils/asr_model_downloader.py` — `--model x_asr` 下载 transducer 三件套 + hotwords，原子替换
 - `perception/plugins/firered_vad.py` — vendor FireRedVAD ONNX runtime（DFSMN，无 torch），`FireRedVadOnnx.detect()`
@@ -288,3 +288,40 @@ if flushed and len(flushed) > SAMPLE_RATE:
 
 **尚未验证**：Jetson 10 实例并发和平台分数。单实例 12/12 非空支持修复方向，但能否彻底清除历史
 4/120 空结果仍需多实例或平台链路确认，不能由本轮单实例结果替代。
+
+---
+
+## 2026-08-01：领域微调评估与热词扩展
+
+### 数据与微调结论
+
+- 将 Ceph 源目录 `/mnt/contest_ceph/zhangjinghong/g1_voxcpm_output` 完整复制到本地盘
+  `/mnt/disk2/zengzhitao/x-asr-domain-finetune/data/g1_voxcpm_output`；源、目标均为 9023 个文件、约
+  1.1 GiB，`rsync -ani --delete` 无差异，源数据未修改；
+- 原始 manifest 共 8973 条、2991 个不同文本、52 个动作、约 6.33 小时；过滤时长 0.5–12 秒及
+  punctuation BPE `<unk>` 后保留 8110 条；按文本哈希分组，得到 train 7246 条（4.879 小时）和
+  dev 864 条（0.580 小时），文本交集为 0，两个 split 都覆盖全部 52 个动作；
+- 从官方 `fintuned_with_punctuation.pt` 做两轮保守全模型微调。PyTorch greedy dev CER 从
+  0.3567 降到 0.2521；导出 INT8 后，经项目 `OfflineASRAdapter` 在同一 synthetic dev 上，
+  基线 CER 0.0721，候选 CER 0.0447（相对下降 38.0%）；
+- 候选模型在 Jetson 真实 12-case full-file 上反而从基线 1-CER 0.8333 降到 0.7807，说明
+  synthetic voice/domain 与真实录音仍有偏移。该权重明确拒绝上线；checkpoint、数据、ONNX 和
+  评估结果均保留在 `/mnt/disk2/zengzhitao/x-asr-domain-finetune/`，未加入 Git。
+
+### 低风险热词方案
+
+- 保持现有 X-ASR 权重和 `hotwordsScore=2.0` 不变，在运行时为下载的 234 条动作词补入 10 条
+  产品领域词：`进入零力矩模式`、`进入阻尼模式`、`飞吻`、`来个飞吻`、`大疆`、`大疆创新`、
+  `仙元路`、`大疆天空之城`、`高举你的双手`、`双手打叉`；转换时去重，不修改下载模型资产；
+- Jetson full-file 12-case 参数扫描：新增热词 + maxActivePaths=5 得 1-CER 0.8684；10 路得
+  **0.8947**；20 路回落到 0.8860。对新增词使用 3/4/6 分偏置均比统一 2 分差，因此采用
+  `modified_beam_search(10)` + 2 分热词；
+- Jetson 镜像 `phanthymotus-perception-asr:hotwords10` 构建成功，image ID
+  `c1d7d416c18e`；ARM 镜像内 8 个 ASR 单测通过，模型、FireRedVAD、MCP 均正常加载；
+- 平台等价链路（MCP `config/start` → ROS2 1024-byte 实时音频 → 1500ms 静音 → FireRedVAD
+  → DDS 结果 → `stop`）12/12 非空，mean 1-CER **0.8747**，相对 `c71a51d` 的 0.8338
+  提升 4.09 个百分点；最大单条耗时 43.53 秒（含脚本固定的 30 秒 quiet window）；
+- 结果原件：`/mnt/disk2/zengzhitao/x-asr-domain-finetune/eval/hotwords10_jetson_results.json`，
+  SHA256 `ac43dde237846f04697cd96a31b86a8fd663873304566388fe8f7c2d21988d6d`。
+
+**尚未验证**：Jetson 10 实例并发和 Judge 平台分数；本轮只证明单实例平台等价链路改善。
