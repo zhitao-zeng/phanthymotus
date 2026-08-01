@@ -28,6 +28,15 @@ class OfflineASRHotwordsTest(unittest.TestCase):
             self.assertEqual(lines.count("大 疆 :2.0"), 1)
             self.assertFalse(any("comment" in line for line in lines))
 
+            rescored_output, _ = _prepare_hotwords_file(
+                source, root / "rescored", hotwords_score=2.5
+            )
+            rescored_lines = rescored_output.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            self.assertIn("进 入 零 力 矩 模 式 :2.5", rescored_lines)
+            self.assertTrue(all(line.endswith(":2.5") for line in rescored_lines))
+
 
 if __name__ == "__main__":
     unittest.main()
