@@ -138,6 +138,26 @@ class FireRedVadSessionTest(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(detector.calls, 2)
 
+    def test_diagnostics_explain_empty_detection(self):
+        detector = _SequenceDetector([[]])
+        session = self._session(detector)
+        speech = b"\x64\x00" * int(asr_runtime.SAMPLE_RATE * 0.4)
+        silence = b"\x00\x00" * asr_runtime.SAMPLE_RATE
+
+        session.process_chunk(speech, 1.0)
+        with self.assertLogs("asr_runtime.firered", level="INFO") as logs:
+            self.assertIsNone(session.process_chunk(silence, 2.0))
+
+        diagnostics = session.diagnostics()
+        self.assertEqual(diagnostics["chunks_seen"], 2)
+        self.assertEqual(diagnostics["detect_calls"], 1)
+        self.assertEqual(diagnostics["empty_detects"], 1)
+        self.assertEqual(diagnostics["segments_detected"], 0)
+        self.assertEqual(diagnostics["detect_triggers"], {"zero_tail": 1})
+        self.assertGreater(diagnostics["active_samples"], 0)
+        self.assertGreater(diagnostics["rms"], 0)
+        self.assertTrue(any("segments=0" in message for message in logs.output))
+
 
 if __name__ == "__main__":
     unittest.main()
