@@ -1,0 +1,36 @@
+name: obstacle-checks
+
+on:
+  push:
+    branches: [feat/zengzhitao-obstacle]
+    paths:
+      - "perception/**"
+      - ".github/workflows/obstacle-checks.yml"
+  pull_request:
+    paths:
+      - "perception/**"
+      - ".github/workflows/obstacle-checks.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install test dependency
+        run: python -m pip install "numpy==1.26.4"
+      - name: Compile obstacle Python sources
+        run: >-
+          python -m py_compile
+          perception/plugins/obstacle.py
+          perception/plugins/obstacle_distance_core/*.py
+          perception/utils/obstacle_model_downloader.py
+      - name: Run obstacle tests
+        run: python -m unittest discover -s perception/tests -p "test_obstacle*.py" -v

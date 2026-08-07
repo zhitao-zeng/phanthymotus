@@ -41,6 +41,18 @@ for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx', 'dashscope'):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
 
 
+def _rss_mib() -> float:
+    """Best-effort process RSS in MiB (0.0 when unreadable)."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def _load_config() -> dict:
@@ -86,6 +98,11 @@ class PerceptionBundle:
             plugin = VideoObjectPerceptionPlugin(plugins_cfg["vop"], namespace, executor)
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
+
+        if plugins_cfg.get("obstacle", {}).get("enabled", False):
+            from plugins.obstacle import ObstacleDistancePlugin
+            self._plugins.append(ObstacleDistancePlugin(plugins_cfg["obstacle"], executor))
+            log.info("ObstacleDistancePlugin loaded")
 
     def get_all_tools(self) -> list:
         tools = []
@@ -379,10 +396,16 @@ def _start_registration(mcp_port: int, name: str, category: str):
                     headers={"Content-Type": "application/json"}, method="POST",
                 )
                 with _urllib.urlopen(req, timeout=3, context=_ctx):
-                    log.info(f"[register] heartbeat ok → {agent_core_url}")
+                    log.info(
+                        f"[register] heartbeat ok → {agent_core_url} "
+                        f"rss={_rss_mib():.1f}MiB"
+                    )
                 _t.sleep(30)
             except Exception as e:
-                log.warning(f"[register] failed: {e}, retrying in 5s")
+                log.warning(
+                    f"[register] failed: {e}, retrying in 5s "
+                    f"rss={_rss_mib():.1f}MiB"
+                )
                 _t.sleep(5)
     threading.Thread(target=_run, daemon=True, name="register").start()
 
@@ -391,8 +414,8 @@ def main():
     global _bundle
 
     cfg      = _load_config()
-    mcp_port = int(cfg.get("mcp_port", 15720))
-    ws_port  = int(cfg.get("ws_port",  15721))
+    mcp_port = int(os.environ.get("MCP_PORT") or cfg.get("mcp_port", 15720))
+    ws_port = int(os.environ.get("WS_PORT") or cfg.get("ws_port", 15721))
 
     log.info(f"perception bundle starting, mcp_port={mcp_port}, ws_port={ws_port}")
     log.info(f"config: plugins.asr.enabled={cfg.get('plugins',{}).get('asr',{}).get('enabled')}, "
@@ -416,8 +439,15 @@ def main():
 
     threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
 
-    # Start WebSocket ASR server in a separate thread
-    threading.Thread(target=_start_ws_thread, args=(ws_port,), daemon=True, name="ws_asr").start()
+    # Obstacle-only images do not install the ASR WebSocket dependency. Start
+    # that server only when the ASR plugin is actually enabled.
+    if asr_cfg.get("enabled", False):
+        threading.Thread(
+            target=_start_ws_thread,
+            args=(ws_port,),
+            daemon=True,
+            name="ws_asr",
+        ).start()
 
     _start_registration(mcp_port, "Perception Stack", "perception")
 
