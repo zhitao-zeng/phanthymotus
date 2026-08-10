@@ -25,6 +25,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from std_msgs.msg import String
 
 from plugins.asr_runtime import (
+    IngressSessionDiagnostics,
     VadSession,
     pcm16_to_float_samples,
     resolve_vad_settings,
@@ -37,10 +38,10 @@ SPEECH_THRESH  = 0.5
 SILENCE_THRESH = 0.35
 SILENCE_FRAMES = 16
 
-_LOW_LAT_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
+_ASR_INPUT_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
-    depth=50,
+    depth=200,
     durability=DurabilityPolicy.VOLATILE,
 )
 
@@ -640,13 +641,17 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 model_dir: str,
                 kws_cfg: dict = None,
                 save_vad_segments: bool = False, max_saved_segments: int = 1000,
-                pause_evt: multiprocessing.Event = None):
+                pause_evt: multiprocessing.Event = None,
+                pause_ack_evt: multiprocessing.Event = None,
+                resume_ack_evt: multiprocessing.Event = None,
+                initial_session_id: int = 1):
     """Runs in a child process — sherpa-onnx ONNX VAD + optional KWS gate.
 
     Pipeline: Audio → VAD → (KWS gate) → utterance output
     - If kws_cfg is provided and enabled, only output utterances after keyword detected
     - Otherwise (kws disabled), output all utterances (backward compat)
     - pause_evt: when set, drain pcm_q without outputting (VAD process stays alive across stop/start)
+    - pause_ack_evt/resume_ack_evt: parent/worker lifecycle handshake
     """
     logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                         datefmt='%H:%M:%S')
@@ -744,13 +749,17 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         f"[vad-worker] process started (pid={os.getpid()}, "
         f"backend={vad_session.backend}, kws={kws_enabled})"
     )
-    session_id = 1
+    session_id = max(1, int(initial_session_id))
     session_chunks = 0
     session_bytes = 0
     session_utterances = 0
     session_queue_drops = 0
     paused_dropped_chunks = 0
     paused_dropped_bytes = 0
+    if pause_ack_evt is not None:
+        pause_ack_evt.clear()
+    if resume_ack_evt is not None:
+        resume_ack_evt.set()
 
     # VAD segment saving
     _VAD_SEG_DIR = '/models/vad_segments'
@@ -800,6 +809,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         if pause_evt is not None and pause_evt.is_set():
             if not paused:
                 paused = True
+                if resume_ack_evt is not None:
+                    resume_ack_evt.clear()
                 try:
                     summary = {
                         "session_id": session_id,
@@ -818,6 +829,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 try:
                     vad_session.init()  # reset VAD state for the next utterance
                     _log.info("[vad-worker] paused, session=%d reset", session_id)
+                    if pause_ack_evt is not None:
+                        pause_ack_evt.set()
                 except Exception:
                     _log.exception("[vad-worker] failed to reset paused session")
             try:
@@ -843,6 +856,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             session_queue_drops = 0
             paused_dropped_chunks = 0
             paused_dropped_bytes = 0
+            if pause_ack_evt is not None:
+                pause_ack_evt.clear()
+            if resume_ack_evt is not None:
+                resume_ack_evt.set()
             _log.info("[vad-worker] resumed session=%d", session_id)
 
         try:
@@ -960,6 +977,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         except queue.Full:
             _log.warning("[vad-worker] utterance queue full on flush, dropping segment")
 
+    if pause_ack_evt is not None:
+        pause_ack_evt.clear()
+    if resume_ack_evt is not None:
+        resume_ack_evt.clear()
     _log.info("[vad-worker] process exiting")
 
 
@@ -983,7 +1004,7 @@ class _ASRNode(Node):
         # reader can lose short utterances while DDS endpoints rematch.
         from audio_msgs.msg import AudioChunk
         self._sub = self.create_subscription(
-            AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS
+            AudioChunk, self._input_topic, self._audio_cb, _ASR_INPUT_QOS
         )
         self._pub      = self.create_publisher(String, self._output_topic, _ASR_PUB_QOS)
         # VAD runs in a separate process to avoid GIL contention
@@ -999,6 +1020,9 @@ class _ASRNode(Node):
         self._utterance_queue: Optional[multiprocessing.Queue] = None
         self._vad_stop: Optional[multiprocessing.Event] = None
         self._vad_pause: Optional[multiprocessing.Event] = None   # pause=True → VAD drains silently
+        self._vad_pause_ack: Optional[multiprocessing.Event] = None
+        self._vad_resume_ack: Optional[multiprocessing.Event] = None
+        self._vad_reuse_safe = False
         self._vad_proc: Optional[multiprocessing.Process] = None
         self._vad_cfg_key: tuple = ()                             # snapshot for change-detection
         self._worker_thread: Optional[threading.Thread] = None
@@ -1011,6 +1035,8 @@ class _ASRNode(Node):
         self._last_audio_ts = None
         self._last_result_ts = None
         self._last_error = None
+        self._ingress_lock = threading.Lock()
+        self._ingress = IngressSessionDiagnostics()
 
     def start(self) -> dict:
         if self.state == "running":
@@ -1033,25 +1059,46 @@ class _ASRNode(Node):
     def _start_inner(self) -> dict:
         log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
         self._first_chunk_event = threading.Event()
+        self._stop_event.set()  # keep callbacks gated until the VAD worker is ready
         # Subscription is persistent (created in __init__); only recreate if
         # it was torn down (e.g. after an error path).
         if self._sub is None:
             from audio_msgs.msg import AudioChunk
             self._sub = self.create_subscription(
-                AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS
+                AudioChunk, self._input_topic, self._audio_cb, _ASR_INPUT_QOS
             )
-        self._stop_event.clear()
 
         new_vad_cfg = self._vad_cfg_snapshot()
         vad_cfg_changed = (new_vad_cfg != self._vad_cfg_key)
+        next_session_id = self._ingress.session_id + 1
+        lifecycle_timeout = max(
+            0.1, float(os.environ.get("ASR_VAD_LIFECYCLE_TIMEOUT_S", "2.0"))
+        )
+        worker_ready = False
 
         # ── VAD process: reuse if alive and config unchanged, else (re)build ──
         if (self._vad_proc is not None and self._vad_proc.is_alive()
-                and not vad_cfg_changed and self._vad_pause is not None):
-            # Resume paused VAD process — ONNX model already loaded, no cold start
+                and not vad_cfg_changed and self._vad_pause is not None
+                and self._vad_pause_ack is not None
+                and self._vad_resume_ack is not None
+                and self._vad_reuse_safe and self._vad_pause_ack.is_set()):
+            # Resume only after the worker has acknowledged the previous reset.
+            self._vad_resume_ack.clear()
             self._vad_pause.clear()
-            log.info(f"[asr] VAD worker resumed (pid={self._vad_proc.pid}, rss={_rss_mb():.0f}MB)")
-        else:
+            worker_ready = self._vad_resume_ack.wait(timeout=lifecycle_timeout)
+            if worker_ready:
+                log.info(
+                    f"[asr] VAD worker resume acknowledged "
+                    f"(pid={self._vad_proc.pid}, rss={_rss_mb():.0f}MB)"
+                )
+            else:
+                log.warning(
+                    "[asr] VAD worker resume acknowledgement timed out; "
+                    "rebuilding worker"
+                )
+                self._destroy_vad()
+
+        if not worker_ready:
             # Tear down any stale process first
             if self._vad_proc is not None and self._vad_proc.is_alive():
                 if self._vad_stop:
@@ -1070,6 +1117,9 @@ class _ASRNode(Node):
             self._utterance_queue = multiprocessing.Queue(maxsize=100)
             self._vad_stop = multiprocessing.Event()
             self._vad_pause = multiprocessing.Event()
+            self._vad_pause_ack = multiprocessing.Event()
+            self._vad_resume_ack = multiprocessing.Event()
+            self._vad_reuse_safe = False
             self._vad_cfg_key = new_vad_cfg
             self._vad_proc = multiprocessing.Process(
                 target=_vad_worker,
@@ -1077,30 +1127,37 @@ class _ASRNode(Node):
                       self._vad_backend, self._vad_threshold, self._vad_silence_ms,
                       self._vad_pre_roll_ms, self._vad_model_dir, self._kws_cfg,
                       self._save_vad_segments, self._max_saved_segments,
-                      self._vad_pause),
+                      self._vad_pause, self._vad_pause_ack,
+                      self._vad_resume_ack, next_session_id),
                 daemon=True, name="vad_worker",
             )
             self._vad_proc.start()
             log.info(f"[asr] VAD worker process started (pid={self._vad_proc.pid}, rss={_rss_mb():.0f}MB)")
-            # Verify VAD worker is alive before returning "running" to caller.
-            # A dead VAD worker silently drops all audio — fail fast so the
-            # caller receives an explicit startup failure.
-            time.sleep(1.0)
-            if not self._vad_proc.is_alive():
+            startup_timeout = max(
+                lifecycle_timeout,
+                float(os.environ.get("ASR_VAD_START_TIMEOUT_S", "10.0")),
+            )
+            worker_ready = self._vad_resume_ack.wait(timeout=startup_timeout)
+            if not worker_ready or not self._vad_proc.is_alive():
                 exitcode = self._vad_proc.exitcode
                 self.state = "error"
+                self._destroy_vad()
                 self.destroy_subscription(self._sub); self._sub = None
                 raise RuntimeError(
-                    f"VAD worker process died immediately (exitcode={exitcode}). "
+                    f"VAD worker failed readiness handshake (exitcode={exitcode}). "
                     f"Check that /models/sherpa-onnx/vad/silero_vad.onnx exists "
                     f"or that the COS fallback download succeeded."
                 )
+            self._vad_reuse_safe = True
 
         # Do not wait for an audio publisher here: clients may create it only
         # after start() returns. The persistent subscription lets endpoint
         # matching complete asynchronously.
 
         # Transcription worker thread (reads from utterance_queue)
+        with self._ingress_lock:
+            self._ingress.start(next_session_id)
+        self._stop_event.clear()
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
         self.state = "running"
@@ -1114,6 +1171,9 @@ class _ASRNode(Node):
         reload) and the same DDS endpoints (discovery state preserved).
         Use _destroy_vad() for real teardown (adapter rebuild / topic change).
         """
+        if self.state == "idle":
+            return {"state": "idle"}
+
         # Subscription stays alive across stop/start (see __init__ comment);
         # _audio_cb drops incoming chunks while _stop_event is set.
         # Unblock start() if it's waiting
@@ -1122,8 +1182,28 @@ class _ASRNode(Node):
         if hasattr(self, '_worker_ready'):
             self._worker_ready.set()
         # Pause the VAD worker (it resets its session and drains pcm silently)
-        if self._vad_pause is not None:
+        if (self._vad_pause is not None and self._vad_pause_ack is not None
+                and self._vad_proc is not None and self._vad_proc.is_alive()):
+            self._vad_pause_ack.clear()
+            if self._vad_resume_ack is not None:
+                self._vad_resume_ack.clear()
             self._vad_pause.set()
+            lifecycle_timeout = max(
+                0.1, float(os.environ.get("ASR_VAD_LIFECYCLE_TIMEOUT_S", "2.0"))
+            )
+            self._vad_reuse_safe = self._vad_pause_ack.wait(
+                timeout=lifecycle_timeout
+            )
+            if self._vad_reuse_safe:
+                log.info(
+                    f"[asr] VAD worker pause acknowledged "
+                    f"(pid={self._vad_proc.pid})"
+                )
+            else:
+                log.warning(
+                    "[asr] VAD worker pause acknowledgement timed out; "
+                    "worker will be rebuilt on next start"
+                )
         # Let the transcription worker drain queued utterances before we stop it
         if self._utterance_queue is not None and self._worker_thread is not None:
             deadline = time.monotonic() + 3.0
@@ -1139,6 +1219,12 @@ class _ASRNode(Node):
         self._stop_event.set()
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=3)
+        with self._ingress_lock:
+            ingress_summary = self._ingress.snapshot()
+        log.info(
+            "[asr] input session summary reason=stop %s",
+            json.dumps(ingress_summary, ensure_ascii=False, sort_keys=True),
+        )
         self.state = "idle"
         return {"state": "idle"}
 
@@ -1160,6 +1246,10 @@ class _ASRNode(Node):
                 except Exception:
                     pass
         self._vad_proc = None
+        self._vad_pause = None
+        self._vad_pause_ack = None
+        self._vad_resume_ack = None
+        self._vad_reuse_safe = False
         self._vad_cfg_key = ()
 
     def _wait_result_subscriber(self) -> bool:
@@ -1216,21 +1306,34 @@ class _ASRNode(Node):
             return
         pcm = bytes(msg.data)
         ts  = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        self._received_chunks += 1
-        self._last_audio_ts = ts
-        if self._received_chunks == 1:
-            log.info(f"[asr] first audio chunk received (rss={_rss_mb():.0f}MB)")
         if ts < 1e9:  # header.stamp not set by publisher
             ts = time.time()
+        with self._ingress_lock:
+            self._received_chunks += 1
+            self._last_audio_ts = ts
+            first_session_chunk = self._ingress.record_callback(pcm, ts)
+            session_id = self._ingress.session_id
+        if first_session_chunk:
+            log.info(
+                f"[asr] first audio callback session={session_id} "
+                f"len={len(pcm)} rss={_rss_mb():.0f}MB"
+            )
         try:
             self._pcm_queue.put_nowait((pcm, ts))
+            with self._ingress_lock:
+                self._ingress.record_enqueued(pcm)
         except queue.Full:
-            self._dropped_chunks += 1
-            if self._dropped_chunks == 1 or self._dropped_chunks % 100 == 0:
-                log.warning(f"[asr] PCM queue full, dropped_chunks={self._dropped_chunks}")
+            with self._ingress_lock:
+                self._dropped_chunks += 1
+                self._ingress.record_drop()
+                dropped_chunks = self._dropped_chunks
+            if dropped_chunks == 1 or dropped_chunks % 100 == 0:
+                log.warning(f"[asr] PCM queue full, dropped_chunks={dropped_chunks}")
         except Exception as e:
-            self._dropped_chunks += 1
-            self._last_error = str(e)
+            with self._ingress_lock:
+                self._dropped_chunks += 1
+                self._ingress.record_drop()
+                self._last_error = str(e)
             log.error(f"[asr] failed to enqueue audio: {e}")
 
     def _worker(self):
@@ -1339,6 +1442,9 @@ class _ASRNode(Node):
             except (AttributeError, NotImplementedError, OSError):
                 return None
 
+        with self._ingress_lock:
+            ingress_snapshot = self._ingress.snapshot()
+
         return {
             "state":     self.state,
             "topic_in":  [{"topic": self._input_topic,  "format": "audio/pcm-16k", "desc": ""}],
@@ -1353,6 +1459,7 @@ class _ASRNode(Node):
                 "last_audio_ts": self._last_audio_ts,
                 "last_result_ts": self._last_result_ts,
                 "last_error": self._last_error,
+                "input_session": ingress_snapshot,
             },
         }
 

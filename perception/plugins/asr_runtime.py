@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import struct
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Iterable, Optional
@@ -17,6 +18,70 @@ try:
     import numpy as _np
 except ImportError:  # pragma: no cover - exercised in minimal runtime images
     _np = None
+
+
+@dataclass
+class IngressSessionDiagnostics:
+    """Per-start counters at the ROS callback and PCM queue boundary."""
+
+    session_id: int = 0
+    callback_chunks: int = 0
+    callback_bytes: int = 0
+    callback_nonzero_chunks: int = 0
+    queued_chunks: int = 0
+    queued_bytes: int = 0
+    pcm_queue_drops: int = 0
+    first_header_ts: Optional[float] = None
+    last_header_ts: Optional[float] = None
+    started_monotonic: Optional[float] = None
+
+    def start(self, session_id: int, *, now: Optional[float] = None) -> None:
+        self.session_id = session_id
+        self.callback_chunks = 0
+        self.callback_bytes = 0
+        self.callback_nonzero_chunks = 0
+        self.queued_chunks = 0
+        self.queued_bytes = 0
+        self.pcm_queue_drops = 0
+        self.first_header_ts = None
+        self.last_header_ts = None
+        self.started_monotonic = time.monotonic() if now is None else now
+
+    def record_callback(self, pcm: bytes, header_ts: float) -> bool:
+        """Record one ROS callback and return whether it is the session's first."""
+        self.callback_chunks += 1
+        self.callback_bytes += len(pcm)
+        if any(pcm):
+            self.callback_nonzero_chunks += 1
+        if self.first_header_ts is None:
+            self.first_header_ts = header_ts
+        self.last_header_ts = header_ts
+        return self.callback_chunks == 1
+
+    def record_enqueued(self, pcm: bytes) -> None:
+        self.queued_chunks += 1
+        self.queued_bytes += len(pcm)
+
+    def record_drop(self) -> None:
+        self.pcm_queue_drops += 1
+
+    def snapshot(self, *, now: Optional[float] = None) -> dict:
+        elapsed_ms = None
+        if self.started_monotonic is not None:
+            current = time.monotonic() if now is None else now
+            elapsed_ms = round(max(0.0, current - self.started_monotonic) * 1000)
+        return {
+            "session_id": self.session_id,
+            "callback_chunks": self.callback_chunks,
+            "callback_bytes": self.callback_bytes,
+            "callback_nonzero_chunks": self.callback_nonzero_chunks,
+            "queued_chunks": self.queued_chunks,
+            "queued_bytes": self.queued_bytes,
+            "pcm_queue_drops": self.pcm_queue_drops,
+            "first_header_ts": self.first_header_ts,
+            "last_header_ts": self.last_header_ts,
+            "elapsed_ms": elapsed_ms,
+        }
 
 
 def pcm16_to_float_samples(pcm: bytes):

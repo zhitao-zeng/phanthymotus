@@ -159,5 +159,46 @@ class FireRedVadSessionTest(unittest.TestCase):
         self.assertTrue(any("segments=0" in message for message in logs.output))
 
 
+class IngressSessionDiagnosticsTest(unittest.TestCase):
+    def test_separates_callbacks_enqueues_and_queue_drops(self):
+        diagnostics = asr_runtime.IngressSessionDiagnostics()
+        diagnostics.start(3, now=10.0)
+
+        self.assertTrue(diagnostics.record_callback(b"\x00" * 4, 100.0))
+        diagnostics.record_enqueued(b"\x00" * 4)
+        self.assertFalse(diagnostics.record_callback(b"\x01\x00" * 3, 100.1))
+        diagnostics.record_drop()
+
+        self.assertEqual(
+            diagnostics.snapshot(now=10.25),
+            {
+                "session_id": 3,
+                "callback_chunks": 2,
+                "callback_bytes": 10,
+                "callback_nonzero_chunks": 1,
+                "queued_chunks": 1,
+                "queued_bytes": 4,
+                "pcm_queue_drops": 1,
+                "first_header_ts": 100.0,
+                "last_header_ts": 100.1,
+                "elapsed_ms": 250,
+            },
+        )
+
+    def test_start_resets_previous_session(self):
+        diagnostics = asr_runtime.IngressSessionDiagnostics()
+        diagnostics.start(1, now=1.0)
+        diagnostics.record_callback(b"\x01\x00", 20.0)
+        diagnostics.record_enqueued(b"\x01\x00")
+
+        diagnostics.start(2, now=2.0)
+
+        snapshot = diagnostics.snapshot(now=2.0)
+        self.assertEqual(snapshot["session_id"], 2)
+        self.assertEqual(snapshot["callback_chunks"], 0)
+        self.assertEqual(snapshot["queued_chunks"], 0)
+        self.assertIsNone(snapshot["first_header_ts"])
+
+
 if __name__ == "__main__":
     unittest.main()
