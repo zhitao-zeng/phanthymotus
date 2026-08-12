@@ -93,7 +93,7 @@ RUN python3 /tmp/asr_model_downloader.py \
       --output-dir /models/firered_vad && \
     rm -f /tmp/asr_model_downloader.py
 RUN mkdir -p /models/sherpa-onnx/vad && \
-    python3 -c "import urllib.request; urllib.request.urlretrieve('https://github.com/snakers4/silero-vad/raw/master/files/silero_vad.onnx', '/models/sherpa-onnx/vad/silero_vad.onnx')"
+    python3 -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx', '/models/sherpa-onnx/vad/silero_vad.onnx')"
 
 # Keep CPU-heavy inference predictable on memory-constrained Jetson devices.
 ENV OMP_NUM_THREADS=1 \

@@ -19,6 +19,10 @@ class ASRModelDownloaderTest(unittest.TestCase):
             dockerfile,
         )
         self.assertIn("--output-dir /models/firered_vad", dockerfile)
+        self.assertIn(
+            "src/silero_vad/data/silero_vad.onnx",
+            dockerfile,
+        )
         self.assertIn("model_path: /models/sherpa-onnx/x_asr_punct_int8", config)
         self.assertIn("model_dir: /models/firered_vad", config)
 
