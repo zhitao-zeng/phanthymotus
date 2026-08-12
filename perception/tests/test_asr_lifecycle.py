@@ -85,6 +85,22 @@ class _FakeVadSession:
         return b""
 
 
+class _FakeRunningNode:
+    def __init__(self):
+        self.state = "running"
+        self.stop_calls = 0
+        self.start_calls = 0
+
+    def stop(self):
+        self.stop_calls += 1
+        self.state = "idle"
+
+    def start(self):
+        self.start_calls += 1
+        self.state = "running"
+        return {"state": "running"}
+
+
 class AsrLifecycleTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -146,6 +162,48 @@ class AsrLifecycleTest(unittest.TestCase):
             stop_evt.set()
             worker.join(timeout=2.0)
             self.assertFalse(worker.is_alive())
+
+    def test_utterance_queue_accepts_legacy_and_kws_aware_items(self):
+        legacy = self.asr._unpack_utterance_queue_item((b"pcm", 1.0, 2.0))
+        kws_aware = self.asr._unpack_utterance_queue_item(
+            (b"pcm", 1.0, 2.0, True)
+        )
+
+        self.assertEqual(legacy, (b"pcm", 1.0, 2.0, False))
+        self.assertEqual(kws_aware, (b"pcm", 1.0, 2.0, True))
+
+    def test_non_model_config_restarts_running_nodes(self):
+        plugin = self.asr.ASRPlugin.__new__(self.asr.ASRPlugin)
+        node = _FakeRunningNode()
+        adapter = object()
+        plugin._state_lock = threading.Lock()
+        plugin._loading = False
+        plugin._load_error = None
+        plugin._adapter = adapter
+        plugin._plugin_cfg = {"mode": "offline", "language": "zh-CN"}
+        plugin._mode = "offline"
+        plugin._language = "zh-CN"
+        plugin._asr_model = "paraformer-zh-en"
+        plugin._vad_backend = "firered"
+        plugin._vad_threshold = 0.4
+        plugin._vad_silence_ms = 400
+        plugin._vad_pre_roll_ms = 500
+        plugin._vad_model_dir = "/models/vad"
+        plugin._kws_cfg = {"trigger_mode": "vad", "enabled": False}
+        plugin._save_vad_segments = False
+        plugin._max_saved_segments = 1000
+        plugin._nodes = {"case": node}
+
+        result = plugin._dispatch_action(
+            "config", {"language": "en-US"}, ""
+        )
+
+        self.assertEqual(result["status"], "configured")
+        self.assertEqual(node.stop_calls, 1)
+        self.assertEqual(node.start_calls, 1)
+        self.assertEqual(node.state, "running")
+        self.assertIs(node._adapter, adapter)
+        self.assertEqual(node._language, "en-US")
 
 
 if __name__ == "__main__":

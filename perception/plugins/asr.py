@@ -344,6 +344,17 @@ def _asr_output_topic(input_topic: str) -> str:
     return f"{input_topic}/asr"
 
 
+def _unpack_utterance_queue_item(item):
+    """Accept both legacy VAD results and upstream KWS-aware results."""
+    if len(item) == 4:
+        utterance, start_ts, end_ts, kws_triggered = item
+        return utterance, start_ts, end_ts, bool(kws_triggered)
+    if len(item) == 3:
+        utterance, start_ts, end_ts = item
+        return utterance, start_ts, end_ts, False
+    raise ValueError(f"invalid utterance queue item length: {len(item)}")
+
+
 def _is_kws_enabled(kws_cfg: dict | None) -> bool:
     if not kws_cfg:
         return False
@@ -742,6 +753,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     # ── State machine ──
     # States: 'waiting_wake' (KWS mode) or 'listening' (direct mode / post-wake)
     state = 'waiting_wake' if kws_enabled else 'listening'
+    kws_triggered = False
     kws_cooldown_until = 0.0
     paused = False
 
@@ -874,12 +886,18 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     if len(utterance) > SAMPLE_RATE:
                         _log.info(f"[vad-worker] idle-trigger utterance, len={len(utterance)} bytes")
                         try:
-                            result_q.put((utterance, start_ts, end_ts), timeout=0.2)
+                            result_q.put(
+                                (utterance, start_ts, end_ts, kws_triggered),
+                                timeout=0.2,
+                            )
                         except queue.Full:
                             session_queue_drops += 1
                             _log.warning("[vad-worker] utterance queue full on idle trigger")
                         else:
                             session_utterances += 1
+                            kws_triggered = False
+                        if kws_enabled:
+                            state = 'waiting_wake'
             continue
 
         session_chunks += 1
@@ -909,6 +927,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                         kws_cooldown_until = now + 2.0
                         _log.info(f"[vad-worker] WAKE WORD detected: {kw.strip()}")
                         state = 'listening'
+                        kws_triggered = True
                         kws_stream = kws_spotter.create_stream()
             # Drain any completed VAD segments (discard in wake-wait mode)
             vad_result = vad_session.process_chunk(pcm, ts)
@@ -929,12 +948,16 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 continue
             _log.info(f"[vad-worker] utterance complete, len={len(utterance)} bytes")
             try:
-                result_q.put((utterance, start_ts, end_ts), timeout=0.2)
+                result_q.put(
+                    (utterance, start_ts, end_ts, kws_triggered),
+                    timeout=0.2,
+                )
             except queue.Full:
                 session_queue_drops += 1
                 _log.warning("[vad-worker] utterance queue full, dropping segment")
             else:
                 session_utterances += 1
+                kws_triggered = False
             if kws_enabled:
                 state = 'waiting_wake'
 
@@ -960,7 +983,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 continue
             _log.info(f"[vad-worker] drained utterance, len={len(utterance)} bytes")
             try:
-                result_q.put((utterance, start_ts, end_ts), timeout=0.2)
+                result_q.put(
+                    (utterance, start_ts, end_ts, kws_triggered),
+                    timeout=0.2,
+                )
             except queue.Full:
                 _log.warning("[vad-worker] utterance queue full during drain, dropping segment")
     except Exception as e:
@@ -973,7 +999,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             _save_segment_pcm(flushed, _seg_count)
             _seg_count[0] += 1
         try:
-            result_q.put((flushed, 0.0, 0.0), timeout=0.2)
+            result_q.put((flushed, 0.0, 0.0, kws_triggered), timeout=0.2)
         except queue.Full:
             _log.warning("[vad-worker] utterance queue full on flush, dropping segment")
 
@@ -1366,7 +1392,30 @@ class _ASRNode(Node):
 
         while not self._stop_event.is_set():
             try:
-                utterance, start_ts, end_ts = self._utterance_queue.get(timeout=1)
+                item = self._utterance_queue.get(timeout=1)
+                # Keep compatibility with upstream's speech-onset hook signal.
+                if len(item) >= 2 and item[0] == "speech_start":
+                    try:
+                        import json as _json_hook
+                        import ssl as _ssl
+                        import urllib.request as _urllib_req
+
+                        hook_request = _urllib_req.Request(
+                            "https://localhost:15678/api/hooks/fire",
+                            data=_json_hook.dumps({"hook": "on_hearing"}).encode(),
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        context = _ssl.create_default_context()
+                        context.check_hostname = False
+                        context.verify_mode = _ssl.CERT_NONE
+                        _urllib_req.urlopen(hook_request, timeout=2, context=context)
+                    except Exception as error:
+                        log.debug(f"[asr] fire on_hearing failed: {error}")
+                    continue
+                utterance, start_ts, end_ts, _kws_from_vad = (
+                    _unpack_utterance_queue_item(item)
+                )
             except queue.Empty:
                 continue
             except Exception as e:
@@ -1716,10 +1765,22 @@ class ASRPlugin:
                     "asr_model": self._asr_model,
                     "message": f"Switching ASR to mode '{self._mode}'...",
                 }
-            # Stop all nodes (they keep publisher/DDS state; next start
-            # syncs the new config into them via the start path's reuse branch)
-            for node in self._nodes.values():
+            # Apply non-model config without leaving active instances stopped.
+            was_running = [node for node in self._nodes.values() if node.state == "running"]
+            for node in was_running:
                 node.stop()
+            for node in was_running:
+                node._adapter = adapter
+                node._language = self._language
+                node._vad_backend = self._vad_backend
+                node._vad_threshold = self._vad_threshold
+                node._vad_silence_ms = self._vad_silence_ms
+                node._vad_pre_roll_ms = self._vad_pre_roll_ms
+                node._vad_model_dir = self._vad_model_dir
+                node._kws_cfg = self._kws_cfg
+                node._save_vad_segments = self._save_vad_segments
+                node._max_saved_segments = self._max_saved_segments
+                node.start()
             return {
                 "status": "configured",
                 "mode": self._mode,
