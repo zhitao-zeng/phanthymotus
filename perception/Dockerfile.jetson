@@ -86,11 +86,11 @@ COPY perception/utils/asr_model_downloader.py /tmp/asr_model_downloader.py
 RUN python3 /tmp/asr_model_downloader.py \
       --model x_asr \
       --base-url ${ASR_OFFLINE_MODEL_BASE_URL} \
-      --output-dir /models/sherpa-onnx/asr-offline
+      --output-dir /models/sherpa-onnx/x_asr_punct_int8
 RUN python3 /tmp/asr_model_downloader.py \
       --model firered_vad \
-      --base-url http://172.28.4.81:34567/zengzhitao/embodied-ai/FireRedVAD \
-      --output-dir /models/sherpa-onnx/firered-vad && \
+      --base-url http://172.28.4.81:34567/zengzhitao/embodied-ai/firered_vad \
+      --output-dir /models/firered_vad && \
     rm -f /tmp/asr_model_downloader.py
 RUN mkdir -p /models/sherpa-onnx/vad && \
     python3 -c "import urllib.request; urllib.request.urlretrieve('https://github.com/snakers4/silero-vad/raw/master/files/silero_vad.onnx', '/models/sherpa-onnx/vad/silero_vad.onnx')"

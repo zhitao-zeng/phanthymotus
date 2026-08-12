@@ -9,6 +9,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 class ASRModelDownloaderTest(unittest.TestCase):
+    def test_jetson_model_destinations_match_product_config(self):
+        perception_dir = Path(__file__).resolve().parents[1]
+        dockerfile = (perception_dir / "Dockerfile.jetson").read_text()
+        config = (perception_dir / "config.yaml").read_text()
+
+        self.assertIn(
+            "--output-dir /models/sherpa-onnx/x_asr_punct_int8",
+            dockerfile,
+        )
+        self.assertIn("--output-dir /models/firered_vad", dockerfile)
+        self.assertIn("model_path: /models/sherpa-onnx/x_asr_punct_int8", config)
+        self.assertIn("model_dir: /models/firered_vad", config)
+
     def test_downloads_complete_bundle_from_staging(self):
         from utils.asr_model_downloader import download_model
 
