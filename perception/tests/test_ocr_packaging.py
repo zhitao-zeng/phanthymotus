@@ -40,8 +40,11 @@ class OCRPackagingTest(unittest.TestCase):
         config = (REPO_ROOT / "perception" / "config.yaml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("  asr:\n    enabled: true", config)
-        self.assertIn("  ocr:\n    enabled: false\n    provider: rapidocr", config)
+        self.assertIn("  asr:\n    enabled: false", config)
+        self.assertIn("  tts:\n    enabled: false", config)
+        self.assertIn("  htmsg:\n    enabled: false", config)
+        self.assertIn("  vop:\n    enabled: false", config)
+        self.assertIn("  ocr:\n    enabled: true\n    provider: rapidocr", config)
         self.assertIn(
             "model_dir: /models/ocr/ppocrv6-small-trt",
             config,
@@ -63,10 +66,13 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertNotIn("fallback_model_dir:", config)
         self.assertNotIn("large_image_strategy:", config)
 
-    def test_jetson_image_uses_external_ocr_models(self):
+    def test_jetson_image_downloads_ocr_models_on_first_start(self):
         dockerfile = (REPO_ROOT / "perception" / "Dockerfile.jetson").read_text(
             encoding="utf-8"
         )
+        downloader = (
+            REPO_ROOT / "perception" / "utils" / "model_downloader.py"
+        ).read_text(encoding="utf-8")
 
         self.assertIn("rapidocr==3.9.1", dockerfile)
         self.assertNotIn("MNN", dockerfile)
@@ -89,48 +95,43 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertNotIn("onnxruntime", dockerfile)
         self.assertIn("rapidocr.__file__", dockerfile)
         self.assertIn("-name '*.onnx' -delete", dockerfile)
-        self.assertIn("curl --fail --location", dockerfile)
-        self.assertIn("sha256sum -c -", dockerfile)
-        self.assertIn("--connect-timeout 20 --max-time 120", dockerfile)
-        self.assertIn("OCR_MODEL_REVISION=0301e9299b3abe09c6a60796d7bed74c23fcc525", dockerfile)
+        self.assertIn("ARG JP_VERSION=61", dockerfile)
+        self.assertNotIn("OCR_MODEL_REVISION", dockerfile)
+        self.assertNotIn("model-seed/ocr", dockerfile)
+        self.assertNotIn("seed_ocr_models.sh", dockerfile)
+        self.assertFalse(
+            (REPO_ROOT / "perception" / "deploy" / "seed_ocr_models.sh").exists()
+        )
         self.assertNotIn("resolve/master", dockerfile)
-        self.assertIn("MODEL_TEMP=\"$(mktemp", dockerfile)
-        self.assertIn('mv -f "${MODEL_TEMP}"', dockerfile)
-        self.assertIn("DET_SIZE=11194324", dockerfile)
-        self.assertIn("DET_SIZE=12334256", dockerfile)
-        self.assertIn("REC_SIZE=23303292", dockerfile)
-        self.assertIn("REC_SIZE=19915466", dockerfile)
-        self.assertIn("CLS_SIZE=1046484", dockerfile)
-        self.assertIn("CLS_SIZE=1038858", dockerfile)
-        self.assertIn('stat -c \'%s\' "${MODEL_TEMP}"', dockerfile)
+
+        self.assertIn("OCR_MODEL_BASE_URL", downloader)
+        self.assertIn("www.modelscope.cn", downloader)
+        self.assertIn("0301e9299b3abe09c6a60796d7bed74c23fcc525", downloader)
+        self.assertNotIn("resolve/master", downloader)
+        self.assertIn('"size": 11194324', downloader)
+        self.assertIn('"size": 12334256', downloader)
+        self.assertIn('"size": 23303292', downloader)
+        self.assertIn('"size": 19915466', downloader)
+        self.assertIn('"size": 1046484', downloader)
+        self.assertIn('"size": 1038858', downloader)
         self.assertIn(
             "tensorrt-jp6-trt10.4-orin-batch8-cls8",
-            dockerfile,
+            downloader,
         )
         self.assertIn(
             "tensorrt-jp511-trt8.5-orin-batch8-cls8",
-            dockerfile,
+            downloader,
         )
-        self.assertIn('"det.engine:${DET_SIZE}:${DET_SHA256}"', dockerfile)
-        self.assertIn('"rec.engine:${REC_SIZE}:${REC_SHA256}"', dockerfile)
-        self.assertIn('"cls.engine:${CLS_SIZE}:${CLS_SHA256}"', dockerfile)
-        self.assertIn("DET_SHA256=3b36aae", dockerfile)
-        self.assertIn("DET_SHA256=1bb32a02", dockerfile)
-        self.assertIn("CLS_SHA256=148a6895", dockerfile)
-        self.assertIn("CLS_SHA256=02c722e5", dockerfile)
-        self.assertIn(
-            "/opt/phanthy-motus/model-seed/ocr/ppocrv6-small-trt",
-            dockerfile,
-        )
-        self.assertIn("seed_ocr_models.sh", dockerfile)
+        self.assertIn("3b36aae43b2cc4a1", downloader)
+        self.assertIn("1bb32a027e93b06d", downloader)
+        self.assertIn("148a6895260d3b6b", downloader)
+        self.assertIn("02c722e56e621b56", downloader)
+        self.assertIn("tempfile.TemporaryDirectory", downloader)
+        self.assertIn("for attempt in range(1, 4)", downloader)
+        self.assertIn("urlopen(url, timeout=120)", downloader)
+        self.assertIn("_verify_download(destination, metadata)", downloader)
+        self.assertIn("os.replace(", downloader)
         self.assertNotIn("COPY perception/models", dockerfile)
-
-        seed_script = (
-            REPO_ROOT / "perception" / "deploy" / "seed_ocr_models.sh"
-        ).read_text(encoding="utf-8")
-        self.assertIn('cmp -s "${source_file}" "${target_file}"', seed_script)
-        self.assertIn('temporary_file="$(mktemp', seed_script)
-        self.assertIn('mv -f "${temporary_file}" "${target_file}"', seed_script)
 
         service = (REPO_ROOT / "perception" / "deploy" / "service.yml").read_text(
             encoding="utf-8"

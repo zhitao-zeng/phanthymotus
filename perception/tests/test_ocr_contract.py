@@ -147,12 +147,14 @@ class OCRContractTest(unittest.TestCase):
     def test_default_provider_builds_local_adapter(self):
         expected = object()
         with mock.patch(
+            "utils.model_downloader.ensure_ocr_model"
+        ) as ensure_model, mock.patch(
             "plugins.ocr.RapidOCRAdapter", return_value=expected
         ) as adapter:
             result = self.ocr._build_ocr_adapter(
                 {
                     "provider": "rapidocr",
-                    "model_dir": "/models/ocr/ppocrv6-tiny",
+                    "model_dir": "/models/ocr/ppocrv6-small-trt",
                     "device_id": 0,
                     "use_angle_cls": True,
                     "max_side_len": 1600,
@@ -160,8 +162,11 @@ class OCRContractTest(unittest.TestCase):
             )
 
         self.assertIs(result, expected)
+        ensure_model.assert_called_once_with(
+            "/models/ocr/ppocrv6-small-trt"
+        )
         adapter.assert_called_once_with(
-            model_dir="/models/ocr/ppocrv6-tiny",
+            model_dir="/models/ocr/ppocrv6-small-trt",
             device_id=0,
             use_angle_cls=True,
             max_side_len=1600,
