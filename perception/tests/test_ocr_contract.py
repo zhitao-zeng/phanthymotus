@@ -520,6 +520,87 @@ class OCRContractTest(unittest.TestCase):
         ):
             session.max_batch_size(48, 2048)
 
+    def test_tensorrt_session_fits_small_image_to_profile_canvas(self):
+        session = object.__new__(self.ocr_runtime._TensorRTModelSession)
+        session._profiles = [
+            (
+                (1, 3, 704, 1216),
+                (1, 3, 960, 1280),
+                (1, 3, 1600, 1600),
+            )
+        ]
+
+        self.assertEqual(session.fit_input_image_shape(480, 1280), (704, 1280))
+        self.assertEqual(session.fit_input_image_shape(640, 640), (704, 1216))
+        self.assertEqual(session.fit_input_image_shape(720, 1280), (720, 1280))
+        with self.assertRaisesRegex(
+            self.ocr_runtime.TensorRTShapeError, "outside profiles"
+        ):
+            session.fit_input_image_shape(1700, 1280)
+
+    def test_tensorrt_pipeline_pads_short_detector_input_and_crops_output(self):
+        import numpy as np
+
+        cv2_module = types.ModuleType("cv2")
+        cv2_module.INTER_AREA = 1
+        cv2_module.INTER_LINEAR = 2
+        cv2_module.resize = mock.Mock(
+            side_effect=AssertionError("1280x480 content must not be distorted")
+        )
+
+        pipeline = object.__new__(self.ocr_runtime._TensorRTPipeline)
+        pipeline._max_side_len = 1600
+        pipeline._det = mock.Mock()
+        pipeline._det.fit_input_image_shape.return_value = (704, 1280)
+        pipeline._det.run_uint8.return_value = np.zeros(
+            (1, 1, 704, 1280), dtype=np.float32
+        )
+        image = np.full((480, 1280, 3), 255, dtype=np.uint8)
+
+        with mock.patch.dict(sys.modules, {"cv2": cv2_module}):
+            prediction, image_shape = pipeline._run_detector(image)
+
+        detector_input, tensor_shape = pipeline._det.run_uint8.call_args.args
+        self.assertEqual(tensor_shape, (1, 3, 704, 1280))
+        self.assertEqual(detector_input.shape, (704, 1280, 3))
+        self.assertTrue(np.all(detector_input[:480] == 255))
+        self.assertTrue(np.all(detector_input[480:] == 128))
+        self.assertEqual(prediction.shape, (1, 1, 480, 1280))
+        self.assertEqual(image_shape, (480, 1280))
+
+    def test_tensorrt_pipeline_upscales_then_pads_small_square(self):
+        import numpy as np
+
+        cv2_module = types.ModuleType("cv2")
+        cv2_module.INTER_AREA = 1
+        cv2_module.INTER_LINEAR = 2
+        cv2_module.resize = mock.Mock(
+            side_effect=lambda _image, size, interpolation: np.full(
+                (size[1], size[0], 3), 200, dtype=np.uint8
+            )
+        )
+
+        pipeline = object.__new__(self.ocr_runtime._TensorRTPipeline)
+        pipeline._max_side_len = 1600
+        pipeline._det = mock.Mock()
+        pipeline._det.fit_input_image_shape.return_value = (704, 1216)
+
+        with mock.patch.dict(sys.modules, {"cv2": cv2_module}):
+            detector_input, content_shape = pipeline._detector_input(
+                np.zeros((640, 640, 3), dtype=np.uint8)
+            )
+
+        cv2_module.resize.assert_called_once()
+        self.assertEqual(cv2_module.resize.call_args.args[1], (704, 704))
+        self.assertEqual(
+            cv2_module.resize.call_args.kwargs["interpolation"],
+            cv2_module.INTER_LINEAR,
+        )
+        self.assertEqual(content_shape, (704, 704))
+        self.assertEqual(detector_input.shape, (704, 1216, 3))
+        self.assertTrue(np.all(detector_input[:, :704] == 200))
+        self.assertTrue(np.all(detector_input[:, 704:] == 128))
+
     def test_tensorrt_pipeline_batches_equal_width_crops_in_box_order(self):
         import numpy as np
 
