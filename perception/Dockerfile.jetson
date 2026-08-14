@@ -39,7 +39,7 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
 RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-      ffmpeg build-essential python3-dev libvips42 curl && \
+      ffmpeg build-essential python3-dev libvips42 && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # JP511/Focal lacks libffi.so.8, which is required when the NVIDIA runtime
@@ -112,52 +112,6 @@ RUN if [ "${JP_VERSION}" = "61" ]; then \
     RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
     find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete
 
-# ── OCR model (kept outside Git) ──────────────────────────────────
-ARG OCR_MODEL_BASE_URL=https://www.modelscope.cn/models/Flame4pd/ppocrv6-small-edge-ocr/resolve
-ARG OCR_MODEL_REVISION=0301e9299b3abe09c6a60796d7bed74c23fcc525
-RUN if [ "${JP_VERSION}" = "61" ]; then \
-      OCR_TRT_MODEL_BUNDLE=tensorrt-jp6-trt10.4-orin-batch8-cls8; \
-      DET_SIZE=11194324; \
-      DET_SHA256=3b36aae43b2cc4a1b1e2d74d846a1319b4b6f42fbc6d97747d8d72e12c74a1ef; \
-      REC_SIZE=23303292; \
-      REC_SHA256=8149fa68d5418f2c0763b8c4e5088987cb679a407317c7510f88ab6de38dd641; \
-      CLS_SIZE=1046484; \
-      CLS_SHA256=148a6895260d3b6b6f86e0c5787121fc1bba316f3427397f654421196c13cb77; \
-    else \
-      OCR_TRT_MODEL_BUNDLE=tensorrt-jp511-trt8.5-orin-batch8-cls8; \
-      DET_SIZE=12334256; \
-      DET_SHA256=1bb32a027e93b06d5319ac61e38bb3e447137b01465eacefa7a652f58130ebdf; \
-      REC_SIZE=19915466; \
-      REC_SHA256=1e204f0469beba33d8590b29c06419cf1073d98d41243b5ee316d2f877340b61; \
-      CLS_SIZE=1038858; \
-      CLS_SHA256=02c722e56e621b56a36678cc8aa124a31b41e9e3c9ca350b11e4de0d5bbd0a35; \
-    fi && \
-    OCR_TRT_MODEL_BASE_URL="${OCR_MODEL_BASE_URL}/${OCR_MODEL_REVISION}/${OCR_TRT_MODEL_BUNDLE}" && \
-    OCR_TRT_MODEL_DIR=/opt/phanthy-motus/model-seed/ocr/ppocrv6-small-trt && \
-    mkdir -p "${OCR_TRT_MODEL_DIR}" && \
-    for MODEL_SPEC in \
-      "det.engine:${DET_SIZE}:${DET_SHA256}" \
-      "rec.engine:${REC_SIZE}:${REC_SHA256}" \
-      "cls.engine:${CLS_SIZE}:${CLS_SHA256}" \
-      "keys.txt:74947:b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d"; do \
-      MODEL_FILE="${MODEL_SPEC%%:*}"; \
-      MODEL_METADATA="${MODEL_SPEC#*:}"; \
-      MODEL_SIZE="${MODEL_METADATA%%:*}"; \
-      MODEL_SHA256="${MODEL_METADATA#*:}"; \
-      MODEL_TEMP="$(mktemp "${OCR_TRT_MODEL_DIR}/.${MODEL_FILE}.XXXXXX")"; \
-      curl --fail --location --silent --show-error --retry 3 \
-        --retry-connrefused --connect-timeout 20 --max-time 120 \
-        "${OCR_TRT_MODEL_BASE_URL}/${MODEL_FILE}" \
-        --output "${MODEL_TEMP}"; \
-      ACTUAL_SIZE="$(stat -c '%s' "${MODEL_TEMP}")"; \
-      [ "${ACTUAL_SIZE}" = "${MODEL_SIZE}" ] || { \
-        echo "size mismatch for ${MODEL_FILE}: expected ${MODEL_SIZE}, got ${ACTUAL_SIZE}" >&2; \
-        exit 1; \
-      }; \
-      echo "${MODEL_SHA256}  ${MODEL_TEMP}" | sha256sum -c -; \
-      chmod 0644 "${MODEL_TEMP}"; \
-      mv -f "${MODEL_TEMP}" "${OCR_TRT_MODEL_DIR}/${MODEL_FILE}"; \
-    done
 # ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
 RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
     rm -rf /var/lib/apt/lists/*
@@ -174,8 +128,6 @@ COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
 COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
-COPY perception/deploy/seed_ocr_models.sh /deploy/seed_ocr_models.sh
-RUN chmod 0755 /deploy/seed_ocr_models.sh
 
 EXPOSE 15720
 EXPOSE 15721
@@ -190,7 +142,6 @@ ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
-     /deploy/seed_ocr_models.sh && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      python3 /work/main.py"]

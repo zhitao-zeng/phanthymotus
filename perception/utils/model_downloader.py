@@ -1,19 +1,64 @@
-"""
-utils/model_downloader.py — Auto-download sherpa-onnx models from COS if missing.
-"""
+"""Download deployment model artifacts when they are missing."""
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import tarfile
 import tempfile
+import time
 import zipfile
-from urllib.request import urlretrieve
+from urllib.error import URLError
+from urllib.request import urlopen, urlretrieve
 
 log = logging.getLogger(__name__)
 
 COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
+OCR_MODEL_BASE = os.environ.get(
+    "OCR_MODEL_BASE_URL",
+    "https://www.modelscope.cn/models/Flame4pd/"
+    "ppocrv6-small-edge-ocr/resolve/"
+    "0301e9299b3abe09c6a60796d7bed74c23fcc525",
+)
+
+_OCR_KEYS = {
+    "size": 74947,
+    "sha256": "b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d",
+}
+
+OCR_MODEL_FILES = {
+    "ocr_jp61": {
+        "det.engine": {
+            "size": 11194324,
+            "sha256": "3b36aae43b2cc4a1b1e2d74d846a1319b4b6f42fbc6d97747d8d72e12c74a1ef",
+        },
+        "rec.engine": {
+            "size": 23303292,
+            "sha256": "8149fa68d5418f2c0763b8c4e5088987cb679a407317c7510f88ab6de38dd641",
+        },
+        "cls.engine": {
+            "size": 1046484,
+            "sha256": "148a6895260d3b6b6f86e0c5787121fc1bba316f3427397f654421196c13cb77",
+        },
+        "keys.txt": _OCR_KEYS,
+    },
+    "ocr_jp511": {
+        "det.engine": {
+            "size": 12334256,
+            "sha256": "1bb32a027e93b06d5319ac61e38bb3e447137b01465eacefa7a652f58130ebdf",
+        },
+        "rec.engine": {
+            "size": 19915466,
+            "sha256": "1e204f0469beba33d8590b29c06419cf1073d98d41243b5ee316d2f877340b61",
+        },
+        "cls.engine": {
+            "size": 1038858,
+            "sha256": "02c722e56e621b56a36678cc8aa124a31b41e9e3c9ca350b11e4de0d5bbd0a35",
+        },
+        "keys.txt": _OCR_KEYS,
+    },
+}
 
 
 def _progress_hook(name: str):
@@ -30,6 +75,14 @@ def _progress_hook(name: str):
     return hook
 
 MODELS = {
+    "ocr_jp61": {
+        "base_url": f"{OCR_MODEL_BASE}/tensorrt-jp6-trt10.4-orin-batch8-cls8",
+        "files": OCR_MODEL_FILES["ocr_jp61"],
+    },
+    "ocr_jp511": {
+        "base_url": f"{OCR_MODEL_BASE}/tensorrt-jp511-trt8.5-orin-batch8-cls8",
+        "files": OCR_MODEL_FILES["ocr_jp511"],
+    },
     "asr": {
         "url": f"{COS_BASE}/sherpa-onnx-streaming-paraformer-bilingual-zh-en.zip",
         "check_file": "tokens.txt",
@@ -81,10 +134,18 @@ MODELS = {
 
 
 def ensure_model(name: str, model_dir: str) -> None:
-    """Ensure model files exist in model_dir. Download from COS if missing."""
+    """Ensure model files exist in model_dir, downloading them if needed."""
     info = MODELS.get(name)
     if not info:
         raise ValueError(f"Unknown model name: {name}")
+
+    files = info.get("files")
+    if files:
+        if _bundle_exists(model_dir, files):
+            log.info(f"[model_downloader] {name}: already exists at {model_dir}")
+            return
+        _download_bundle(name, info["base_url"], model_dir, files)
+        return
 
     check_path = os.path.join(model_dir, info["check_file"])
     if os.path.exists(check_path):
@@ -131,6 +192,109 @@ def ensure_model(name: str, model_dir: str) -> None:
             f"[model_downloader] {name}: download completed but {info['check_file']} "
             f"not found in {model_dir}"
         )
+
+
+def ensure_ocr_model(model_dir: str) -> None:
+    """Select and ensure the TensorRT OCR bundle for the current runtime."""
+    try:
+        import tensorrt
+    except ImportError as error:
+        raise RuntimeError("TensorRT is required to select the OCR model bundle") from error
+
+    version = str(getattr(tensorrt, "__version__", ""))
+    try:
+        major = int(version.split(".", 1)[0])
+    except ValueError as error:
+        raise RuntimeError(f"Unsupported TensorRT version: {version or 'unknown'}") from error
+
+    if major >= 10:
+        model_name = "ocr_jp61"
+    elif major == 8:
+        model_name = "ocr_jp511"
+    else:
+        raise RuntimeError(f"Unsupported TensorRT version for OCR: {version}")
+
+    log.info(
+        f"[model_downloader] OCR: TensorRT {version} selects {model_name}"
+    )
+    ensure_model(model_name, model_dir)
+
+
+def _bundle_exists(model_dir: str, files: dict) -> bool:
+    """Return whether every expected bundle file is already present."""
+    return all(
+        os.path.isfile(os.path.join(model_dir, filename))
+        and os.path.getsize(os.path.join(model_dir, filename)) > 0
+        for filename in files
+    )
+
+
+def _verify_download(path: str, metadata: dict) -> None:
+    actual_size = os.path.getsize(path)
+    if actual_size != metadata["size"]:
+        raise ValueError(
+            f"size mismatch for {os.path.basename(path)}: "
+            f"expected {metadata['size']}, got {actual_size}"
+        )
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != metadata["sha256"]:
+        raise ValueError(
+            f"SHA256 mismatch for {os.path.basename(path)}: "
+            f"expected {metadata['sha256']}, got {actual_sha256}"
+        )
+
+
+def _download_bundle(name: str, base_url: str, model_dir: str, files: dict) -> None:
+    """Download and verify a multi-file model before replacing its destination."""
+    os.makedirs(model_dir, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{name}-", dir=model_dir) as staging:
+        for filename, metadata in files.items():
+            if os.path.basename(filename) != filename:
+                raise ValueError(f"Invalid model filename: {filename}")
+            url = f"{base_url.rstrip('/')}/{filename}"
+            destination = os.path.join(staging, filename)
+            last_error = None
+            for attempt in range(1, 4):
+                try:
+                    log.info(
+                        f"[model_downloader] {name}: downloading {filename} "
+                        f"(attempt {attempt}/3)"
+                    )
+                    with urlopen(url, timeout=120) as response, open(
+                        destination, "wb"
+                    ) as output:
+                        while True:
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            output.write(chunk)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    _verify_download(destination, metadata)
+                    os.chmod(destination, 0o644)
+                    break
+                except (URLError, TimeoutError, OSError, ValueError) as error:
+                    last_error = error
+                    if os.path.exists(destination):
+                        os.unlink(destination)
+                    if attempt < 3:
+                        time.sleep(3)
+            else:
+                raise RuntimeError(
+                    f"[model_downloader] {name}: failed to download {filename}"
+                ) from last_error
+
+        for filename in files:
+            os.replace(
+                os.path.join(staging, filename),
+                os.path.join(model_dir, filename),
+            )
+    log.info(f"[model_downloader] {name}: verified bundle ready at {model_dir}")
 
 
 def _extract_zip(zip_path: str, model_dir: str) -> None:

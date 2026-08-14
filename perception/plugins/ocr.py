@@ -178,7 +178,10 @@ def _build_ocr_adapter(cfg: dict) -> RapidOCRAdapter:
     provider = cfg.get('provider', 'rapidocr')
     if provider != 'rapidocr':
         raise ValueError(f"unsupported OCR provider: {provider}")
-    return RapidOCRAdapter(**_adapter_options(cfg))
+    options = _adapter_options(cfg)
+    from utils.model_downloader import ensure_ocr_model
+    ensure_ocr_model(options["model_dir"])
+    return RapidOCRAdapter(**options)
 
 
 # ── ROS2 Node (订阅模式) ───────────────────────────────────────────────────────
