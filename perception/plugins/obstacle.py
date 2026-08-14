@@ -90,6 +90,7 @@ class LocalDistanceAdapter:
         from .obstacle_distance_core.zipdepth_tensorrt_backends import (
             create_backends,
         )
+        from utils.model_downloader import ensure_obstacle_models
 
         self._cfg = deepcopy(cfg or {})
         scene_mode = self._cfg.get("scene_mode", "fixed")
@@ -149,6 +150,15 @@ class LocalDistanceAdapter:
                 "obstacle ROS input has no scene metadata; scene_mode must be "
                 "fixed or resolution"
             )
+        engine_paths = ensure_obstacle_models(
+            self._cfg.get("model_dir", "/models/obstacle/zipdepth-int8")
+        )
+        for key, filename in (
+            ("indoor_depth_engine", "zipdepth-base-npu-512x384-int8.engine"),
+            ("vehicle_depth_engine", "yolo26n-depth-int8.engine"),
+            ("segmentation_engine", "yolo26n-seg-int8.engine"),
+        ):
+            self._cfg.setdefault(key, engine_paths[filename])
         depth_backend, segmentation_backend = create_backends(self._cfg)
         self._estimator = ObstacleDistanceEstimator(
             depth_backend,

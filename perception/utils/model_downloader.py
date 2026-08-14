@@ -1,19 +1,56 @@
-"""
-utils/model_downloader.py — Auto-download sherpa-onnx models from COS if missing.
-"""
+"""Download perception models into the shared runtime cache when missing."""
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import logging
 import os
+import shutil
 import tarfile
 import tempfile
+import time
 import zipfile
-from urllib.request import urlretrieve
+from urllib.request import urlopen, urlretrieve
 
 log = logging.getLogger(__name__)
 
 COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
+OBSTACLE_MODEL_REVISION = "b8ba6d69a819b5ed6f0c1c5723b37c8775fa737b"
+OBSTACLE_MODEL_BASE = (
+    "https://www.modelscope.cn/models/Flame4pd/"
+    "obstacle-distance-jetson-int8/resolve"
+)
+OBSTACLE_ENGINE_BUNDLES = {
+    "jp61": {
+        "zipdepth-base-npu-512x384-int8.engine": (
+            7935428,
+            "aa34296bcaeed28a5176b423f074da3923c996e7be06702a3952d475000a8887",
+        ),
+        "yolo26n-depth-int8.engine": (
+            7778158,
+            "8174652d6ba72af15c10caccf95629d585d33245e5242aa1f1734317d5a23f7c",
+        ),
+        "yolo26n-seg-int8.engine": (
+            5641961,
+            "7cb85598bc50b82ab5835102dab9214f6e58a0061c6a1891ee018387346bae30",
+        ),
+    },
+    "jp511": {
+        "zipdepth-base-npu-512x384-int8.engine": (
+            7936960,
+            "61d9b81c81bcd26660d3647bfb86fd133f865ad5b73b4177efcad2884f7a2d1c",
+        ),
+        "yolo26n-depth-int8.engine": (
+            6746230,
+            "816ca14c23af37ee2961ec09db51a54888462c5e4bb296bbaba2a569e6f2bb64",
+        ),
+        "yolo26n-seg-int8.engine": (
+            4920200,
+            "ed5e0f8dcb968440866f5b0433f7b813d14f2e89f810be6e8910945e0af42635",
+        ),
+    },
+}
 
 
 def _progress_hook(name: str):
@@ -78,6 +115,133 @@ MODELS = {
         "single_file": True,
     },
 }
+
+
+def _obstacle_bundle_name(bundle: str | None = None) -> str:
+    value = bundle or os.environ.get("OBSTACLE_MODEL_BUNDLE")
+    if not value:
+        value = os.environ.get("PHANTHY_JP_VERSION")
+    aliases = {
+        "61": "jp61",
+        "jp61": "jp61",
+        "511": "jp511",
+        "jp511": "jp511",
+    }
+    normalized = aliases.get(str(value or "").strip().lower())
+    if normalized:
+        return normalized
+
+    try:
+        import tensorrt as trt
+
+        major = int(str(trt.__version__).split(".", 1)[0])
+    except Exception:
+        major = 0
+    if major >= 10:
+        return "jp61"
+    if major == 8:
+        return "jp511"
+    raise RuntimeError(
+        "Cannot select obstacle engine bundle; set PHANTHY_JP_VERSION to "
+        "61 or 511"
+    )
+
+
+def _file_matches(path: str, expected_size: int, expected_sha: str) -> bool:
+    try:
+        if os.path.getsize(path) != expected_size:
+            return False
+        digest = hashlib.sha256()
+        with open(path, "rb") as model_file:
+            for chunk in iter(lambda: model_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest() == expected_sha
+    except OSError:
+        return False
+
+
+def _download_with_retry(url: str, destination: str, name: str) -> None:
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            with urlopen(url, timeout=60) as response:
+                with open(destination, "wb") as output:
+                    shutil.copyfileobj(response, output, 1024 * 1024)
+            return
+        except Exception as error:
+            last_error = error
+            if attempt < 3:
+                log.warning(
+                    "[model_downloader] %s: download attempt %d failed; "
+                    "retrying",
+                    name,
+                    attempt,
+                )
+                time.sleep(attempt)
+    raise RuntimeError(
+        f"[model_downloader] {name}: download failed after 3 attempts"
+    ) from last_error
+
+
+def ensure_obstacle_models(
+    model_dir: str,
+    bundle: str | None = None,
+) -> dict[str, str]:
+    """Download the matching obstacle TensorRT engines when absent or invalid."""
+    bundle_name = _obstacle_bundle_name(bundle)
+    manifest = OBSTACLE_ENGINE_BUNDLES[bundle_name]
+    os.makedirs(model_dir, exist_ok=True)
+    paths: dict[str, str] = {}
+
+    for filename, (expected_size, expected_sha) in manifest.items():
+        destination = os.path.join(model_dir, filename)
+        paths[filename] = destination
+        if _file_matches(destination, expected_size, expected_sha):
+            log.info(
+                "[model_downloader] obstacle/%s: already exists at %s",
+                bundle_name,
+                destination,
+            )
+            continue
+
+        # Platform instances share /models. Serialize each missing file so a
+        # cold multi-instance launch downloads one copy instead of one per process.
+        with open(f"{destination}.lock", "a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            if _file_matches(destination, expected_size, expected_sha):
+                continue
+            url = (
+                f"{OBSTACLE_MODEL_BASE}/{OBSTACLE_MODEL_REVISION}/"
+                f"{bundle_name}/{filename}"
+            )
+            fd, partial_path = tempfile.mkstemp(
+                prefix=f".{filename}.",
+                suffix=".partial",
+                dir=model_dir,
+            )
+            os.close(fd)
+            try:
+                log.info(
+                    "[model_downloader] obstacle/%s: downloading %s",
+                    bundle_name,
+                    filename,
+                )
+                _download_with_retry(
+                    url,
+                    partial_path,
+                    f"obstacle/{filename}",
+                )
+                if not _file_matches(partial_path, expected_size, expected_sha):
+                    raise RuntimeError(
+                        f"[model_downloader] obstacle/{filename}: size or "
+                        "SHA256 verification failed"
+                    )
+                os.replace(partial_path, destination)
+            finally:
+                if os.path.exists(partial_path):
+                    os.unlink(partial_path)
+
+    return paths
 
 
 def ensure_model(name: str, model_dir: str) -> None:

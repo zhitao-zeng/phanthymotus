@@ -52,9 +52,7 @@ plugins:
     # Select the deployment domain explicitly; OBSTACLE_FIXED_SCENE overrides it.
     scene_mode: fixed
     fixed_scene: indoor
-    indoor_depth_engine: /opt/phanthy-motus/model-seed/obstacle/zipdepth-int8/zipdepth-base-npu-512x384-int8.engine
-    vehicle_depth_engine: /opt/phanthy-motus/model-seed/obstacle/zipdepth-int8/yolo26n-depth-int8.engine
-    segmentation_engine: /opt/phanthy-motus/model-seed/obstacle/zipdepth-int8/yolo26n-seg-int8.engine
+    model_dir: /models/obstacle/zipdepth-int8
     decision_threshold_m: 2.0
     fallback_distance_m: 3.0
     soft_timeout_s: 2.5
