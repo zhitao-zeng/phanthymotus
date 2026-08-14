@@ -12,7 +12,8 @@ ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG JP_VERSION=511
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
-ARG PYPI_MIRROR APT_MIRROR
+ARG PYPI_MIRROR APT_MIRROR JP_VERSION
+ARG OBSTACLE_MODEL_REVISION=b8ba6d69a819b5ed6f0c1c5723b37c8775fa737b
 
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
@@ -76,6 +77,45 @@ RUN mkdir -p /work/weights/clip && \
 # Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
 ENV YOLO_CONFIG_DIR=/work
 
+# Obstacle TensorRT engines are runtime-specific and stay in the immutable
+# image layer so a deployment bind mount on /models cannot hide them.
+RUN set -eu; \
+    case "${JP_VERSION}" in \
+        61) \
+            bundle=jp61; \
+            zipdepth_size=7935428; \
+            zipdepth_sha=aa34296bcaeed28a5176b423f074da3923c996e7be06702a3952d475000a8887; \
+            depth_size=7778158; \
+            depth_sha=8174652d6ba72af15c10caccf95629d585d33245e5242aa1f1734317d5a23f7c; \
+            seg_size=5641961; \
+            seg_sha=7cb85598bc50b82ab5835102dab9214f6e58a0061c6a1891ee018387346bae30 \
+            ;; \
+        511) \
+            bundle=jp511; \
+            zipdepth_size=7936960; \
+            zipdepth_sha=61d9b81c81bcd26660d3647bfb86fd133f865ad5b73b4177efcad2884f7a2d1c; \
+            depth_size=6746230; \
+            depth_sha=816ca14c23af37ee2961ec09db51a54888462c5e4bb296bbaba2a569e6f2bb64; \
+            seg_size=4920200; \
+            seg_sha=ed5e0f8dcb968440866f5b0433f7b813d14f2e89f810be6e8910945e0af42635 \
+            ;; \
+        *) echo "unsupported JP_VERSION=${JP_VERSION}" >&2; exit 1 ;; \
+    esac; \
+    output_dir=/opt/phanthy-motus/model-seed/obstacle/zipdepth-int8; \
+    base_url="https://www.modelscope.cn/models/Flame4pd/obstacle-distance-jetson-int8/resolve/${OBSTACLE_MODEL_REVISION}/${bundle}"; \
+    mkdir -p "${output_dir}"; \
+    download_engine() { \
+        filename="$1"; expected_size="$2"; expected_sha="$3"; \
+        output="${output_dir}/${filename}"; \
+        python3 -c 'import pathlib, sys, urllib.request; target = pathlib.Path(sys.argv[2]); partial = target.with_suffix(target.suffix + ".partial"); urllib.request.urlretrieve(sys.argv[1], partial); partial.replace(target)' \
+            "${base_url}/${filename}" "${output}"; \
+        test "$(wc -c < "${output}")" -eq "${expected_size}"; \
+        printf '%s  %s\n' "${expected_sha}" "${output}" | sha256sum -c -; \
+    }; \
+    download_engine zipdepth-base-npu-512x384-int8.engine "${zipdepth_size}" "${zipdepth_sha}"; \
+    download_engine yolo26n-depth-int8.engine "${depth_size}" "${depth_sha}"; \
+    download_engine yolo26n-seg-int8.engine "${seg_size}" "${seg_sha}"
+
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
@@ -90,6 +130,7 @@ COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
 
 EXPOSE 15720
 EXPOSE 15721
