@@ -1,0 +1,38 @@
+name: ocr-checks
+
+on:
+  pull_request:
+    paths:
+      - "perception/**"
+      - ".github/workflows/ocr-checks.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install "numpy==1.26.4" pyyaml
+      - name: Compile OCR Python sources
+        run: >-
+          python -m py_compile
+          perception/main.py
+          perception/plugins/ocr.py
+          perception/plugins/ocr_preprocess.py
+          perception/plugins/ocr_runtime.py
+          perception/tools/build_ocr_tensorrt_engines.py
+      - name: Run OCR contract tests
+        run: >-
+          python -m unittest -v
+          perception.tests.test_main_lifecycle
+          perception.tests.test_ocr_contract
+          perception.tests.test_ocr_packaging
+          perception.tests.test_ocr_tensorrt_builder
