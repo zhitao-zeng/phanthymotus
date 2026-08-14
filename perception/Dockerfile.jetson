@@ -1,5 +1,5 @@
 # ── Jetson GPU variant ──────────────────────────────────────────────
-# Base: jetson-base:jp511-torch (torch 2.0 + torchvision 0.15 with CUDA)
+# Base selected by JP_VERSION; the evaluation default targets JetPack 6.1.
 #
 # Build context: repo root (phanthy-motus/) so we can access both
 # src/perception_stack/ and deploy/ros-base/audio_msgs/
@@ -10,7 +10,7 @@
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-ARG JP_VERSION=511
+ARG JP_VERSION=61
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
 ARG PYPI_MIRROR APT_MIRROR JP_VERSION
 ENV PHANTHY_JP_VERSION=${JP_VERSION}
