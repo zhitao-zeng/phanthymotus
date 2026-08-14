@@ -13,7 +13,7 @@
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-ARG JP_VERSION=511
+ARG JP_VERSION=61
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp61-torch AS jp61-compat
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
 ARG PYPI_MIRROR APT_MIRROR JP_VERSION
