@@ -19,7 +19,7 @@ X_ASR_BASE = os.environ.get(
     "ASR_X_ASR_MODEL_BASE_URL",
     "https://www.modelscope.cn/models/Flame4pd/"
     "x-asr-zh-en-punct-int8-robot/resolve/"
-    "e111bb210b1aad07c6a16b75adb61b80ee841990",
+    "335b0164ff98be099b5e16597e232d3fcf3a190d",
 )
 
 X_ASR_FILES = {
@@ -28,20 +28,20 @@ X_ASR_FILES = {
         "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
     },
     "README.md": {
-        "size": 1965,
-        "sha256": "2aa4393f1af6f823eec58fbf5225ff86209595c04edba05aadab7d474cdebbac",
+        "size": 2095,
+        "sha256": "fea3fb07ca863604790be8ef598a4f7892d4433ba2715be4ca42da4002e7730a",
     },
     "encoder-epoch-99-avg-1.int8.onnx": {
-        "size": 161015713,
-        "sha256": "7f6aa62056efd8af9da13e0faa81cd3f284d2fb2e3b63de56fd2dfd3450910dc",
+        "size": 160093173,
+        "sha256": "d1867d459f56210b34f7eeccc4bdca3896a9dff481973ee126da2680bd4ca86e",
     },
     "decoder-epoch-99-avg-1.onnx": {
         "size": 11309084,
-        "sha256": "72f47405d3c1033bebccbef82f90071e7b4ba3e71b9c986f2b74244b25723aed",
+        "sha256": "fbfb117776da78f1dddeffeee988e73c101be2f532d8e8a23116a7b880549441",
     },
     "joiner-epoch-99-avg-1.int8.onnx": {
         "size": 2581422,
-        "sha256": "aedb7fa697b2ab43f20499826fff7c997eea7d67db77be97769aeeeb726e63b3",
+        "sha256": "ee3b111cd85b198387722994dd3401017a4a07102af3a469e6d1211b894bfe1e",
     },
     "tokens.txt": {
         "size": 58806,
