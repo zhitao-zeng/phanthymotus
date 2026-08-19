@@ -15,7 +15,10 @@ from pathlib import Path
 
 SAMPLE_RATE = 16000
 TAIL_PADDING_SECONDS = 0.5
-MAX_ACTIVE_PATHS = 10
+# 4 active paths decode ~18% faster than 10 on Orin NX (JP5.11, 2 threads,
+# int8) with identical fixed-12 accuracy and a <=0.1pp shift on the 1.9k-cut
+# AISHELL-3 replay guardrail; wider beams only added decode latency.
+MAX_ACTIVE_PATHS = 4
 HOTWORDS_SCORE = 2.5
 
 log = logging.getLogger(__name__)
