@@ -82,7 +82,17 @@ class XASRAdapter:
         model_dir: str,
         hw_provider: str = "cpu",
         num_threads: int = 2,
+        max_active_paths: int = None,
+        tail_padding_seconds: float = None,
     ):
+        self._max_active_paths = (
+            MAX_ACTIVE_PATHS if max_active_paths is None else int(max_active_paths)
+        )
+        self._tail_padding_seconds = (
+            TAIL_PADDING_SECONDS
+            if tail_padding_seconds is None
+            else float(tail_padding_seconds)
+        )
         root = Path(model_dir)
         encoder = root / "encoder-epoch-99-avg-1.int8.onnx"
         decoder = root / "decoder-epoch-99-avg-1.onnx"
@@ -119,7 +129,7 @@ class XASRAdapter:
             sample_rate=SAMPLE_RATE,
             feature_dim=80,
             decoding_method="modified_beam_search",
-            max_active_paths=MAX_ACTIVE_PATHS,
+            max_active_paths=self._max_active_paths,
             hotwords_file=str(encoded_hotwords),
             hotwords_score=HOTWORDS_SCORE,
             modeling_unit="bpe",
@@ -128,10 +138,11 @@ class XASRAdapter:
         self._decode_lock = threading.Lock()
         log.info(
             "[asr] X-ASR adapter loaded: encoder=%s, provider=%s, "
-            "max_active_paths=%d, hotwords_score=%.1f",
+            "max_active_paths=%d, tail_padding=%.2fs, hotwords_score=%.1f",
             encoder,
             hw_provider,
-            MAX_ACTIVE_PATHS,
+            self._max_active_paths,
+            self._tail_padding_seconds,
             HOTWORDS_SCORE,
         )
 
@@ -148,7 +159,7 @@ class XASRAdapter:
             sample / 32768.0
             for sample in struct.unpack(f"<{sample_count}h", pcm)
         ]
-        samples.extend([0.0] * int(sample_rate * TAIL_PADDING_SECONDS))
+        samples.extend([0.0] * int(sample_rate * self._tail_padding_seconds))
 
         with self._decode_lock:
             stream = self._recognizer.create_stream()
