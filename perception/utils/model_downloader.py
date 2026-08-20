@@ -47,7 +47,9 @@ MODELS = {
         "check_file": "tokens.txt",
     },
     "asr_x_asr": {
-        "url": f"{COS_BASE}/x-asr-zh-en-punct-int8-robot.zip",
+        # v2: domain-finetuned weights + wake-word hotword list (robot344).
+        # sha256 14e48e1195eb44246bce245359d2c45eeb60108a59288e56d4ee1344e80cc3f4
+        "url": f"{COS_BASE}/x-asr-zh-en-punct-int8-robot-v2.zip",
         "check_file": "tokens.txt",
     },
     "tts": {

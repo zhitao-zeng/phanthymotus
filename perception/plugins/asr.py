@@ -293,8 +293,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
-                "asr_beam_paths": {"type": "integer", "description": "X-ASR modified beam search active paths (smaller = faster; 4 keeps accuracy on the stock model)", "default": 4, "scope": "shared", "x-show-when": {"asr_model": "x-asr-zh-en"}},
-                "asr_tail_pad_ms": {"type": "integer", "description": "Silence padding (ms) appended before X-ASR decodes an utterance; the stock model needs 500", "default": 500, "scope": "shared", "x-show-when": {"asr_model": "x-asr-zh-en"}},
+                "asr_beam_paths": {"type": "integer", "description": "X-ASR modified beam search active paths (smaller = faster; 3 keeps accuracy on the v2 domain weights, use 4+ for the v1 stock weights)", "default": 3, "scope": "shared", "x-show-when": {"asr_model": "x-asr-zh-en"}},
+                "asr_tail_pad_ms": {"type": "integer", "description": "Silence padding (ms) appended before X-ASR decodes an utterance (300 is lossless on the v2 domain weights; the v1 stock weights need 500)", "default": 300, "scope": "shared", "x-show-when": {"asr_model": "x-asr-zh-en"}},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
                 "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
@@ -558,7 +558,8 @@ ASR_MODELS = {
     "x-asr-zh-en": {
         "label": "X-ASR Bilingual (zh+en, offline transducer)",
         "adapter": SherpaOnnxXASRAdapter,
-        "default_model_dir": "/models/sherpa-onnx/x-asr-zh-en",
+        # v2 dir so volumes seeded with the v1 bundle re-download the new weights
+        "default_model_dir": "/models/sherpa-onnx/x-asr-zh-en-v2",
     },
     "paraformer-zh-en": {
         "label": "Paraformer Bilingual (zh+en, streaming)",

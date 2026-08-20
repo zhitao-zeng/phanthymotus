@@ -14,11 +14,13 @@ from pathlib import Path
 
 
 SAMPLE_RATE = 16000
-TAIL_PADDING_SECONDS = 0.5
-# 4 active paths decode ~18% faster than 10 on Orin NX (JP5.11, 2 threads,
-# int8) with identical fixed-12 accuracy and a <=0.1pp shift on the 1.9k-cut
-# AISHELL-3 replay guardrail; wider beams only added decode latency.
-MAX_ACTIVE_PATHS = 4
+# Defaults tuned for the v2 domain-finetuned bundle: 3 active paths and 300ms
+# tail padding are lossless there and decode ~22% faster than 10/500ms on
+# Orin NX (JP5.11, 2 threads, int8). The v1 stock weights need 4 paths and
+# 500ms padding — override via asr_beam_paths / asr_tail_pad_ms when using
+# them.
+TAIL_PADDING_SECONDS = 0.3
+MAX_ACTIVE_PATHS = 3
 HOTWORDS_SCORE = 2.5
 
 log = logging.getLogger(__name__)
