@@ -172,6 +172,23 @@ class AsrLifecycleTest(unittest.TestCase):
         self.assertEqual(legacy, (b"pcm", 1.0, 2.0, False))
         self.assertEqual(kws_aware, (b"pcm", 1.0, 2.0, True))
 
+    def test_audio_contract_truncates_only_incomplete_pcm_sample(self):
+        node = self.asr._ASRNode.__new__(self.asr._ASRNode)
+        node._input_topic = "/audio"
+        node._audio_contract_warns = {}
+
+        with self.assertLogs("plugins.asr", level="WARNING"):
+            pcm = node._check_audio_contract(
+                "unexpected", b"\x01\x00" * 511 + b"\x01"
+            )
+
+        self.assertEqual(pcm, b"\x01\x00" * 511)
+        self.assertEqual(node._audio_contract_warns, {
+            "format": 1,
+            "align": 1,
+            "size": 1,
+        })
+
     def test_non_model_config_restarts_running_nodes(self):
         plugin = self.asr.ASRPlugin.__new__(self.asr.ASRPlugin)
         node = _FakeRunningNode()

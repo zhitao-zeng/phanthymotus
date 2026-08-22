@@ -86,6 +86,18 @@ class FireRedVadSessionTest(unittest.TestCase):
             len(utterance), int(asr_runtime.SAMPLE_RATE * 1.5) * 2
         )
 
+    def test_reports_absolute_timestamps_for_detected_span(self):
+        detector = _SequenceDetector([[(0.5, 1.0)]])
+        session = self._session(detector)
+        session._pcm.extend(b"\x01\x00" * int(asr_runtime.SAMPLE_RATE * 2.0))
+        session._buffer_start_ts = 100.0
+
+        session._run_detect()
+
+        _, start_ts, end_ts = session._completed.popleft()
+        self.assertAlmostEqual(start_ts, 100.5)
+        self.assertAlmostEqual(end_ts, 100.9)
+
     def test_empty_detection_keeps_session_open_for_late_audio(self):
         # FireRed reports the completed segment after the configured 400ms
         # possible-silence run: speech is [1.0, 1.6], segment is [1.0, 2.0].

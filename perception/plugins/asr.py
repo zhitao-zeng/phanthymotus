@@ -37,6 +37,9 @@ SAMPLE_RATE    = 16000
 SPEECH_THRESH  = 0.5
 SILENCE_THRESH = 0.35
 SILENCE_FRAMES = 16
+AUDIO_FORMAT = "audio/pcm-16k"
+_AUDIO_FORMAT_ALIASES = frozenset({AUDIO_FORMAT, "pcm_16k_16bit_mono"})
+MIN_CHUNK_BYTES = 1024
 
 _ASR_INPUT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
@@ -1063,6 +1066,7 @@ class _ASRNode(Node):
         self._last_error = None
         self._ingress_lock = threading.Lock()
         self._ingress = IngressSessionDiagnostics()
+        self._audio_contract_warns: dict[str, int] = {}
 
     def start(self) -> dict:
         if self.state == "running":
@@ -1330,7 +1334,11 @@ class _ASRNode(Node):
                         pass
             self.state = "error"
             return
-        pcm = bytes(msg.data)
+        pcm = self._check_audio_contract(
+            getattr(msg, "format", "") or "", bytes(msg.data)
+        )
+        if not pcm:
+            return
         ts  = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         if ts < 1e9:  # header.stamp not set by publisher
             ts = time.time()
@@ -1361,6 +1369,37 @@ class _ASRNode(Node):
                 self._ingress.record_drop()
                 self._last_error = str(e)
             log.error(f"[asr] failed to enqueue audio: {e}")
+
+    def _warn_audio_contract(self, key: str, detail: str) -> None:
+        count = self._audio_contract_warns.get(key, 0) + 1
+        self._audio_contract_warns[key] = count
+        if count == 1 or count % 500 == 0:
+            log.warning(
+                f"[asr] audio contract violated on {self._input_topic}: "
+                f"{detail} (occurrence {count})"
+            )
+
+    def _check_audio_contract(self, fmt: str, pcm: bytes) -> bytes:
+        """Report incompatible AudioChunk metadata and keep usable PCM aligned."""
+        if fmt not in _AUDIO_FORMAT_ALIASES:
+            self._warn_audio_contract(
+                "format", f"format={fmt!r}, expected {AUDIO_FORMAT!r}"
+            )
+
+        if len(pcm) % 2:
+            self._warn_audio_contract(
+                "align", f"{len(pcm)} bytes is not 16-bit aligned, truncating"
+            )
+            pcm = pcm[: len(pcm) // 2 * 2]
+
+        if 0 < len(pcm) < MIN_CHUNK_BYTES:
+            self._warn_audio_contract(
+                "size",
+                f"{len(pcm)}-byte chunk is below the {MIN_CHUNK_BYTES}-byte "
+                "minimum, VAD may not emit a segment",
+            )
+
+        return pcm
 
     def _worker(self):
         try:

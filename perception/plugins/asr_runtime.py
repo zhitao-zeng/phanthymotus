@@ -471,6 +471,7 @@ class _FireRedVadSession:
         self._detected = False
         self._silence_samples = 0
         self._last_chunk_ts = 0.0
+        self._buffer_start_ts: Optional[float] = None
         self._last_detect_bytes = 0
         self._completed: Deque[tuple[bytes, float, float]] = deque()
         self._reset_diagnostics()
@@ -489,6 +490,7 @@ class _FireRedVadSession:
         self._detected = False
         self._silence_samples = 0
         self._last_chunk_ts = 0.0
+        self._buffer_start_ts = None
         self._last_detect_bytes = 0
         self._completed.clear()
         self._reset_diagnostics()
@@ -629,11 +631,13 @@ class _FireRedVadSession:
             detected_end = max(start, detected_end - self._silence_s)
         end = min(total_s, detected_end + self._TAIL_PAD_S)
         utterance = self._slice(start, end)
-        # timestamps are approximate: span covers all audio up to total_s
+        buffer_start_ts = self._buffer_start_ts
+        if buffer_start_ts is None:
+            buffer_start_ts = self._last_chunk_ts - total_s
         self._completed.append((
             utterance,
-            -total_s,  # start_ts relative (not used by caller)
-            0.0,
+            buffer_start_ts + start,
+            buffer_start_ts + end,
         ))
         try:
             logging.getLogger("asr_runtime.firered").info(
@@ -654,6 +658,11 @@ class _FireRedVadSession:
             return self._completed.popleft() if self._completed else None
         silence_thresh_samples = int(self._SILENCE_TO_DETECT_S * self._sample_rate)
         if chunk:
+            chunk = chunk[: len(chunk) // 2 * 2]
+            if not chunk:
+                return None
+            if self._buffer_start_ts is None:
+                self._buffer_start_ts = now_ts
             self._pcm += chunk
             self._chunks_seen += 1
             self._last_chunk_ts = now_ts
