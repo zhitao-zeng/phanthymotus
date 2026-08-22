@@ -47,7 +47,8 @@ MODELS = {
         "check_file": "tokens.txt",
     },
     "asr_x_asr": {
-        "url": f"{COS_BASE}/x-asr-zh-en-punct-int8-robot.zip",
+        # Domain-adapted weights with the packaged wake-word hotword list.
+        "url": f"{COS_BASE}/x-asr-zh-en-punct-int8-robot-v2.zip",
         "check_file": "tokens.txt",
     },
     "tts": {
