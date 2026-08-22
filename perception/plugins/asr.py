@@ -372,6 +372,8 @@ TOOLS = [
                                                  "never gives back — check headroom before enabling",
                                   "default": "cpu", "scope": "shared",
                                   "x-show-when": {"asr_model": ["paraformer-zh-en", "sensevoice-small"]}},
+                "asr_beam_paths": {"type": "integer", "description": "X-ASR modified beam search active paths", "default": 3, "scope": "shared", "x-show-when": {"asr_model": "x-asr-zh-en"}},
+                "asr_tail_pad_ms": {"type": "integer", "description": "Silence padding (ms) appended before X-ASR decodes an utterance", "default": 300, "scope": "shared", "x-show-when": {"asr_model": "x-asr-zh-en"}},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
                 "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
@@ -631,10 +633,15 @@ class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
 class SherpaOnnxXASRAdapter(ASRAdapter):
     """Offline X-ASR transducer with general robot-domain hotword biasing."""
 
-    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
+    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2,
+                 max_active_paths: int = None, tail_padding_seconds: float = None):
         from plugins.x_asr import XASRAdapter
 
-        self._delegate = XASRAdapter(model_dir, device, num_threads)
+        self._delegate = XASRAdapter(
+            model_dir, device, num_threads,
+            max_active_paths=max_active_paths,
+            tail_padding_seconds=tail_padding_seconds,
+        )
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         return self._delegate.transcribe(wav_bytes, language)
@@ -664,7 +671,7 @@ ASR_MODELS = {
             # is mixed precision (int8 encoder+joiner, fp32 decoder) and the int8
             # parts are enough to make the GPU lose.
             "cpu": {"download": "asr_x_asr", "dtype": "int8",
-                    "dir": "/models/sherpa-onnx/x-asr-zh-en"},
+                    "dir": "/models/sherpa-onnx/x-asr-zh-en-v2"},
         },
     },
     "paraformer-zh-en": {
@@ -787,7 +794,19 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
         ensure_model(spec["download"], model_dir)
 
     num_threads = int(cfg.get('num_threads', 2))
-    adapter = model_info["adapter"](model_dir, device, num_threads)
+    if model_name == "x-asr-zh-en":
+        tail_pad_ms = cfg.get('asr_tail_pad_ms')
+        adapter = model_info["adapter"](
+            model_dir,
+            device,
+            num_threads,
+            max_active_paths=cfg.get('asr_beam_paths'),
+            tail_padding_seconds=(
+                None if tail_pad_ms is None else int(tail_pad_ms) / 1000.0
+            ),
+        )
+    else:
+        adapter = model_info["adapter"](model_dir, device, num_threads)
     if cfg.get('warmup', True):
         _warmup_adapter(adapter, model_name, device)
     return adapter
