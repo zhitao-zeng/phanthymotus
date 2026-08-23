@@ -8,12 +8,30 @@ import logging
 import os
 import tarfile
 import tempfile
+import time
 import zipfile
+from urllib.error import URLError
 from urllib.request import urlretrieve
 
 log = logging.getLogger(__name__)
 
 COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
+X_ASR_BASE = os.environ.get(
+    "ASR_X_ASR_MODEL_BASE_URL",
+    "https://www.modelscope.cn/models/Flame4pd/"
+    "x-asr-zh-en-punct-int8-robot/resolve/"
+    "ec58ae2349d54e8497f0da71382ef4c5e0b8b8be",
+)
+X_ASR_FILES = {
+    "LICENSE": 11358,
+    "encoder-epoch-99-avg-1.int8.onnx": 160093173,
+    "decoder-epoch-99-avg-1.onnx": 11309084,
+    "joiner-epoch-99-avg-1.int8.onnx": 2581422,
+    "tokens.txt": 58806,
+    "bpe.model": 119265,
+    "bpe.vocab": 69594,
+    "hotwords.txt": 3509,
+}
 
 
 def _progress_hook(name: str):
@@ -47,8 +65,8 @@ MODELS = {
         "check_file": "tokens.txt",
     },
     "asr_x_asr": {
-        # Domain-adapted weights with the packaged wake-word hotword list.
-        "url": f"{COS_BASE}/x-asr-zh-en-punct-int8-robot-v2.zip",
+        "base_url": X_ASR_BASE,
+        "files": X_ASR_FILES,
         "check_file": "tokens.txt",
     },
     "tts": {
@@ -90,6 +108,14 @@ def ensure_model(name: str, model_dir: str) -> None:
     info = MODELS.get(name)
     if not info:
         raise ValueError(f"Unknown model name: {name}")
+
+    files = info.get("files")
+    if files:
+        if _bundle_exists(model_dir, files):
+            log.info(f"[model_downloader] {name}: already exists at {model_dir}")
+            return
+        _download_bundle(name, info["base_url"], model_dir, files)
+        return
 
     check_path = os.path.join(model_dir, info["check_file"])
     if os.path.exists(check_path):
@@ -136,6 +162,62 @@ def ensure_model(name: str, model_dir: str) -> None:
             f"[model_downloader] {name}: download completed but {info['check_file']} "
             f"not found in {model_dir}"
         )
+
+
+def _bundle_exists(model_dir: str, files: dict[str, int]) -> bool:
+    return all(
+        os.path.isfile(os.path.join(model_dir, filename))
+        and os.path.getsize(os.path.join(model_dir, filename)) == expected_size
+        for filename, expected_size in files.items()
+    )
+
+
+def _download_bundle(
+    name: str,
+    base_url: str,
+    model_dir: str,
+    files: dict[str, int],
+) -> None:
+    """Download a fixed multi-file bundle before replacing the destination."""
+    parent = os.path.dirname(model_dir.rstrip("/")) or "."
+    os.makedirs(parent, exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{name}-", dir=parent) as staging:
+        for filename, expected_size in files.items():
+            destination = os.path.join(staging, filename)
+            url = f"{base_url.rstrip('/')}/{filename}"
+            last_error = None
+            for attempt in range(1, 4):
+                try:
+                    log.info(
+                        f"[model_downloader] {name}: downloading {filename} "
+                        f"(attempt {attempt}/3)"
+                    )
+                    urlretrieve(url, destination, reporthook=_progress_hook(filename))
+                    actual_size = os.path.getsize(destination)
+                    if actual_size != expected_size:
+                        raise ValueError(
+                            f"size mismatch for {filename}: "
+                            f"expected {expected_size}, got {actual_size}"
+                        )
+                    break
+                except (URLError, TimeoutError, OSError, ValueError) as error:
+                    last_error = error
+                    if os.path.exists(destination):
+                        os.unlink(destination)
+                    if attempt < 3:
+                        time.sleep(3)
+            else:
+                raise RuntimeError(
+                    f"[model_downloader] {name}: failed to download {filename}"
+                ) from last_error
+
+        for filename in files:
+            os.replace(
+                os.path.join(staging, filename),
+                os.path.join(model_dir, filename),
+            )
+    log.info(f"[model_downloader] {name}: bundle ready at {model_dir}")
 
 
 def _extract_zip(zip_path: str, model_dir: str) -> None:

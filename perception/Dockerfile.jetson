@@ -119,6 +119,12 @@ ENV YOLO_CONFIG_DIR=/work
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
+# Darvin images install the fixed ModelScope bundle once at build time so
+# parallel evaluator instances do not cold-download it independently.
+COPY perception/utils/model_downloader.py /tmp/model_downloader.py
+RUN python3 -c "import sys; sys.path.insert(0, '/tmp'); from model_downloader import ensure_model; ensure_model('asr_x_asr', '/models/sherpa-onnx/x-asr-zh-en-v2')" && \
+    rm -f /tmp/model_downloader.py
+
 # ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
 # ldconfig shimmed for the same reason as the ffmpeg step above — this is the
 # step that actually failed on `--jp-version 6.1`, because layers 1-11 were
