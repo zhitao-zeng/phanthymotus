@@ -203,6 +203,10 @@ COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
 COPY perception/deploy/    /deploy/
 
+# Darvin images install the fixed ModelScope bundle once at build time so
+# parallel evaluator instances do not cold-download it independently.
+RUN python3 -c "from utils.model_downloader import ensure_ocr_model; ensure_ocr_model('/models/ocr/ppocrv6-small-trt', family='jp61' if '${JP_VERSION}' == '61' else 'jp511')"
+
 EXPOSE 15720
 EXPOSE 15721
 
