@@ -13,7 +13,7 @@
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG JP_VERSION=511
-ARG ENABLE_VITS2_TRT=1
+ARG ENABLE_VITS2_TRT=0
 
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
 ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
