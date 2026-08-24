@@ -204,6 +204,11 @@ COPY perception/config.yaml /work/config.yaml
 COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
 COPY perception/deploy/    /deploy/
 
+# Install the pinned engine bundle once in the image so parallel runtime
+# instances start from verified local files instead of downloading separately.
+RUN PYTHONPATH=/work OBSTACLE_MODEL_BUNDLE=jp${JP_VERSION} \
+    python3 -c "from utils.model_downloader import ensure_obstacle_models; ensure_obstacle_models('/models/obstacle/zipdepth-int8')"
+
 EXPOSE 15720
 EXPOSE 15721
 
