@@ -137,6 +137,9 @@ class ObstacleDistanceEstimator:
             name="soft_timeout_s",
             positive=True,
         )
+        self._unload_inactive_scene = (
+            self._config.get("unload_inactive_scene") is True
+        )
 
         if not is_valid_depth_backend(depth_backend):
             raise ValueError("estimator requires a depth backend")
@@ -145,6 +148,14 @@ class ObstacleDistanceEstimator:
 
         self._depth_backend = depth_backend
         self._segmentation_backend = segmentation_backend
+
+    def _prepare_scene(self, domain: SceneDomain) -> None:
+        if not self._unload_inactive_scene:
+            return
+        for backend in (self._depth_backend, self._segmentation_backend):
+            prepare = getattr(backend, "prepare_scene", None)
+            if callable(prepare):
+                prepare(domain)
 
     def _latency_ms(
         self,
@@ -448,6 +459,7 @@ class ObstacleDistanceEstimator:
             deadline_monotonic = started_monotonic + self._soft_timeout_s
 
             approximate_geometry = False
+            self._prepare_scene(domain)
             self._check_deadline(deadline_monotonic)
             if domain is SceneDomain.INDOOR:
                 if not is_valid_indoor_distance_backend(self._depth_backend):

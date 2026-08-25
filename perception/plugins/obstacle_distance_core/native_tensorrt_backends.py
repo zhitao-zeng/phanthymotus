@@ -314,6 +314,11 @@ class NativeTensorRTSegBackend:
         if model is not None:
             model.close()
 
+    def prepare_scene(self, domain) -> None:
+        """Segmentation is only used by the vehicle scene."""
+        if getattr(domain, "value", domain) == "indoor":
+            self.close()
+
     def predict_instances(
         self,
         image_bytes: bytes,

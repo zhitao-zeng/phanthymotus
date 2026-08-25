@@ -277,6 +277,23 @@ class ZipDepthYoloTensorRTDepthBackend:
                 engine = self._vehicle
         return engine
 
+    def prepare_scene(self, domain: SceneDomain) -> None:
+        """Release the mutually exclusive depth engine before a scene switch."""
+        if domain is SceneDomain.INDOOR:
+            attribute = "_vehicle"
+            label = "vehicle"
+        elif domain is SceneDomain.VEHICLE:
+            attribute = "_indoor"
+            label = "indoor"
+        else:
+            return
+        with self._engine_init_lock:
+            engine = getattr(self, attribute)
+            setattr(self, attribute, None)
+        if engine is not None:
+            engine.close()
+            log.info("[obstacle] released inactive %s depth engine", label)
+
     def close(self) -> None:
         """Release both depth engines and their CUDA buffers."""
         with self._engine_init_lock:

@@ -461,7 +461,15 @@ def main():
     os.environ.setdefault("ROS_LOG_LEVEL", "WARN")
 
     rclpy.init()
-    executor = rclpy.executors.MultiThreadedExecutor()
+    enabled_plugins = {
+        name
+        for name, plugin_cfg in cfg.get("plugins", {}).items()
+        if isinstance(plugin_cfg, dict) and plugin_cfg.get("enabled", False)
+    }
+    obstacle_only = enabled_plugins == {"obstacle"}
+    executor = rclpy.executors.MultiThreadedExecutor(
+        num_threads=1 if obstacle_only else None
+    )
     _bundle  = PerceptionBundle(cfg, executor)
 
     def _spin():
@@ -469,8 +477,15 @@ def main():
 
     threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
 
-    # Start WebSocket ASR server in a separate thread
-    threading.Thread(target=_start_ws_thread, args=(ws_port,), daemon=True, name="ws_asr").start()
+    # The WebSocket endpoint is part of ASR, so obstacle-only deployments do
+    # not need its event loop, listener or worker thread.
+    if asr_cfg.get("enabled", False):
+        threading.Thread(
+            target=_start_ws_thread,
+            args=(ws_port,),
+            daemon=True,
+            name="ws_asr",
+        ).start()
 
     _start_registration(mcp_port, "Perception Stack", "perception")
 
