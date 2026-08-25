@@ -16,6 +16,7 @@ from numbers import Real
 from typing import Mapping
 
 import numpy as np
+from utils.tensorrt_runtime import tensorrt_family
 
 from .contracts import (
     DepthBackend,
@@ -137,6 +138,16 @@ class ZipDepthYoloTensorRTDepthBackend:
         self._score_threshold = _finite_number(
             indoor_config.get("score_threshold", -0.06),
             name="ZipDepth score threshold",
+        )
+        score_offsets = indoor_config.get("score_offset_by_runtime", {})
+        if not isinstance(score_offsets, Mapping):
+            raise ObstacleDistanceError(
+                ErrorCode.MODEL_ERROR,
+                "ZipDepth runtime score offsets must be a mapping",
+            )
+        self._score_offset = _finite_number(
+            score_offsets.get(tensorrt_family(), 0.0),
+            name="ZipDepth runtime score offset",
         )
         self._distance_scale = _finite_number(
             indoor_config.get(
@@ -338,9 +349,12 @@ class ZipDepthYoloTensorRTDepthBackend:
         inverse_depth_percentile = float(
             np.percentile(values, self._percentile)
         )
-        score = -inverse_depth_percentile
+        aligned_inverse_depth_percentile = (
+            inverse_depth_percentile - self._score_offset
+        )
+        score = -aligned_inverse_depth_percentile
         distance_m = (
-            self._distance_scale * inverse_depth_percentile
+            self._distance_scale * aligned_inverse_depth_percentile
             + self._distance_bias_m
         )
         distance_m = float(
