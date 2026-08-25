@@ -476,7 +476,7 @@ OCR_MODEL_BASE = os.environ.get(
     "OCR_MODEL_BASE_URL",
     "https://www.modelscope.cn/models/Flame4pd/"
     "ppocrv6-small-edge-ocr/resolve/"
-    "0301e9299b3abe09c6a60796d7bed74c23fcc525",
+    "8be137658c749ec10cc55f8703dae3ad49026836",
 )
 _OCR_KEYS = {
     "size": 74947,
@@ -502,19 +502,22 @@ OCR_MODEL_BUNDLES = {
         },
     },
     "jp511": {
-        "base_url": f"{OCR_MODEL_BASE}/tensorrt-jp511-trt8.5-orin-batch8-cls8",
+        "base_url": (
+            f"{OCR_MODEL_BASE}/"
+            "tensorrt-jp511-trt8.5-orin-batch8-cls8-lowmem"
+        ),
         "files": {
             "det.engine": {
-                "size": 12334256,
-                "sha256": "1bb32a027e93b06d5319ac61e38bb3e447137b01465eacefa7a652f58130ebdf",
+                "size": 9156441,
+                "sha256": "33cd11a1dcc4e51f7004d08864ca5036c9e6c0f603d140ce61ab0615f594500c",
             },
             "rec.engine": {
-                "size": 19915466,
-                "sha256": "1e204f0469beba33d8590b29c06419cf1073d98d41243b5ee316d2f877340b61",
+                "size": 14992729,
+                "sha256": "1e41b72e1ea4cf82fd87d066733833ae12fa665849bf6d893b9b037f6dcb8e03",
             },
             "cls.engine": {
-                "size": 1038858,
-                "sha256": "02c722e56e621b56a36678cc8aa124a31b41e9e3c9ca350b11e4de0d5bbd0a35",
+                "size": 1119846,
+                "sha256": "682d575e8d149422511e6cbafbfed4a1c07dbd88b9545ff99708448b208a4462",
             },
             "keys.txt": _OCR_KEYS,
         },
