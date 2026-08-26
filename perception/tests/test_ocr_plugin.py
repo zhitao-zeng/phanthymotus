@@ -12,6 +12,7 @@ import threading
 import time
 
 import pytest
+from rclpy.qos import ReliabilityPolicy
 
 from vision_stubs import (  # noqa: F401
     _FakeCompressedImage,
@@ -94,6 +95,20 @@ def test_ocr_camera_subscription_uses_shared_qos(ocr):
     _start_and_wait(plugin, executor, "/cam/a")
     node = executor.nodes[0]
     assert node.subscriptions[0].qos is CAMERA_QOS
+
+
+def test_ocr_camera_subscription_can_use_reliable_qos(monkeypatch):
+    plugin, executor, _ = _make_plugin(
+        monkeypatch,
+        cfg={"provider": "rapidocr", "input_reliability": "reliable"},
+    )
+    _start_and_wait(plugin, executor, "/cam/reliable")
+    try:
+        qos = executor.nodes[0].subscriptions[0].qos
+        assert qos.reliability == ReliabilityPolicy.RELIABLE
+        assert qos.depth == 1
+    finally:
+        plugin.dispatch("ocr", {"action": "stop"})
 
 
 def test_ocr_topic_change_disposes_old_node(ocr):

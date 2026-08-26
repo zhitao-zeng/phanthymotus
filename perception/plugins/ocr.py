@@ -38,6 +38,13 @@ log = logging.getLogger(__name__)
 DEFAULT_OCR_MODEL_DIR = "/models/ocr/ppocrv6-small-trt"
 _ERROR_LOG_INTERVAL_SECONDS = 10.0
 
+_RELIABLE_CAMERA_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+    durability=DurabilityPolicy.VOLATILE,
+)
+
 _RESULT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
@@ -92,6 +99,18 @@ def _ocr_output_topic(input_topic: str) -> str:
     return f"{input_topic}/ocr"
 
 
+def _ocr_input_qos(reliability: str):
+    value = str(reliability).strip().lower().replace("-", "_")
+    if value == "best_effort":
+        return CAMERA_QOS
+    if value == "reliable":
+        return _RELIABLE_CAMERA_QOS
+    raise ValueError(
+        "OCR input_reliability must be 'best_effort' or 'reliable': "
+        f"got {reliability!r}"
+    )
+
+
 def _adapter_options(cfg: dict) -> dict:
     return {
         "model_dir": str(cfg.get("model_dir", DEFAULT_OCR_MODEL_DIR)),
@@ -136,7 +155,8 @@ class _OCRNode(Node):
     """订阅 image/jpeg topic，持续进行 OCR 识别"""
 
     def __init__(self, input_topic: str, adapter: RapidOCRAdapter, language: str = "zh",
-                 node_suffix: str = '', min_interval: float = 0.0):
+                 node_suffix: str = '', min_interval: float = 0.0,
+                 input_reliability: str = "best_effort"):
         node_name = f"ocr_{node_suffix}" if node_suffix else "ocr"
         super().__init__(node_name)
 
@@ -144,6 +164,7 @@ class _OCRNode(Node):
         self._output_topic = _ocr_output_topic(input_topic)
         self._adapter = adapter
         self._language = language
+        self._input_qos = _ocr_input_qos(input_reliability)
         # 帧处理最小间隔（秒）：限制 GPU 占用，0 = 不限
         self._min_interval = max(0.0, float(min_interval))
         self.state = "idle"
@@ -194,7 +215,7 @@ class _OCRNode(Node):
         self._frames = frames
         if self._sub is None:
             self._sub = self.create_subscription(
-                CompressedImage, self._input_topic, self._image_cb, CAMERA_QOS
+                CompressedImage, self._input_topic, self._image_cb, self._input_qos
             )
         self.state = "running"
         self._worker_threads = [
@@ -486,6 +507,7 @@ class OCRPlugin:
             cfg.get("language", self._language),
             node_suffix=node_key.replace('/', '_').replace('-', '_'),
             min_interval=float(cfg.get('min_interval_ms', 0)) / 1000.0,
+            input_reliability=str(cfg.get("input_reliability", "best_effort")),
         )
 
     def _dispose(self, node_key: str, node: "_OCRNode") -> None:
