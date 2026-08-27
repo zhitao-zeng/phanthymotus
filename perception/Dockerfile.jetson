@@ -195,6 +195,41 @@ assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__; \
 print('[build] VITS2 frontend ok on numpy ' + numpy.__version__)"; \
     fi && rm -f /tmp/vits2-requirements.txt
 
+# ── JP5 OCR decode parity ─────────────────────────────────────────
+# Ubuntu 20.04 installs libvips 8.9 while JP6/Ubuntu 22.04 installs 8.12.
+# Their thumbnail output differs on large images before TensorRT sees the
+# pixels. Build the JP6-matching C library only for JP5; pyvips itself remains
+# the same pinned Python binding on both families. This is an experimental
+# Darvin candidate, so build dependencies are intentionally kept in the image
+# until the accuracy/resource result decides whether a lean multi-stage package
+# is worth productizing.
+RUN if [ "${JP_VERSION}" = "511" ]; then \
+      mv /usr/sbin/ldconfig /usr/sbin/ldconfig.vips-wrapper && \
+      printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
+      chmod +x /usr/sbin/ldconfig && \
+      apt-get update && \
+      apt-get install -y --no-install-recommends \
+        build-essential autoconf automake libtool pkg-config gettext \
+        gtk-doc-tools gobject-introspection libvips-dev curl && \
+      curl --fail --location --retry 3 \
+        -o /tmp/vips-8.12.1.tar.gz \
+        https://mirrors.tuna.tsinghua.edu.cn/ubuntu/pool/universe/v/vips/vips_8.12.1.orig.tar.gz && \
+      echo 'cb043e473fcf618e3e9d7ce2eb525b6b4b2e60b7a307281136974399295a554e  /tmp/vips-8.12.1.tar.gz' | sha256sum -c - && \
+      tar -xzf /tmp/vips-8.12.1.tar.gz -C /tmp && \
+      cd /tmp/libvips-8.12.1 && \
+      ./autogen.sh --prefix=/opt/libvips812 --disable-static --disable-gtk-doc && \
+      make -j2 && make install && \
+      VIPS_BUILD_VERSION="$(LD_LIBRARY_PATH=/opt/libvips812/lib/aarch64-linux-gnu:/opt/libvips812/lib \
+        /opt/libvips812/bin/vips --version)" && \
+      echo "[build] ${VIPS_BUILD_VERSION}" && \
+      case "${VIPS_BUILD_VERSION}" in vips-8.12.1*) ;; *) exit 1 ;; esac && \
+      LD_LIBRARY_PATH=/opt/libvips812/lib/aarch64-linux-gnu:/opt/libvips812/lib \
+        python3 -c "import pyvips; version = tuple(pyvips.version(i) for i in range(3)); print('[build] pyvips C library', version); assert version == (8, 12, 1)" && \
+      mv -f /usr/sbin/ldconfig.vips-wrapper /usr/sbin/ldconfig && \
+      rm -rf /tmp/libvips-8.12.1 /tmp/vips-8.12.1.tar.gz && \
+      apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
+    fi
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
@@ -216,7 +251,7 @@ RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python${
     find /opt/ros/humble/install -name "site-packages" -type d >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth
 
 # ROS2 shared libraries（audio_msgs .so 等）
-ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="/opt/libvips812/lib/aarch64-linux-gnu:/opt/libvips812/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 
 # One write per log line instead of 8 KB block flushes that can tear a Docker
