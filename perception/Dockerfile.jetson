@@ -234,6 +234,12 @@ print('sherpa-onnx', sherpa_onnx.__version__, 'with CUDA provider')"; \
         pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx; \
     fi
 
+# Darvin starts ten evaluator instances. Seed the immutable step300 bundle once
+# at build time so those instances never race on a cold runtime download.
+COPY perception/utils/model_downloader.py /tmp/model_downloader.py
+RUN python3 -c "import sys; sys.path.insert(0, '/tmp'); from model_downloader import ensure_model; ensure_model('asr_sensevoice', '/models/sherpa-onnx/sensevoice-step300')" && \
+    rm -f /tmp/model_downloader.py
+
 # ── OCR runtime deps (PP-OCRv6 TensorRT engines; TensorRT/CUDA come from base) ──
 # libvips42 (apt, above) is the runtime library pyvips dlopens for JPEG decode
 # + downscale; rapidocr is used --no-deps for its pure-Python DB/CTC post-

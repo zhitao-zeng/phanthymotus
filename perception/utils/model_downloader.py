@@ -48,7 +48,12 @@ MODELS = {
         "check_file": "tokens.txt",
     },
     "asr_sensevoice": {
-        "url": f"{COS_BASE}/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.zip",
+        "url": (
+            "https://www.modelscope.cn/models/Flame4pd/"
+            "sensevoice-step300-int8-robot/resolve/"
+            "3fb11907f0a85fc474fb26c1e37f9fdb78d453a7/"
+            "sensevoice-step300-int8-v1.zip"
+        ),
         "check_file": "tokens.txt",
     },
     "asr_paraformer_offline": {
