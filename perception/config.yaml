@@ -64,6 +64,7 @@ plugins:
   obstacle:
     enabled: true
     provider: local
+    retain_node_on_stop: true  # Darvin reuses one topic across per-case start/stop calls
     # Route supported deployment image sizes to their model domains.
     scene_mode: resolution
     unload_inactive_scene: true

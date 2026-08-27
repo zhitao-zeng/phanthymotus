@@ -393,7 +393,9 @@ class ObstacleDistancePlugin:
       downloaded and initialised once (single-flight);
     * info is a pure query and never blocks on the loader;
     * stop during loading cancels the pending instance; stop of a live
-      instance disposes its node (executor.remove_node + destroy_node);
+      instance normally disposes its node (executor.remove_node +
+      destroy_node). The opt-in ``retain_node_on_stop`` mode pauses the
+      worker but keeps the ROS endpoints for a later start on the same key;
     * config bumps a load generation so a stale loader can never install
       an adapter built from an outdated configuration.
 
@@ -410,6 +412,9 @@ class ObstacleDistancePlugin:
         self._executor = executor
         self._plugin_cfg = deepcopy(plugin_cfg or {})
         self._provider = self._plugin_cfg.get("provider", "local")
+        self._retain_node_on_stop = bool(
+            self._plugin_cfg.get("retain_node_on_stop", False)
+        )
 
         # Guarded by _state_lock, held for bookkeeping only — never while
         # building engines or joining workers.
@@ -424,7 +429,11 @@ class ObstacleDistancePlugin:
         self._load_generation = 0
         self._loader_thread: threading.Thread | None = None
 
-        log.info("[obstacle] plugin registered: provider=%s", self._provider)
+        log.info(
+            "[obstacle] plugin registered: provider=%s, retain_node_on_stop=%s",
+            self._provider,
+            self._retain_node_on_stop,
+        )
 
     def get_tools(self) -> list:
         return TOOLS
@@ -833,19 +842,32 @@ class ObstacleDistancePlugin:
         return result
 
     def _do_stop(self, instance_id: str) -> dict:
+        to_stop: list[_ObstacleNode] = []
         to_dispose: list[tuple[str, _ObstacleNode]] = []
         with self._state_lock:
             if instance_id:
                 self._pending_starts.pop(instance_id, None)
-                node = self._nodes.pop(instance_id, None)
+                node = (
+                    self._nodes.get(instance_id)
+                    if self._retain_node_on_stop
+                    else self._nodes.pop(instance_id, None)
+                )
                 if node is not None:
-                    to_dispose.append((instance_id, node))
+                    if self._retain_node_on_stop:
+                        to_stop.append(node)
+                    else:
+                        to_dispose.append((instance_id, node))
                 stopped = [instance_id]
             else:
                 self._pending_starts.clear()
                 stopped = list(self._nodes)
-                to_dispose.extend(self._nodes.items())
-                self._nodes = {}
+                if self._retain_node_on_stop:
+                    to_stop.extend(self._nodes.values())
+                else:
+                    to_dispose.extend(self._nodes.items())
+                    self._nodes = {}
+        for node in to_stop:
+            node.stop()
         for node_key, node in to_dispose:
             self._dispose(node_key, node)
         if instance_id:
