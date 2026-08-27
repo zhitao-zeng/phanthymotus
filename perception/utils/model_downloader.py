@@ -57,7 +57,12 @@ MODELS = {
     },
     "asr_x_asr": {
         # Domain-adapted weights with the packaged wake-word hotword list.
-        "url": f"{COS_BASE}/x-asr-zh-en-punct-int8-robot-v2.zip",
+        "url": (
+            "https://www.modelscope.cn/models/Flame4pd/"
+            "x-asr-zh-en-punct-int8-robot/resolve/"
+            "0e1b721f9433e9c750d3857233372fddfe9e8bd3/"
+            "x-asr-c200-robot343-v1.zip"
+        ),
         "check_file": "tokens.txt",
     },
     "tts": {
