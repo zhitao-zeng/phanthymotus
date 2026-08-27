@@ -44,6 +44,7 @@ plugins:
     device_id: 0
     language: zh
     input_reliability: reliable  # Darvin publishes large images reliably; retain fragment retransmission
+    retain_node_on_stop: true  # Darvin-only: evaluator reuses one topic across per-case start/stop calls
     use_angle_cls: true
     max_side_len: 1600
     det_unclip_ratio: 0.7

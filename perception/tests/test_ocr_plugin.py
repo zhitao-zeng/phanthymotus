@@ -256,6 +256,31 @@ def test_ocr_repeated_start_stop_does_not_grow(ocr):
     assert all(node.destroyed for node in created)
 
 
+def test_ocr_retain_node_on_stop_reuses_same_node(monkeypatch):
+    plugin, executor, builder = _make_plugin(
+        monkeypatch,
+        cfg={"provider": "rapidocr", "retain_node_on_stop": True},
+    )
+    node = None
+    subscription = None
+    for _ in range(54):
+        _start_and_wait(plugin, executor, "/cam/a", instance_id="a")
+        if node is None:
+            node = executor.nodes[0]
+            subscription = node.subscriptions[0]
+        assert executor.nodes == [node]
+        assert node.subscriptions == [subscription]
+
+        plugin.dispatch("ocr", {"action": "stop", "instance_id": "a"})
+        assert executor.nodes == [node]
+        assert plugin._nodes == {"a": node}
+        assert node.state == "idle"
+        assert not node.destroyed
+        assert not node.worker_alive
+
+    assert builder.calls == 1
+
+
 def test_ocr_repeated_start_is_idempotent(ocr):
     plugin, executor, _ = ocr
     _start_and_wait(plugin, executor, "/cam/a", instance_id="a")

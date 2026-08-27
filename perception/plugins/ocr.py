@@ -368,7 +368,9 @@ class OCRPlugin:
       engine build, N instances;
     * info never blocks and never loads anything;
     * stop during loading cancels the pending instance; stop of a live
-      instance disposes its node (executor.remove_node + destroy_node);
+      instance normally disposes its node (executor.remove_node +
+      destroy_node). The opt-in ``retain_node_on_stop`` experiment pauses the
+      worker but retains the ROS endpoints for a later start on the same key;
     * config bumps a generation token so a stale loader can never install
       an adapter built from an outdated configuration.
     """
@@ -378,6 +380,13 @@ class OCRPlugin:
     def __init__(self, plugin_cfg: dict, executor):
         self._plugin_cfg = dict(plugin_cfg)
         self._language = plugin_cfg.get('language', 'zh')
+        # Darvin's evaluator starts and stops the same OCR instance for every
+        # case. This private experiment switch avoids rebuilding the native
+        # ROS/FastDDS entities in that hot loop. Product/default semantics stay
+        # unchanged: stop fully disposes the node.
+        self._retain_node_on_stop = bool(
+            plugin_cfg.get("retain_node_on_stop", False)
+        )
         self._executor = executor
 
         # All fields below are guarded by _state_lock. The lock is only ever
@@ -394,7 +403,8 @@ class OCRPlugin:
 
         log.info(
             f"[ocr] plugin init: provider={plugin_cfg.get('provider')}, "
-            f"language={self._language}"
+            f"language={self._language}, "
+            f"retain_node_on_stop={self._retain_node_on_stop}"
         )
 
     def get_tools(self) -> list:
@@ -715,17 +725,30 @@ class OCRPlugin:
         return result
 
     def _do_stop(self, instance_id: str) -> dict:
+        to_stop: list[_OCRNode] = []
         to_dispose: list[tuple[str, _OCRNode]] = []
         with self._state_lock:
             if instance_id:
                 self._pending_starts.pop(instance_id, None)
-                node = self._nodes.pop(instance_id, None)
+                node = (
+                    self._nodes.get(instance_id)
+                    if self._retain_node_on_stop
+                    else self._nodes.pop(instance_id, None)
+                )
                 if node is not None:
-                    to_dispose.append((instance_id, node))
+                    if self._retain_node_on_stop:
+                        to_stop.append(node)
+                    else:
+                        to_dispose.append((instance_id, node))
             else:
                 self._pending_starts.clear()
-                to_dispose.extend(self._nodes.items())
-                self._nodes = {}
+                if self._retain_node_on_stop:
+                    to_stop.extend(self._nodes.values())
+                else:
+                    to_dispose.extend(self._nodes.items())
+                    self._nodes = {}
+        for node in to_stop:
+            node.stop()
         for node_key, node in to_dispose:
             self._dispose(node_key, node)
         return {"state": "idle"}
