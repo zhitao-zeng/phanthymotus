@@ -125,10 +125,28 @@ class EmptyResultRetryConfig:
         )
 
 
+_vips_cache_disabled = False
+
+
+def _disable_vips_operation_cache(pyvips) -> None:
+    """Stop libvips from retaining decoded intermediates between calls.
+
+    Each frame is decoded once and never revisited, so the operation cache
+    never serves a hit in this pipeline and only holds memory.
+    """
+    global _vips_cache_disabled
+    if _vips_cache_disabled:
+        return
+    pyvips.cache_set_max_mem(0)
+    pyvips.cache_set_max(0)
+    _vips_cache_disabled = True
+
+
 def decode_vips_overview(image_bytes: bytes, max_side: int):
     import numpy as np
     import pyvips
 
+    _disable_vips_operation_cache(pyvips)
     if max_side <= 0:
         raise ValueError("max_side must be positive")
     # no_rotate=True: keep the stored pixel orientation. Boxes are scaled back
