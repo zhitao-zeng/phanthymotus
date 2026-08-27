@@ -32,6 +32,20 @@ SPEECH_THRESH  = 0.5
 SILENCE_THRESH = 0.35
 SILENCE_FRAMES = 16
 
+
+def _process_memory_mb() -> tuple[float, float]:
+    """Return current RSS and peak RSS without adding a psutil dependency."""
+    values = {}
+    try:
+        with open("/proc/self/status", encoding="utf-8") as status_file:
+            for line in status_file:
+                name, separator, value = line.partition(":")
+                if separator and name in ("VmRSS", "VmHWM"):
+                    values[name] = float(value.split()[0]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    return values.get("VmRSS", 0.0), values.get("VmHWM", 0.0)
+
 # Documented AudioChunk contract — see perception/README.md ("Audio Requirements
 # for ASR"): 16 kHz mono PCM_S16_LE, at least 512 samples per chunk.
 AUDIO_FORMAT       = "audio/pcm-16k"
@@ -569,13 +583,19 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         import io as _io, wave as _wave
+        import numpy as np
+
         with _wave.open(_io.BytesIO(wav_bytes)) as wf:
             pcm = wf.readframes(wf.getnframes())
         n = len(pcm) // 2
-        samples = struct.unpack(f'<{n}h', pcm)
-        float_samples = [s / 32768.0 for s in samples]
-        # Pad 500ms silence at the end to avoid last-token truncation
-        float_samples += [0.0] * int(SAMPLE_RATE * 0.5)
+        # Avoid a tuple of Python ints followed by a list of Python floats. On a
+        # 30-second utterance those short-lived objects cost tens of megabytes
+        # per process, which is material when several services share one device.
+        tail_samples = int(SAMPLE_RATE * 0.5)
+        float_samples = np.empty(n + tail_samples, dtype=np.float32)
+        float_samples[:n] = np.frombuffer(pcm, dtype="<i2")
+        float_samples[:n] *= 1.0 / 32768.0
+        float_samples[n:] = 0.0
 
         stream = self._recognizer.create_stream()
         stream.accept_waveform(SAMPLE_RATE, float_samples)
@@ -1353,6 +1373,9 @@ class _ASRNode(Node):
         self._pcm_queue = None
         self._utterance_queue = None
         self._vad_stop = None
+        rss_mb, hwm_mb = _process_memory_mb()
+        log.info("[asr] pipeline stopped topic=%s rss=%.0fMB hwm=%.0fMB",
+                 self._input_topic, rss_mb, hwm_mb)
 
     def _audio_cb(self, msg):
         if self._stop_event.is_set():
@@ -1528,7 +1551,8 @@ class _ASRNode(Node):
                           "spans": _spans}
                 msg = String(); msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
-                log.info(f"[asr] {text!r}")
+                rss_mb, hwm_mb = _process_memory_mb()
+                log.info("[asr] %r (rss=%.0fMB, hwm=%.0fMB)", text, rss_mb, hwm_mb)
             except Exception as e:
                 log.error(f"[asr] transcribe error: {e}", exc_info=True)
 
