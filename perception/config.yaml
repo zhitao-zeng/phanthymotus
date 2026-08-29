@@ -94,7 +94,7 @@ plugins:
     recognizer: lvface
     device_id: 0
     detector_input_size: [640, 640]
-    detector_score_threshold: 0.2
+    detector_score_threshold: 0.15
     detector_nms_threshold: 0.4
     query_flip_tta: false
     centroid_weight: 0.6
