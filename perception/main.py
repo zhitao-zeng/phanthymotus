@@ -85,11 +85,21 @@ class PerceptionBundle:
         face_only = os.environ.get("FACE_ONLY", "").strip().lower() in {
             "1", "true", "yes", "face"
         }
-        if face_only:
-            face_cfg = dict(plugins_cfg.get("face", {}))
+        face_cfg = dict(plugins_cfg.get("face", {}))
+        face_db_dir = os.environ.get("FACE_DB_DIR") or face_cfg.get(
+            "face_db_dir", "/workspace/face_db"
+        )
+        gallery_mounted = Path(face_db_dir).is_dir()
+        if face_only or gallery_mounted:
             face_cfg["enabled"] = True
+            face_cfg["face_db_dir"] = face_db_dir
+            if gallery_mounted and not os.environ.get("FACE_BACKEND"):
+                face_cfg["backend"] = "opencv"
+            if gallery_mounted and not os.environ.get("FACE_RECOGNIZER"):
+                face_cfg["recognizer"] = "mobilefacenet"
             plugins_cfg = {"face": face_cfg}
-            log.info("FACE_ONLY selected: loading only FaceRecognitionPlugin")
+            reason = "FACE_ONLY" if face_only else "mounted face gallery"
+            log.info("%s selected: loading only FaceRecognitionPlugin", reason)
 
         if plugins_cfg.get("asr", {}).get("enabled", False):
             from plugins.asr import ASRPlugin

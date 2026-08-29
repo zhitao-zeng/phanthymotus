@@ -14,9 +14,10 @@ ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG JP_VERSION=511
 ARG ENABLE_VITS2_TRT=1
+ARG FACE_CPU_MODEL_BASE_URL=https://github.com/zhitao-zeng/phanthymotus/releases/download/face-id-models-v1
 
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
-ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
+ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT FACE_CPU_MODEL_BASE_URL
 
 # ── Everything that differs per JetPack line, resolved once ──────────────────
 # These facts used to be restated at each point of use — the numpy pin appeared
@@ -253,6 +254,15 @@ RUN . /etc/jetpack.env; \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} "pyvips==3.1.0" && \
     RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
     find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete
+
+# ── Face-ID CPU seed (shared by JP5/JP6; copied into /models on first start) ──
+RUN mkdir -p /opt/phanthy-motus/models/face/cpu && \
+    python3 -c "import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1] + '/scrfd_500m_kps.onnx', sys.argv[2])" \
+      "${FACE_CPU_MODEL_BASE_URL}" /opt/phanthy-motus/models/face/cpu/scrfd_500m_kps.onnx && \
+    python3 -c "import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1] + '/mobilefacenet_webface600k.onnx', sys.argv[2])" \
+      "${FACE_CPU_MODEL_BASE_URL}" /opt/phanthy-motus/models/face/cpu/mobilefacenet_webface600k.onnx && \
+    echo "98cb7b00f99874543cde21b4f63a960b4d2f63bbfa7f68cc36381de817e93673  /opt/phanthy-motus/models/face/cpu/scrfd_500m_kps.onnx" | sha256sum -c - && \
+    echo "9cc6e4a75f0e2bf0b1aed94578f144d15175f357bdc05e815e5c4a02b319eb4f  /opt/phanthy-motus/models/face/cpu/mobilefacenet_webface600k.onnx" | sha256sum -c -
 
 # ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
 # ldconfig shimmed for the same reason as the ffmpeg step above — this is the

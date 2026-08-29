@@ -563,6 +563,33 @@ def test_ensure_face_model_requires_url_for_cold_download(tmp_path, monkeypatch)
         model_downloader.ensure_face_model("/models/face", family="jp61")
 
 
+def test_ensure_face_cpu_model_installs_verified_seed(tmp_path, monkeypatch):
+    from utils import model_downloader
+
+    payloads = {
+        "scrfd.onnx": b"detector",
+        "mobile.onnx": b"recognizer",
+    }
+    seed = tmp_path / "seed"
+    target = tmp_path / "models" / "face"
+    seed.mkdir(parents=True)
+    for name, payload in payloads.items():
+        (seed / name).write_bytes(payload)
+    monkeypatch.setattr(model_downloader, "FACE_CPU_MODEL_FILES", _manifest(payloads))
+    monkeypatch.setenv("FACE_CPU_MODEL_SEED_DIR", str(seed))
+    monkeypatch.delenv("FACE_CPU_MODEL_BASE_URL", raising=False)
+    monkeypatch.delenv("FACE_MODEL_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        model_downloader,
+        "require_models_subpath",
+        lambda path: str(target),
+    )
+    paths = model_downloader.ensure_face_cpu_model("/models/face")
+    assert set(paths) == set(payloads)
+    for name, payload in payloads.items():
+        assert (target / "cpu" / name).read_bytes() == payload
+
+
 # ── SampledLogGate ───────────────────────────────────────────────────────────
 
 def test_sampled_log_gate_transitions_and_sampling():

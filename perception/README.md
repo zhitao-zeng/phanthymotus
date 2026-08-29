@@ -62,6 +62,18 @@ thread per process unless OpenCV is configured otherwise. The distributed
 SCRFD graph is the official ONNX with its otherwise-dynamic input frozen to
 `1x3x640x640` using `tools/fix_onnx_input_shape.py`; weights and outputs are
 unchanged, while OpenCV DNN can resolve every `Shape` node at import time.
+When a nonempty face gallery is mounted at `/workspace/face_db`, the bundle
+automatically selects this face-only CPU path; this matches the evaluator,
+which controls only the gallery mount and does not forward arbitrary submit
+environment variables into its remote perception containers. CPU models
+default to the immutable `face-id-models-v1` GitHub release and remain pinned
+by size and SHA256; `FACE_CPU_MODEL_BASE_URL` can replace that distribution
+host without changing model identity.
+The Docker image stores the verified CPU pair under
+`/opt/phanthy-motus/models/face/cpu`. First start installs from this local seed
+through the same staged verifier, so ten evaluator containers do not perform
+ten concurrent public downloads. A bind-mounted `/models` may hide any build-
+time `/models` content, which is why the seed deliberately lives under `/opt`.
 
 Utilities:
 

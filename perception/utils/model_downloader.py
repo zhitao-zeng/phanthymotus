@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+from pathlib import Path
 import tarfile
 import tempfile
 import time
@@ -669,19 +670,33 @@ FACE_CPU_MODEL_FILES = {
     },
 }
 
+FACE_CPU_MODEL_DEFAULT_BASE = (
+    "https://github.com/zhitao-zeng/phanthymotus/releases/download/"
+    "face-id-models-v1"
+)
+
 
 def ensure_face_cpu_model(model_dir: str) -> dict[str, str]:
     """Ensure the cross-JetPack OpenCV DNN detector/recognizer pair."""
 
     model_dir = require_models_subpath(model_dir)
     cpu_dir = os.path.join(model_dir, "cpu")
-    base = os.environ.get("FACE_MODEL_BASE_URL", "").strip()
-    if not base and not _bundle_matches(cpu_dir, FACE_CPU_MODEL_FILES):
-        raise RuntimeError(
-            "FACE_MODEL_BASE_URL is required when face CPU models are not already present"
-        )
-    base_url = f"{base.rstrip('/')}/cpu" if base else ""
-    log.info("[model_downloader] face: using CPU ONNX bundle")
+    seed_dir = os.environ.get(
+        "FACE_CPU_MODEL_SEED_DIR",
+        "/opt/phanthy-motus/models/face/cpu",
+    )
+    cpu_base = os.environ.get("FACE_CPU_MODEL_BASE_URL", "").strip()
+    generic_base = os.environ.get("FACE_MODEL_BASE_URL", "").strip()
+    if _bundle_matches(seed_dir, FACE_CPU_MODEL_FILES):
+        base_url = Path(seed_dir).resolve().as_uri()
+        log.info("[model_downloader] face: installing CPU ONNX bundle from image seed")
+    elif cpu_base:
+        base_url = cpu_base.rstrip("/")
+    elif generic_base:
+        base_url = f"{generic_base.rstrip('/')}/cpu"
+    else:
+        base_url = FACE_CPU_MODEL_DEFAULT_BASE
+        log.info("[model_downloader] face: downloading CPU ONNX bundle")
     return ensure_verified_bundle(
         "face/cpu", cpu_dir, base_url, FACE_CPU_MODEL_FILES
     )
