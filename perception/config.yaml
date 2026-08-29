@@ -82,3 +82,33 @@ plugins:
       det_thresh: 0.1
       det_box_thresh: 0.1
     min_interval_ms: 0
+
+  # Optional on-device face identification. Model engines are loaded only on
+  # the first valid `face start`; start/stop then reuses the same engines and
+  # gallery templates across benchmark cases.
+  face:
+    enabled: false
+    backend: tensorrt
+    model_dir: /models/face
+    face_db_dir: /workspace/face_db
+    recognizer: lvface
+    device_id: 0
+    detector_input_size: [640, 640]
+    detector_score_threshold: 0.2
+    detector_nms_threshold: 0.4
+    query_flip_tta: false
+    centroid_weight: 0.6
+    unknown_threshold: null
+    gallery_quality:
+      min_detection_score: 0.2
+      min_face_size: 24
+      min_eye_distance: 8
+      min_blur_variance: 0
+      flip_tta: true
+      max_subcenters: 3
+      subcenter_min_images: 4
+    bbox_calibration:
+      x_scale: 1.0
+      y_scale: 1.0
+      y_shift: 0.0
+    min_interval_ms: 0

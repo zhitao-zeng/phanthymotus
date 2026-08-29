@@ -514,6 +514,55 @@ def test_select_bundle_family(tmp_path, monkeypatch):
         model_downloader.select_bundle_family({"jp61": bundles["jp61"]}, family="511")
 
 
+def test_ensure_face_model_reuses_valid_offline_bundle(tmp_path, monkeypatch):
+    from utils import model_downloader
+
+    payloads = {
+        "scrfd.engine": b"detector",
+        "lvface.engine": b"recognizer",
+    }
+    bundles = {
+        "jp61": {
+            "files": _manifest(payloads),
+        }
+    }
+    monkeypatch.setattr(model_downloader, "FACE_MODEL_BUNDLES", bundles)
+    monkeypatch.delenv("FACE_MODEL_BASE_URL", raising=False)
+    root = tmp_path / "models"
+    family_dir = root / "face" / "jp61"
+    family_dir.mkdir(parents=True)
+    for name, payload in payloads.items():
+        (family_dir / name).write_bytes(payload)
+    monkeypatch.setattr(model_downloader, "MODELS_ROOT", str(root))
+    # require_models_subpath's default is bound at definition time, so pass a
+    # model path under /models in production and patch the validator here.
+    monkeypatch.setattr(
+        model_downloader,
+        "require_models_subpath",
+        lambda path: str(family_dir.parent),
+    )
+    paths = model_downloader.ensure_face_model("/models/face", family="61")
+    assert set(paths) == set(payloads)
+
+
+def test_ensure_face_model_requires_url_for_cold_download(tmp_path, monkeypatch):
+    from utils import model_downloader
+
+    monkeypatch.setattr(
+        model_downloader,
+        "FACE_MODEL_BUNDLES",
+        {"jp61": {"files": _manifest({"det.engine": b"detector"})}},
+    )
+    monkeypatch.delenv("FACE_MODEL_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        model_downloader,
+        "require_models_subpath",
+        lambda path: str(tmp_path / "face"),
+    )
+    with pytest.raises(RuntimeError, match="FACE_MODEL_BASE_URL"):
+        model_downloader.ensure_face_model("/models/face", family="jp61")
+
+
 # ── SampledLogGate ───────────────────────────────────────────────────────────
 
 def test_sampled_log_gate_transitions_and_sampling():

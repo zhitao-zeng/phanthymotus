@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "parameter_definition": "sum of ONNX graph initializer elements",
+  "models": [
+    {
+      "role": "detector",
+      "name": "scrfd_500m_kps",
+      "source": "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_sc.zip",
+      "source_revision": "v0.7",
+      "archive_bytes": 16140916,
+      "archive_sha256": "57d31b56b6ffa911c8a73cfc1707c73cab76efe7f13b675a05223bf42de47c72",
+      "file": "det_500m.onnx",
+      "file_bytes": 2524817,
+      "file_sha256": "5e4447f50245bbd7966bd6c0fa52938c61474a04ec7def48753668a9d8b4ea3a",
+      "initializer_parameters": 626332,
+      "license": "InsightFace pretrained model; non-commercial research use unless separately licensed"
+    },
+    {
+      "role": "recognizer",
+      "name": "lvface_t_glint360k",
+      "source": "https://huggingface.co/bytedance-research/LVFace/resolve/b12702ab1f5c721748e054a66dc90e1edd1f0724/LVFace-T_Glint360K/LVFace-T_Glint360K.onnx",
+      "source_revision": "b12702ab1f5c721748e054a66dc90e1edd1f0724",
+      "file": "LVFace-T_Glint360K.onnx",
+      "file_bytes": 76653813,
+      "file_sha256": "bf8da0e1e93c432d9a1d874a9ba0990f5859f970e8864b3990f2f33d11f9cdb3",
+      "initializer_parameters": 19139072,
+      "license": "LVFace pretrained model; non-commercial research use"
+    },
+    {
+      "role": "recognizer_fast",
+      "name": "mobilefacenet_webface600k",
+      "source": "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_sc.zip",
+      "source_revision": "v0.7",
+      "file": "w600k_mbf.onnx",
+      "file_bytes": 13616099,
+      "file_sha256": "9cc6e4a75f0e2bf0b1aed94578f144d15175f357bdc05e815e5c4a02b319eb4f",
+      "initializer_parameters": 3400448,
+      "license": "InsightFace pretrained model; non-commercial research use unless separately licensed"
+    }
+  ],
+  "primary_pair_initializer_parameters": 19765404,
+  "fast_pair_initializer_parameters": 4026780,
+  "all_listed_initializer_parameters": 23165852,
+  "conversions": [
+    {
+      "name": "lvface_t_glint360k_trt8_layernorm_decomposed",
+      "source_sha256": "bf8da0e1e93c432d9a1d874a9ba0990f5859f970e8864b3990f2f33d11f9cdb3",
+      "file_bytes": 76677350,
+      "file_sha256": "bef8a57724ed440f8fa03bf695367e55ce6df0a2d345200a1482a6a6ffa2adf0",
+      "transform": "decompose 25 final-axis LayerNormalization nodes into primitive ONNX operations",
+      "onnxruntime_max_abs_diff": 0.0
+    }
+  ],
+  "validated_engines": [
+    {
+      "family": "jp511",
+      "tensorrt": "8.5.2",
+      "device": "Jetson Orin Nano 8GB, compute capability 8.7",
+      "detector_bytes": 1782502,
+      "detector_sha256": "34a8d33b7ffee7f77696c01f91a2ef20d342eaf4e1d3177c14bdbfcdb75c8f9e",
+      "recognizer_bytes": 41759257,
+      "recognizer_sha256": "af0d85a68c70839c4ca89d9c12f3993306cdc58d91a4c2686f9b6ba146584311",
+      "fp32_fp16_embedding_cosine": 0.9997823238372803
+    },
+    {
+      "family": "jp511",
+      "pipeline": "scrfd_500m_kps + mobilefacenet_webface600k",
+      "tensorrt": "8.5.2",
+      "device": "Jetson Orin Nano 8GB, compute capability 8.7",
+      "recognizer_bytes": 7358573,
+      "recognizer_sha256": "d2be965e3d79e050a3e898f47ff49dc3a2f2c32f8e4b3abb635bf4bcc8ca1662",
+      "fp32_fp16_embedding_cosine": 0.9998654127120972
+    },
+    {
+      "family": "jp61",
+      "pipeline": "scrfd_500m_kps + lvface_t_glint360k",
+      "tensorrt": "10.4.0",
+      "device": "Jetson Orin Nano 8GB, compute capability 8.7",
+      "detector_bytes": 1790508,
+      "detector_sha256": "85cd207c66528e5c225a62ad9487ec43b74690be4ddef66d2c14bbed1a1e8570",
+      "recognizer_bytes": 41117356,
+      "recognizer_sha256": "38322ccb06106e352c81726d93770ae386bb97bd1b399e20fa8aab3f57d84fa9",
+      "fp32_fp16_embedding_cosine": 0.9996975660324097
+    }
+  ]
+}

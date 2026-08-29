@@ -2,6 +2,88 @@
 
 Modular ASR/TTS perception plugins running as an MCP HTTP server. Connects to Agent Core via MCP tool calls and exchanges audio/text over ROS2 DDS topics.
 
+## Face Identification
+
+The optional `face` processor performs closed-set, on-device face
+identification:
+
+```text
+JPEG -> SCRFD-500M_KPS -> five-point 112x112 alignment
+     -> LVFace-T or MobileFaceNet -> gallery template matching
+     -> {detect_confidence, bbox_relative, identity}
+```
+
+It keeps the benchmark-compatible MCP contract: `action=start` subscribes to
+an `image/jpeg` ROS2 topic and publishes one JSON result on `<input>/face`.
+`bbox_relative` is normalized `[x, y, width, height]`. A frame without a face
+publishes `bbox_relative: null` and `identity: null`.
+
+The plugin is disabled by default. TensorRT models use this layout, selected
+from the TensorRT version available at runtime:
+
+```text
+/models/face/
+  jp511/
+    scrfd_500m_kps.engine
+    lvface_t_glint360k.engine
+    mobilefacenet_webface600k.engine  # optional fast recognizer
+  jp61/
+    scrfd_500m_kps.engine
+    lvface_t_glint360k.engine
+    mobilefacenet_webface600k.engine  # optional fast recognizer
+```
+
+The identity gallery is mounted separately:
+
+```text
+/workspace/face_db/
+  person-id-1/*.jpg
+  person-id-2/*.jpg
+```
+
+Only registration images belong there; probe metadata and answer files must
+not be mounted into the inference container. Engines and gallery templates are
+built on the first valid `start`, then retained across per-case `stop/start`
+calls. For host-side parity checks, set `backend: onnx` and place the two ONNX
+files directly under `model_dir`.
+
+For a cold TensorRT deployment, set `FACE_MODEL_BASE_URL` to an immutable HTTP
+directory containing `jp511/` and `jp61/`. The first valid start downloads the
+matching two-engine bundle through a temporary directory, verifies pinned byte
+sizes and SHA256 values, and only then publishes it under `model_dir`. A valid
+pre-mounted bundle remains usable offline. `FACE_ONLY=1` is the deployment
+selector for a face-only image; the repository default remains disabled so an
+unrelated perception deployment does not initialize the models.
+
+Utilities:
+
+```bash
+python3 perception/tools/count_onnx_params.py detector.onnx recognizer.onnx
+python3 perception/tools/build_face_engines.py \
+  --detector-onnx detector.onnx --recognizer-onnx recognizer.onnx \
+  --output-dir /models/face/jp61
+python3 perception/tools/benchmark_face_id.py \
+  --config perception/config.yaml image1.jpg image2.jpg
+```
+
+TensorRT 8.5 cannot import the opset-17 `LayerNormalization` nodes in the
+official LVFace ONNX. Preserve the downloaded original and create a separate
+JP5-compatible graph before building that recognizer engine:
+
+```bash
+python3 perception/tools/decompose_layernorm_onnx.py \
+  LVFace-T_Glint360K.onnx lvface_t_glint360k_trt8.onnx
+python3 perception/tools/build_face_engines.py \
+  --recognizer-onnx lvface_t_glint360k_trt8.onnx \
+  --output-dir /models/face/jp511
+```
+
+The conversion is algebraic, not a weight update. Validate the converted ONNX
+against the original with ONNX Runtime, then compare the final FP16 engine's
+embedding cosine on the target Jetson. TensorRT plans remain tied to the target
+TensorRT stack and must not be reused merely because another board is also
+Arm64.
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.

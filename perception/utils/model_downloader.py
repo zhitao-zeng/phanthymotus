@@ -605,6 +605,59 @@ def ensure_ocr_model(model_dir: str, family: str | None = None) -> dict[str, str
     )
 
 
+# ── Face ID (SCRFD + LVFace-T TensorRT engines) ─────────────────────────────
+
+FACE_MODEL_BUNDLES = {
+    "jp511": {
+        "files": {
+            "scrfd_500m_kps.engine": {
+                "size": 1782502,
+                "sha256": "34a8d33b7ffee7f77696c01f91a2ef20d342eaf4e1d3177c14bdbfcdb75c8f9e",
+            },
+            "lvface_t_glint360k.engine": {
+                "size": 41759257,
+                "sha256": "af0d85a68c70839c4ca89d9c12f3993306cdc58d91a4c2686f9b6ba146584311",
+            },
+        },
+    },
+    "jp61": {
+        "files": {
+            "scrfd_500m_kps.engine": {
+                "size": 1790508,
+                "sha256": "85cd207c66528e5c225a62ad9487ec43b74690be4ddef66d2c14bbed1a1e8570",
+            },
+            "lvface_t_glint360k.engine": {
+                "size": 41117356,
+                "sha256": "38322ccb06106e352c81726d93770ae386bb97bd1b399e20fa8aab3f57d84fa9",
+            },
+        },
+    },
+}
+
+
+def ensure_face_model(model_dir: str, family: str | None = None) -> dict[str, str]:
+    """Ensure the face TensorRT engines for the active JetPack family.
+
+    FACE_MODEL_BASE_URL is intentionally required only for a cold download.
+    A pre-mounted, hash-valid bundle remains usable for offline Jetson tests.
+    """
+
+    model_dir = require_models_subpath(model_dir)
+    key = select_bundle_family(FACE_MODEL_BUNDLES, family)
+    entry = FACE_MODEL_BUNDLES[key]
+    family_dir = os.path.join(model_dir, key)
+    base = os.environ.get("FACE_MODEL_BASE_URL", "").strip()
+    if not base and not _bundle_matches(family_dir, entry["files"]):
+        raise RuntimeError(
+            "FACE_MODEL_BASE_URL is required when face engines are not already present"
+        )
+    base_url = f"{base.rstrip('/')}/{key}" if base else ""
+    log.info(f"[model_downloader] face: using {key} bundle")
+    return ensure_verified_bundle(
+        f"face/{key}", family_dir, base_url, entry["files"]
+    )
+
+
 def ensure_verified_archive(name: str, model_dir: str, url: str, entry: dict) -> None:
     """Ensure a size/SHA256-pinned archive has been unpacked into model_dir.
 

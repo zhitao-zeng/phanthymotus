@@ -8,8 +8,8 @@ perception/main.py — Perception Stack bundle 统一入口。
 MCP 工具命名规则：{plugin_prefix}_{tool_name}
   例：asr_info, asr_start, asr_stop, tts_info, tts_start, tts_speak
 
-MCP server 端口: config.mcp_port（默认 15720）
-WebSocket ASR 端口: config.ws_port（默认 15721）
+MCP server 端口: MCP_PORT > config.mcp_port（默认 15720）
+WebSocket ASR 端口: WS_PORT > config.ws_port（默认 15721）
 """
 
 from __future__ import annotations
@@ -81,7 +81,15 @@ def _load_config() -> dict:
 class PerceptionBundle:
     def __init__(self, cfg: dict, executor):
         self._plugins: list = []
-        plugins_cfg = cfg.get("plugins", {})
+        plugins_cfg = dict(cfg.get("plugins", {}))
+        face_only = os.environ.get("FACE_ONLY", "").strip().lower() in {
+            "1", "true", "yes", "face"
+        }
+        if face_only:
+            face_cfg = dict(plugins_cfg.get("face", {}))
+            face_cfg["enabled"] = True
+            plugins_cfg = {"face": face_cfg}
+            log.info("FACE_ONLY selected: loading only FaceRecognitionPlugin")
 
         if plugins_cfg.get("asr", {}).get("enabled", False):
             from plugins.asr import ASRPlugin
@@ -115,6 +123,11 @@ class PerceptionBundle:
             from plugins.ocr import OCRPlugin
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
             log.info("OCRPlugin loaded")
+
+        if plugins_cfg.get("face", {}).get("enabled", False):
+            from plugins.face import FaceRecognitionPlugin
+            self._plugins.append(FaceRecognitionPlugin(plugins_cfg["face"], executor))
+            log.info("FaceRecognitionPlugin loaded")
 
     def get_all_tools(self) -> list:
         tools = []
@@ -462,8 +475,8 @@ def main():
     global _bundle
 
     cfg      = _load_config()
-    mcp_port = int(cfg.get("mcp_port", 15720))
-    ws_port  = int(cfg.get("ws_port",  15721))
+    mcp_port = int(os.environ.get("MCP_PORT") or cfg.get("mcp_port", 15720))
+    ws_port = int(os.environ.get("WS_PORT") or cfg.get("ws_port", 15721))
 
     log.info(f"perception bundle starting, mcp_port={mcp_port}, ws_port={ws_port}")
     log.info(f"config: plugins.asr.enabled={cfg.get('plugins',{}).get('asr',{}).get('enabled')}, "
