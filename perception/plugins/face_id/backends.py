@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import threading
 from typing import Protocol
 
 import numpy as np
@@ -65,6 +67,43 @@ class OnnxRuntimeBackend:
         self.session = None
 
 
+class OpenCVDNNBackend:
+    """CPU-only ONNX inference using OpenCV already present in the image."""
+
+    def __init__(self, path: str | Path):
+        import cv2
+
+        model_path = str(path)
+        if not Path(model_path).is_file():
+            raise FileNotFoundError(f"ONNX model does not exist: {model_path}")
+        threads = int(os.environ.get("FACE_OPENCV_THREADS", "1"))
+        if threads < 1:
+            raise ValueError("FACE_OPENCV_THREADS must be at least 1")
+        cv2.setNumThreads(threads)
+        self.net = cv2.dnn.readNetFromONNX(model_path)
+        self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        self.output_names = list(self.net.getUnconnectedOutLayersNames())
+        if not self.output_names:
+            raise ValueError(f"OpenCV DNN model has no outputs: {model_path}")
+        self._lock = threading.Lock()
+
+    def infer(self, array: np.ndarray) -> list[np.ndarray]:
+        array = np.ascontiguousarray(array, dtype=np.float32)
+        with self._lock:
+            if self.net is None:
+                raise RuntimeError("OpenCV DNN backend is closed")
+            self.net.setInput(array)
+            outputs = self.net.forward(self.output_names)
+        if isinstance(outputs, np.ndarray):
+            return [outputs]
+        return [np.asarray(output) for output in outputs]
+
+    def close(self) -> None:
+        with self._lock:
+            self.net = None
+
+
 def build_backend(
     backend: str,
     path: str | Path,
@@ -77,4 +116,6 @@ def build_backend(
         return TensorRTBackend(path, device_id=device_id)
     if name in {"onnx", "onnxruntime"}:
         return OnnxRuntimeBackend(path, providers=providers)
+    if name in {"opencv", "opencv-dnn", "cpu"}:
+        return OpenCVDNNBackend(path)
     raise ValueError(f"unsupported face inference backend: {backend}")

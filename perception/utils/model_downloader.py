@@ -658,6 +658,35 @@ def ensure_face_model(model_dir: str, family: str | None = None) -> dict[str, st
     )
 
 
+FACE_CPU_MODEL_FILES = {
+    "scrfd_500m_kps.onnx": {
+        "size": 2525807,
+        "sha256": "98cb7b00f99874543cde21b4f63a960b4d2f63bbfa7f68cc36381de817e93673",
+    },
+    "mobilefacenet_webface600k.onnx": {
+        "size": 13616099,
+        "sha256": "9cc6e4a75f0e2bf0b1aed94578f144d15175f357bdc05e815e5c4a02b319eb4f",
+    },
+}
+
+
+def ensure_face_cpu_model(model_dir: str) -> dict[str, str]:
+    """Ensure the cross-JetPack OpenCV DNN detector/recognizer pair."""
+
+    model_dir = require_models_subpath(model_dir)
+    cpu_dir = os.path.join(model_dir, "cpu")
+    base = os.environ.get("FACE_MODEL_BASE_URL", "").strip()
+    if not base and not _bundle_matches(cpu_dir, FACE_CPU_MODEL_FILES):
+        raise RuntimeError(
+            "FACE_MODEL_BASE_URL is required when face CPU models are not already present"
+        )
+    base_url = f"{base.rstrip('/')}/cpu" if base else ""
+    log.info("[model_downloader] face: using CPU ONNX bundle")
+    return ensure_verified_bundle(
+        "face/cpu", cpu_dir, base_url, FACE_CPU_MODEL_FILES
+    )
+
+
 def ensure_verified_archive(name: str, model_dir: str, url: str, entry: dict) -> None:
     """Ensure a size/SHA256-pinned archive has been unpacked into model_dir.
 

@@ -55,6 +55,14 @@ pre-mounted bundle remains usable offline. `FACE_ONLY=1` is the deployment
 selector for a face-only image; the repository default remains disabled so an
 unrelated perception deployment does not initialize the models.
 
+For high instance counts, `backend: opencv` with `recognizer: mobilefacenet`
+loads `cpu/scrfd_500m_kps.onnx` and `cpu/mobilefacenet_webface600k.onnx` from
+the same base URL. This path does not create a CUDA context and uses one CPU
+thread per process unless OpenCV is configured otherwise. The distributed
+SCRFD graph is the official ONNX with its otherwise-dynamic input frozen to
+`1x3x640x640` using `tools/fix_onnx_input_shape.py`; weights and outputs are
+unchanged, while OpenCV DNN can resolve every `Shape` node at import time.
+
 Utilities:
 
 ```bash

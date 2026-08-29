@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 
@@ -233,8 +234,10 @@ class FaceRecognitionPlugin:
         self._instance_configs: dict[str, dict] = {}
         log.info(
             "[face] plugin initialized: backend=%s recognizer=%s",
-            self._plugin_cfg.get("backend", "tensorrt"),
-            self._plugin_cfg.get("recognizer", "lvface"),
+            os.environ.get("FACE_BACKEND")
+            or self._plugin_cfg.get("backend", "tensorrt"),
+            os.environ.get("FACE_RECOGNIZER")
+            or self._plugin_cfg.get("recognizer", "lvface"),
         )
 
     def get_tools(self) -> list:

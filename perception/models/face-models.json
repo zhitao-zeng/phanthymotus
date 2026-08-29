@@ -49,6 +49,15 @@
       "file_sha256": "bef8a57724ed440f8fa03bf695367e55ce6df0a2d345200a1482a6a6ffa2adf0",
       "transform": "decompose 25 final-axis LayerNormalization nodes into primitive ONNX operations",
       "onnxruntime_max_abs_diff": 0.0
+    },
+    {
+      "name": "scrfd_500m_kps_fixed640",
+      "source_sha256": "5e4447f50245bbd7966bd6c0fa52938c61474a04ec7def48753668a9d8b4ea3a",
+      "file_bytes": 2525807,
+      "file_sha256": "98cb7b00f99874543cde21b4f63a960b4d2f63bbfa7f68cc36381de817e93673",
+      "transform": "freeze the detector input to 1x3x640x640 and run ONNX shape inference",
+      "bbox_max_abs_diff_px": 0.0000762939453125,
+      "landmark_max_abs_diff_px": 0.00006103515625
     }
   ],
   "validated_engines": [

@@ -45,6 +45,8 @@ def _resolve_model_path(
         model_dir = Path(str(cfg.get("model_dir", "/models/face")))
         if backend == "tensorrt":
             path = str(model_dir / str(family) / f"{default_name}.engine")
+        elif backend == "opencv":
+            path = str(model_dir / "cpu" / f"{default_name}.onnx")
         else:
             path = str(model_dir / f"{default_name}.onnx")
     if not Path(path).is_file():
@@ -138,6 +140,8 @@ def build_face_engine(cfg: dict) -> FaceIdentityEngine:
     backend_name = str(cfg.get("backend", "tensorrt")).strip().lower()
     if backend_name == "onnxruntime":
         backend_name = "onnx"
+    if backend_name in {"opencv-dnn", "cpu"}:
+        backend_name = "opencv"
     family = None
     if backend_name == "tensorrt":
         from utils.tensorrt_runtime import tensorrt_family
@@ -145,6 +149,11 @@ def build_face_engine(cfg: dict) -> FaceIdentityEngine:
 
         family = tensorrt_family()
         ensure_face_model(str(cfg.get("model_dir", "/models/face")), family=family)
+    elif backend_name == "opencv":
+        from utils.model_downloader import ensure_face_cpu_model
+
+        family = "cpu"
+        ensure_face_cpu_model(str(cfg.get("model_dir", "/models/face")))
     recognizer_type = str(cfg.get("recognizer", "lvface")).strip().lower()
     recognizer_file = {
         "lvface": "lvface_t_glint360k",
