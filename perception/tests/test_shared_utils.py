@@ -590,6 +590,31 @@ def test_ensure_face_cpu_model_installs_verified_seed(tmp_path, monkeypatch):
         assert (target / "cpu" / name).read_bytes() == payload
 
 
+def test_ensure_face_lvface_cpu_model_installs_verified_seed(tmp_path, monkeypatch):
+    from utils import model_downloader
+
+    payloads = {"lvface.onnx": b"recognizer"}
+    seed = tmp_path / "seed"
+    target = tmp_path / "models" / "face"
+    seed.mkdir(parents=True)
+    (seed / "lvface.onnx").write_bytes(payloads["lvface.onnx"])
+    monkeypatch.setattr(
+        model_downloader,
+        "FACE_LVFACE_CPU_MODEL_FILES",
+        _manifest(payloads),
+    )
+    monkeypatch.setenv("FACE_LVFACE_MODEL_SEED_DIR", str(seed))
+    monkeypatch.delenv("FACE_LVFACE_MODEL_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        model_downloader,
+        "require_models_subpath",
+        lambda path: str(target),
+    )
+    paths = model_downloader.ensure_face_lvface_cpu_model("/models/face")
+    assert set(paths) == set(payloads)
+    assert (target / "lvface_cpu" / "lvface.onnx").read_bytes() == b"recognizer"
+
+
 # ── SampledLogGate ───────────────────────────────────────────────────────────
 
 def test_sampled_log_gate_transitions_and_sampling():

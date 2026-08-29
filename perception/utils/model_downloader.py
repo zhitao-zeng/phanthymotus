@@ -702,6 +702,42 @@ def ensure_face_cpu_model(model_dir: str) -> dict[str, str]:
     )
 
 
+FACE_LVFACE_CPU_MODEL_FILES = {
+    "lvface_t_glint360k.onnx": {
+        "size": 76653813,
+        "sha256": "bf8da0e1e93c432d9a1d874a9ba0990f5859f970e8864b3990f2f33d11f9cdb3",
+    },
+}
+
+FACE_LVFACE_CPU_DEFAULT_BASE = (
+    "https://hf-mirror.com/bytedance-research/LVFace/resolve/"
+    "b12702ab1f5c721748e054a66dc90e1edd1f0724/LVFace-T_Glint360K"
+)
+
+
+def ensure_face_lvface_cpu_model(model_dir: str) -> dict[str, str]:
+    """Ensure the fixed LVFace-T ONNX used by the CPU runtime profile."""
+
+    model_dir = require_models_subpath(model_dir)
+    target_dir = os.path.join(model_dir, "lvface_cpu")
+    seed_dir = os.environ.get(
+        "FACE_LVFACE_MODEL_SEED_DIR",
+        "/opt/phanthy-motus/models/face/lvface_cpu",
+    )
+    model_base = os.environ.get("FACE_LVFACE_MODEL_BASE_URL", "").strip()
+    if _bundle_matches(seed_dir, FACE_LVFACE_CPU_MODEL_FILES):
+        base_url = Path(seed_dir).resolve().as_uri()
+        log.info("[model_downloader] face: installing LVFace-T from image seed")
+    elif model_base:
+        base_url = model_base.rstrip("/")
+    else:
+        base_url = FACE_LVFACE_CPU_DEFAULT_BASE
+        log.info("[model_downloader] face: downloading LVFace-T ONNX")
+    return ensure_verified_bundle(
+        "face/lvface_cpu", target_dir, base_url, FACE_LVFACE_CPU_MODEL_FILES
+    )
+
+
 def ensure_verified_archive(name: str, model_dir: str, url: str, entry: dict) -> None:
     """Ensure a size/SHA256-pinned archive has been unpacked into model_dir.
 

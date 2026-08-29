@@ -15,9 +15,10 @@ ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG JP_VERSION=511
 ARG ENABLE_VITS2_TRT=1
 ARG FACE_CPU_MODEL_BASE_URL=https://github.com/zhitao-zeng/phanthymotus/releases/download/face-id-models-v1
+ARG FACE_LVFACE_MODEL_URL=https://hf-mirror.com/bytedance-research/LVFace/resolve/b12702ab1f5c721748e054a66dc90e1edd1f0724/LVFace-T_Glint360K/LVFace-T_Glint360K.onnx
 
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
-ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT FACE_CPU_MODEL_BASE_URL
+ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT FACE_CPU_MODEL_BASE_URL FACE_LVFACE_MODEL_URL
 
 # ── Everything that differs per JetPack line, resolved once ──────────────────
 # These facts used to be restated at each point of use — the numpy pin appeared
@@ -47,12 +48,12 @@ ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT FACE_CPU_MODEL_BASE_URL
 ARG SHERPA_GPU_WHEEL_511=jp511/sherpa_onnx-1.13.6+cuda-cp38-cp38-linux_aarch64.whl
 ARG SHERPA_GPU_WHEEL_61=jp61/sherpa_onnx-1.13.6+cuda-cp310-cp310-linux_aarch64.whl
 RUN case "${JP_VERSION}" in \
-        511) NUMPY=1.24.4; WHEEL="${SHERPA_GPU_WHEEL_511}" ;; \
-        61)  NUMPY=1.26.4; WHEEL="${SHERPA_GPU_WHEEL_61}"  ;; \
-        *)   NUMPY=1.24.4; WHEEL= ;; \
+        511) NUMPY=1.24.4; ORT=1.16.0; WHEEL="${SHERPA_GPU_WHEEL_511}" ;; \
+        61)  NUMPY=1.26.4; ORT=1.18.1; WHEEL="${SHERPA_GPU_WHEEL_61}"  ;; \
+        *)   NUMPY=1.24.4; ORT=1.18.1; WHEEL= ;; \
     esac; \
-    printf 'NUMPY_VERSION=%s\nSHERPA_GPU_WHEEL=%s\nPY_ABI=%s\n' \
-        "${NUMPY}" "${WHEEL}" \
+    printf 'NUMPY_VERSION=%s\nORT_CPU_VERSION=%s\nSHERPA_GPU_WHEEL=%s\nPY_ABI=%s\n' \
+        "${NUMPY}" "${ORT}" "${WHEEL}" \
         "$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')" \
         > /etc/jetpack.env && \
     echo "[build] jp${JP_VERSION}:" && cat /etc/jetpack.env
@@ -61,6 +62,14 @@ RUN case "${JP_VERSION}" in \
 RUN if [ -n "${APT_MIRROR}" ]; then \
         sed -i "s/archive.ubuntu.com/${APT_MIRROR}/g; s/ports.ubuntu.com/${APT_MIRROR}/g" /etc/apt/sources.list; \
     fi
+
+# LVFace-T uses the standard ONNX Runtime Python API on CPU. Keep its wheel
+# aligned with the ORT generation embedded by the corresponding sherpa build,
+# and pin numpy to the base image's ABI-compatible version.
+RUN . /etc/jetpack.env; \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+      "numpy==${NUMPY_VERSION}" "onnxruntime==${ORT_CPU_VERSION}" && \
+    python3 -c "import onnxruntime as ort; assert 'CPUExecutionProvider' in ort.get_available_providers(); print('onnxruntime', ort.__version__)"
 
 # ── Switch ROS2 to TUNA mirror + skip expired key (if sources exist) ──
 RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
@@ -238,8 +247,9 @@ print('sherpa-onnx', sherpa_onnx.__version__, 'with CUDA provider')"; \
 # ── OCR runtime deps (PP-OCRv6 TensorRT engines; TensorRT/CUDA come from base) ──
 # libvips42 (apt, above) is the runtime library pyvips dlopens for JPEG decode
 # + downscale; rapidocr is used --no-deps for its pure-Python DB/CTC post-
-# processing only (its bundled ONNX models are deleted, onnxruntime is not
-# installed). Every package is version-pinned; six and Pillow are NOT listed
+# processing only (its bundled ONNX models are deleted and never loaded by
+# rapidocr). The shared ONNX Runtime install above is reserved for the optional
+# LVFace CPU profile. Every package is version-pinned; six and Pillow are NOT listed
 # because both bases already ship them (jp511: 1.14.0/10.4.0 via the VOP
 # layer, jp61: 1.16.0/9.0.1) and re-listing them unpinned would make the
 # resolution nondeterministic. numpy is pinned to the version each JetPack's
@@ -263,6 +273,11 @@ RUN mkdir -p /opt/phanthy-motus/models/face/cpu && \
       "${FACE_CPU_MODEL_BASE_URL}" /opt/phanthy-motus/models/face/cpu/mobilefacenet_webface600k.onnx && \
     echo "98cb7b00f99874543cde21b4f63a960b4d2f63bbfa7f68cc36381de817e93673  /opt/phanthy-motus/models/face/cpu/scrfd_500m_kps.onnx" | sha256sum -c - && \
     echo "9cc6e4a75f0e2bf0b1aed94578f144d15175f357bdc05e815e5c4a02b319eb4f  /opt/phanthy-motus/models/face/cpu/mobilefacenet_webface600k.onnx" | sha256sum -c -
+
+RUN mkdir -p /opt/phanthy-motus/models/face/lvface_cpu && \
+    python3 -c "import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" \
+      "${FACE_LVFACE_MODEL_URL}" /opt/phanthy-motus/models/face/lvface_cpu/lvface_t_glint360k.onnx && \
+    echo "bf8da0e1e93c432d9a1d874a9ba0990f5859f970e8864b3990f2f33d11f9cdb3  /opt/phanthy-motus/models/face/lvface_cpu/lvface_t_glint360k.onnx" | sha256sum -c -
 
 # ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
 # ldconfig shimmed for the same reason as the ffmpeg step above — this is the

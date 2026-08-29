@@ -8,8 +8,10 @@ The optional `face` processor performs closed-set, on-device face
 identification:
 
 ```text
-JPEG -> SCRFD-500M_KPS -> five-point 112x112 alignment
+JPEG -> SCRFD-500M_KPS -> detect every face
+     -> five-point 112x112 alignment per face
      -> LVFace-T or MobileFaceNet -> gallery template matching
+     -> select the face with the strongest gallery evidence
      -> {detect_confidence, bbox_relative, identity}
 ```
 
@@ -63,7 +65,9 @@ SCRFD graph is the official ONNX with its otherwise-dynamic input frozen to
 `1x3x640x640` using `tools/fix_onnx_input_shape.py`; weights and outputs are
 unchanged, while OpenCV DNN can resolve every `Shape` node at import time.
 When a nonempty face gallery is mounted at `/workspace/face_db`, the bundle
-automatically selects this face-only CPU path; this matches the evaluator,
+automatically selects the `mounted_gallery_profile` CPU path. `mobile_cpu`
+uses OpenCV DNN for both models; `lvface_cpu` keeps SCRFD on OpenCV DNN and
+uses one-thread ONNX Runtime CPU for LVFace-T. This matches the evaluator,
 which controls only the gallery mount and does not forward arbitrary submit
 environment variables into its remote perception containers. CPU models
 default to the immutable `face-id-models-v1` GitHub release and remain pinned
@@ -74,6 +78,9 @@ The Docker image stores the verified CPU pair under
 through the same staged verifier, so ten evaluator containers do not perform
 ten concurrent public downloads. A bind-mounted `/models` may hide any build-
 time `/models` content, which is why the seed deliberately lives under `/opt`.
+The pinned LVFace-T ONNX is stored separately under
+`/opt/phanthy-motus/models/face/lvface_cpu` and installed only when that
+runtime profile is selected.
 
 Utilities:
 
@@ -84,6 +91,9 @@ python3 perception/tools/build_face_engines.py \
   --output-dir /models/face/jp61
 python3 perception/tools/benchmark_face_id.py \
   --config perception/config.yaml image1.jpg image2.jpg
+python3 perception/tools/evaluate_face_gallery_loo.py \
+  --config perception/config.yaml --gallery /workspace/face_db \
+  --output /tmp/face-loo.json
 ```
 
 TensorRT 8.5 cannot import the opset-17 `LayerNormalization` nodes in the
