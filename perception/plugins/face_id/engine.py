@@ -54,6 +54,10 @@ def _resolve_model_path(
     return path
 
 
+def _has_explicit_model_pair(cfg: dict) -> bool:
+    return bool(cfg.get("detector_model") and cfg.get("recognizer_model"))
+
+
 class FaceIdentityEngine:
     """Thread-safe batch-one face identification pipeline."""
 
@@ -142,18 +146,22 @@ def build_face_engine(cfg: dict) -> FaceIdentityEngine:
         backend_name = "onnx"
     if backend_name in {"opencv-dnn", "cpu"}:
         backend_name = "opencv"
+    explicit_model_pair = _has_explicit_model_pair(cfg)
     family = None
     if backend_name == "tensorrt":
         from utils.tensorrt_runtime import tensorrt_family
-        from utils.model_downloader import ensure_face_model
 
         family = tensorrt_family()
-        ensure_face_model(str(cfg.get("model_dir", "/models/face")), family=family)
-    elif backend_name == "opencv":
-        from utils.model_downloader import ensure_face_cpu_model
+        if not explicit_model_pair:
+            from utils.model_downloader import ensure_face_model
 
+            ensure_face_model(str(cfg.get("model_dir", "/models/face")), family=family)
+    elif backend_name == "opencv":
+        if not explicit_model_pair:
+            from utils.model_downloader import ensure_face_cpu_model
+
+            ensure_face_cpu_model(str(cfg.get("model_dir", "/models/face")))
         family = "cpu"
-        ensure_face_cpu_model(str(cfg.get("model_dir", "/models/face")))
     recognizer_type = str(cfg.get("recognizer", "lvface")).strip().lower()
     recognizer_file = {
         "lvface": "lvface_t_glint360k",

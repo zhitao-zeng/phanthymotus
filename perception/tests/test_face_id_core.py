@@ -7,7 +7,7 @@ import numpy as np
 
 from plugins.face_id.alignment import ARCFACE_112_TEMPLATE, align_face
 from plugins.face_id.detector import SCRFDDetector, distance_to_bbox, nms
-from plugins.face_id.engine import FaceIdentityEngine
+from plugins.face_id.engine import FaceIdentityEngine, _has_explicit_model_pair
 from plugins.face_id.gallery import (
     IdentityGallery,
     IdentityTemplates,
@@ -33,6 +33,17 @@ class _StaticBackend:
 
     def close(self):
         self.closed = True
+
+
+def test_explicit_model_pair_requires_both_paths():
+    assert _has_explicit_model_pair(
+        {
+            "detector_model": "/models/det.onnx",
+            "recognizer_model": "/models/rec.onnx",
+        }
+    )
+    assert not _has_explicit_model_pair({"detector_model": "/models/det.onnx"})
+    assert not _has_explicit_model_pair({"recognizer_model": "/models/rec.onnx"})
 
 
 def _scrfd_outputs(input_size=64):
