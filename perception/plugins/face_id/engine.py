@@ -21,6 +21,24 @@ from .schema import empty_face_payload
 
 log = logging.getLogger(__name__)
 
+_RUNTIME_PROFILES = {
+    "mobile_cpu": {
+        "backend": "opencv",
+        "detector_backend": "opencv",
+        "recognizer_backend": "opencv",
+        "recognizer": "mobilefacenet",
+    },
+    "lvface_cpu": {
+        "backend": "opencv",
+        "detector_backend": "opencv",
+        "recognizer_backend": "onnx",
+        "recognizer": "lvface",
+        "onnx_providers": ["CPUExecutionProvider"],
+        "onnx_intra_op_threads": 1,
+        "onnx_inter_op_threads": 1,
+    },
+}
+
 
 def _pair(value, *, name: str) -> tuple[int, int]:
     if not isinstance(value, (list, tuple)) or len(value) != 2:
@@ -58,6 +76,33 @@ def _has_explicit_model_pair(cfg: dict) -> bool:
     return bool(cfg.get("detector_model") and cfg.get("recognizer_model"))
 
 
+def _normalize_backend_name(value: str) -> str:
+    name = str(value).strip().lower()
+    if name == "onnxruntime":
+        return "onnx"
+    if name in {"opencv-dnn", "cpu"}:
+        return "opencv"
+    return name
+
+
+def _apply_runtime_profile(cfg: dict) -> dict:
+    profile_name = str(cfg.get("runtime_profile") or "").strip().lower()
+    if not profile_name:
+        return dict(cfg)
+    try:
+        profile = _RUNTIME_PROFILES[profile_name]
+    except KeyError as error:
+        raise ValueError(f"unsupported face runtime profile: {profile_name}") from error
+    resolved = {**cfg, **profile}
+    if profile_name == "lvface_cpu" and not cfg.get("recognizer_model"):
+        resolved["recognizer_model"] = str(
+            Path(str(cfg.get("model_dir", "/models/face")))
+            / "lvface_cpu"
+            / "lvface_t_glint360k.onnx"
+        )
+    return resolved
+
+
 class FaceIdentityEngine:
     """Thread-safe batch-one face identification pipeline."""
 
@@ -68,6 +113,7 @@ class FaceIdentityEngine:
         gallery: IdentityGallery,
         matcher: IdentityMatcher,
         *,
+        face_selection: str = "primary",
         query_flip_tta: bool = False,
         bbox_x_scale: float = 1.0,
         bbox_y_scale: float = 1.0,
@@ -77,6 +123,9 @@ class FaceIdentityEngine:
         self.recognizer = recognizer
         self.gallery = gallery
         self.matcher = matcher
+        self.face_selection = str(face_selection).strip().lower()
+        if self.face_selection not in {"primary", "gallery_match"}:
+            raise ValueError(f"unsupported face selection: {face_selection}")
         self.query_flip_tta = bool(query_flip_tta)
         self.bbox_x_scale = float(bbox_x_scale)
         self.bbox_y_scale = float(bbox_y_scale)
@@ -96,15 +145,13 @@ class FaceIdentityEngine:
             if self._closed:
                 raise RuntimeError("face identity engine is closed")
             detections = self.detector.detect(image)
-            detection = select_primary_face(detections, image.shape)
-            if detection is None:
+            if not detections:
                 return empty_face_payload()
-            aligned = align_face(image, detection.landmarks)
-            embedding = self.recognizer.embed(
-                aligned,
-                flip_tta=self.query_flip_tta,
-            )
-            match = self.matcher.match(embedding)
+            if self.face_selection == "primary":
+                detection = select_primary_face(detections, image.shape)
+                match = self._match_detection(image, detection)
+            else:
+                detection, match = self._select_by_gallery(image, detections)
             confidence = None if match is None else self.matcher.confidence(match.score)
             return face_payload(
                 detection,
@@ -115,6 +162,31 @@ class FaceIdentityEngine:
                 y_shift=self.bbox_y_shift,
                 match_confidence=confidence,
             )
+
+    def _embedding(self, image: np.ndarray, detection) -> np.ndarray:
+        aligned = align_face(image, detection.landmarks)
+        return self.recognizer.embed(aligned, flip_tta=self.query_flip_tta)
+
+    def _match_detection(self, image: np.ndarray, detection):
+        return self.matcher.match(self._embedding(image, detection))
+
+    def _select_by_gallery(self, image: np.ndarray, detections):
+        candidates = []
+        for detection in detections:
+            ranked = self.matcher.rank(self._embedding(image, detection), top_k=2)
+            top = ranked[0]
+            margin = top.score - ranked[1].score if len(ranked) > 1 else 0.0
+            candidates.append((top.score, margin, detection.score, detection, top))
+        _score, _margin, _detection_score, detection, match = max(
+            candidates,
+            key=lambda item: item[:3],
+        )
+        if (
+            self.matcher.unknown_threshold is not None
+            and match.score < self.matcher.unknown_threshold
+        ):
+            match = None
+        return detection, match
 
     def close(self) -> None:
         with self._lock:
@@ -129,8 +201,18 @@ def build_face_engine(cfg: dict) -> FaceIdentityEngine:
     """Build a real local face engine from explicit model files and gallery."""
 
     cfg = dict(cfg)
+    runtime_profile = os.environ.get("FACE_RUNTIME_PROFILE")
+    if runtime_profile:
+        cfg["runtime_profile"] = runtime_profile
+    cfg = _apply_runtime_profile(cfg)
+    common_backend = os.environ.get("FACE_BACKEND")
+    if common_backend:
+        cfg["backend"] = common_backend
+        cfg["detector_backend"] = common_backend
+        cfg["recognizer_backend"] = common_backend
     env_overrides = {
-        "FACE_BACKEND": "backend",
+        "FACE_DETECTOR_BACKEND": "detector_backend",
+        "FACE_RECOGNIZER_BACKEND": "recognizer_backend",
         "FACE_MODEL_DIR": "model_dir",
         "FACE_DETECTOR_MODEL": "detector_model",
         "FACE_RECOGNIZER_MODEL": "recognizer_model",
@@ -141,27 +223,13 @@ def build_face_engine(cfg: dict) -> FaceIdentityEngine:
         value = os.environ.get(env_name)
         if value:
             cfg[config_name] = value
-    backend_name = str(cfg.get("backend", "tensorrt")).strip().lower()
-    if backend_name == "onnxruntime":
-        backend_name = "onnx"
-    if backend_name in {"opencv-dnn", "cpu"}:
-        backend_name = "opencv"
-    explicit_model_pair = _has_explicit_model_pair(cfg)
-    family = None
-    if backend_name == "tensorrt":
-        from utils.tensorrt_runtime import tensorrt_family
-
-        family = tensorrt_family()
-        if not explicit_model_pair:
-            from utils.model_downloader import ensure_face_model
-
-            ensure_face_model(str(cfg.get("model_dir", "/models/face")), family=family)
-    elif backend_name == "opencv":
-        if not explicit_model_pair:
-            from utils.model_downloader import ensure_face_cpu_model
-
-            ensure_face_cpu_model(str(cfg.get("model_dir", "/models/face")))
-        family = "cpu"
+    backend_name = _normalize_backend_name(cfg.get("backend", "tensorrt"))
+    detector_backend_name = _normalize_backend_name(
+        cfg.get("detector_backend", backend_name)
+    )
+    recognizer_backend_name = _normalize_backend_name(
+        cfg.get("recognizer_backend", backend_name)
+    )
     recognizer_type = str(cfg.get("recognizer", "lvface")).strip().lower()
     recognizer_file = {
         "lvface": "lvface_t_glint360k",
@@ -171,38 +239,79 @@ def build_face_engine(cfg: dict) -> FaceIdentityEngine:
     }.get(recognizer_type)
     if recognizer_file is None:
         raise ValueError(f"unsupported face recognizer: {recognizer_type}")
+    explicit_model_pair = _has_explicit_model_pair(cfg)
+    trt_family = None
+    if "tensorrt" in {detector_backend_name, recognizer_backend_name}:
+        from utils.tensorrt_runtime import tensorrt_family
+
+        trt_family = tensorrt_family()
+        if not explicit_model_pair:
+            from utils.model_downloader import ensure_face_model
+
+            ensure_face_model(
+                str(cfg.get("model_dir", "/models/face")), family=trt_family
+            )
+    if (
+        "opencv" in {detector_backend_name, recognizer_backend_name}
+        and not explicit_model_pair
+    ):
+        from utils.model_downloader import ensure_face_cpu_model
+
+        ensure_face_cpu_model(str(cfg.get("model_dir", "/models/face")))
+    if (
+        recognizer_type in {"lvface", "lvface-t"}
+        and recognizer_backend_name == "onnx"
+        and not Path(str(cfg.get("recognizer_model", ""))).is_file()
+    ):
+        from utils.model_downloader import ensure_face_lvface_cpu_model
+
+        ensure_face_lvface_cpu_model(str(cfg.get("model_dir", "/models/face")))
     detector_path = _resolve_model_path(
         cfg,
         key="detector_model",
         default_name="scrfd_500m_kps",
-        backend=backend_name,
-        family=family,
+        backend=detector_backend_name,
+        family=trt_family if detector_backend_name == "tensorrt" else None,
     )
     recognizer_path = _resolve_model_path(
         cfg,
         key="recognizer_model",
         default_name=recognizer_file,
-        backend=backend_name,
-        family=family,
+        backend=recognizer_backend_name,
+        family=trt_family if recognizer_backend_name == "tensorrt" else None,
     )
     gallery_dir = str(cfg.get("face_db_dir") or "/workspace/face_db")
     device_id = int(cfg.get("device_id", 0))
     providers = cfg.get("onnx_providers")
+    onnx_intra_op_threads = cfg.get("onnx_intra_op_threads")
+    onnx_inter_op_threads = cfg.get("onnx_inter_op_threads")
     detector_backend = build_backend(
-        backend_name,
+        detector_backend_name,
         detector_path,
         device_id=device_id,
         providers=providers,
+        intra_op_threads=(
+            None if onnx_intra_op_threads is None else int(onnx_intra_op_threads)
+        ),
+        inter_op_threads=(
+            None if onnx_inter_op_threads is None else int(onnx_inter_op_threads)
+        ),
     )
     recognizer_backend = None
     detector = None
     recognizer = None
     try:
         recognizer_backend = build_backend(
-            backend_name,
+            recognizer_backend_name,
             recognizer_path,
             device_id=device_id,
             providers=providers,
+            intra_op_threads=(
+                None if onnx_intra_op_threads is None else int(onnx_intra_op_threads)
+            ),
+            inter_op_threads=(
+                None if onnx_inter_op_threads is None else int(onnx_inter_op_threads)
+            ),
         )
         detector = SCRFDDetector(
             detector_backend,
@@ -244,15 +353,18 @@ def build_face_engine(cfg: dict) -> FaceIdentityEngine:
             recognizer,
             gallery,
             matcher,
+            face_selection=str(cfg.get("face_selection", "primary")),
             query_flip_tta=bool(cfg.get("query_flip_tta", False)),
             bbox_x_scale=float(bbox_cfg.get("x_scale", 1.0)),
             bbox_y_scale=float(bbox_cfg.get("y_scale", 1.0)),
             bbox_y_shift=float(bbox_cfg.get("y_shift", 0.0)),
         )
         log.info(
-            "[face] engine ready: backend=%s family=%s recognizer=%s gallery=%d",
-            backend_name,
-            family or "host",
+            "[face] engine ready: detector_backend=%s recognizer_backend=%s "
+            "family=%s recognizer=%s gallery=%d",
+            detector_backend_name,
+            recognizer_backend_name,
+            trt_family or "host",
             recognizer_type,
             len(gallery.templates),
         )

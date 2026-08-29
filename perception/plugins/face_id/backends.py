@@ -42,6 +42,8 @@ class OnnxRuntimeBackend:
         path: str | Path,
         *,
         providers: list[str] | None = None,
+        intra_op_threads: int | None = None,
+        inter_op_threads: int | None = None,
     ):
         import onnxruntime as ort
 
@@ -49,7 +51,20 @@ class OnnxRuntimeBackend:
         if not Path(model_path).is_file():
             raise FileNotFoundError(f"ONNX model does not exist: {model_path}")
         selected = providers or ["CPUExecutionProvider"]
-        self.session = ort.InferenceSession(model_path, providers=selected)
+        options = ort.SessionOptions()
+        if intra_op_threads is not None:
+            if intra_op_threads < 1:
+                raise ValueError("ONNX intra-op threads must be at least 1")
+            options.intra_op_num_threads = int(intra_op_threads)
+        if inter_op_threads is not None:
+            if inter_op_threads < 1:
+                raise ValueError("ONNX inter-op threads must be at least 1")
+            options.inter_op_num_threads = int(inter_op_threads)
+        self.session = ort.InferenceSession(
+            model_path,
+            sess_options=options,
+            providers=selected,
+        )
         inputs = self.session.get_inputs()
         if len(inputs) != 1:
             raise ValueError(
@@ -110,12 +125,19 @@ def build_backend(
     *,
     device_id: int = 0,
     providers: list[str] | None = None,
+    intra_op_threads: int | None = None,
+    inter_op_threads: int | None = None,
 ) -> InferenceBackend:
     name = str(backend).strip().lower()
     if name == "tensorrt":
         return TensorRTBackend(path, device_id=device_id)
     if name in {"onnx", "onnxruntime"}:
-        return OnnxRuntimeBackend(path, providers=providers)
+        return OnnxRuntimeBackend(
+            path,
+            providers=providers,
+            intra_op_threads=intra_op_threads,
+            inter_op_threads=inter_op_threads,
+        )
     if name in {"opencv", "opencv-dnn", "cpu"}:
         return OpenCVDNNBackend(path)
     raise ValueError(f"unsupported face inference backend: {backend}")

@@ -93,10 +93,10 @@ class PerceptionBundle:
         if face_only or gallery_mounted:
             face_cfg["enabled"] = True
             face_cfg["face_db_dir"] = face_db_dir
-            if gallery_mounted and not os.environ.get("FACE_BACKEND"):
-                face_cfg["backend"] = "opencv"
-            if gallery_mounted and not os.environ.get("FACE_RECOGNIZER"):
-                face_cfg["recognizer"] = "mobilefacenet"
+            if gallery_mounted and not os.environ.get("FACE_RUNTIME_PROFILE"):
+                face_cfg["runtime_profile"] = face_cfg.get(
+                    "mounted_gallery_profile", "mobile_cpu"
+                )
             plugins_cfg = {"face": face_cfg}
             reason = "FACE_ONLY" if face_only else "mounted face gallery"
             log.info("%s selected: loading only FaceRecognitionPlugin", reason)

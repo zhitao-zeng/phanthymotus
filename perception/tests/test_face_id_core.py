@@ -7,7 +7,11 @@ import numpy as np
 
 from plugins.face_id.alignment import ARCFACE_112_TEMPLATE, align_face
 from plugins.face_id.detector import SCRFDDetector, distance_to_bbox, nms
-from plugins.face_id.engine import FaceIdentityEngine, _has_explicit_model_pair
+from plugins.face_id.engine import (
+    FaceIdentityEngine,
+    _apply_runtime_profile,
+    _has_explicit_model_pair,
+)
 from plugins.face_id.gallery import (
     IdentityGallery,
     IdentityTemplates,
@@ -15,6 +19,7 @@ from plugins.face_id.gallery import (
     weighted_centroid,
 )
 from plugins.face_id.matcher import IdentityMatcher
+from plugins.face_id.loo import evaluate_gallery_leave_one_out
 from plugins.face_id.postprocess import calibrate_bbox, normalized_xywh
 from plugins.face_id.recognizer import FaceRecognizer
 from plugins.face_id.schema import FaceDetection
@@ -44,6 +49,18 @@ def test_explicit_model_pair_requires_both_paths():
     )
     assert not _has_explicit_model_pair({"detector_model": "/models/det.onnx"})
     assert not _has_explicit_model_pair({"recognizer_model": "/models/rec.onnx"})
+
+
+def test_runtime_profiles_share_detector_and_select_recognizer_backend():
+    mobile = _apply_runtime_profile({"runtime_profile": "mobile_cpu"})
+    assert mobile["detector_backend"] == "opencv"
+    assert mobile["recognizer_backend"] == "opencv"
+    assert mobile["recognizer"] == "mobilefacenet"
+    lvface = _apply_runtime_profile({"runtime_profile": "lvface_cpu"})
+    assert lvface["detector_backend"] == "opencv"
+    assert lvface["recognizer_backend"] == "onnx"
+    assert lvface["recognizer"] == "lvface"
+    assert lvface["onnx_intra_op_threads"] == 1
 
 
 def _scrfd_outputs(input_size=64):
@@ -163,6 +180,38 @@ def test_weighted_templates_and_matcher_use_subcenter_signal():
     assert match.subcenter_score > match.centroid_score
 
 
+def test_matcher_rank_and_leave_one_out_exclude_query_template():
+    def template(person_id, rows):
+        features = np.asarray(rows, dtype=np.float32)
+        features /= np.linalg.norm(features, axis=1, keepdims=True)
+        weights = np.ones(len(features), dtype=np.float32)
+        return IdentityTemplates(
+            person_id,
+            weighted_centroid(features, weights),
+            features.copy(),
+            features,
+            len(features),
+            exemplar_weights=weights,
+            query_exemplars=features.copy(),
+        )
+
+    gallery = IdentityGallery(
+        [
+            template("alice", [[1.0, 0.0], [0.98, 0.02]]),
+            template("bob", [[0.0, 1.0], [0.02, 0.98]]),
+            template("singleton", [[-1.0, 0.0]]),
+        ]
+    )
+    ranked = IdentityMatcher(gallery).rank([0.1, 0.9], top_k=2)
+    assert [item.person_id for item in ranked] == ["bob", "alice"]
+    result = evaluate_gallery_leave_one_out(gallery, centroid_weight=0.6)
+    assert result["queries"] == 4
+    assert result["eligible_identities"] == 2
+    assert result["skipped_singletons"] == 1
+    assert result["top1_accuracy"] == 1.0
+    assert result["top5_accuracy"] == 1.0
+
+
 def test_bbox_calibration_and_normalized_xywh():
     calibrated = calibrate_bbox(
         np.array([20, 20, 60, 80]),
@@ -205,6 +254,32 @@ class _Recognizer:
         self.closed = True
 
 
+class _SequenceRecognizer(_Recognizer):
+    def __init__(self, embeddings):
+        self.embeddings = [np.asarray(item, dtype=np.float32) for item in embeddings]
+        self.closed = False
+
+    def embed(self, aligned, *, flip_tta=False):
+        assert aligned.shape == (112, 112, 3)
+        return self.embeddings.pop(0)
+
+
+class _MultiDetector(_Detector):
+    def detect(self, image):
+        return [
+            FaceDetection(
+                np.array([0, 0, 56, 112], dtype=np.float32),
+                0.99,
+                ARCFACE_112_TEMPLATE.copy(),
+            ),
+            FaceDetection(
+                np.array([56, 0, 112, 112], dtype=np.float32),
+                0.90,
+                ARCFACE_112_TEMPLATE.copy(),
+            ),
+        ]
+
+
 def test_end_to_end_engine_returns_current_single_face_schema():
     template = IdentityTemplates(
         "n000001",
@@ -232,3 +307,73 @@ def test_end_to_end_engine_returns_current_single_face_schema():
     }
     engine.close()
     assert detector.closed and recognizer.closed
+
+
+def test_gallery_selection_recognizes_all_faces_before_choosing():
+    gallery = IdentityGallery(
+        [
+            IdentityTemplates(
+                "alice",
+                np.array([1.0, 0.0], dtype=np.float32),
+                np.array([[1.0, 0.0]], dtype=np.float32),
+                np.array([[1.0, 0.0]], dtype=np.float32),
+                1,
+            ),
+            IdentityTemplates(
+                "bob",
+                np.array([0.0, 1.0], dtype=np.float32),
+                np.array([[0.0, 1.0]], dtype=np.float32),
+                np.array([[0.0, 1.0]], dtype=np.float32),
+                1,
+            ),
+        ]
+    )
+    engine = FaceIdentityEngine(
+        _MultiDetector(),
+        _SequenceRecognizer([[0.6, 0.8], [1.0, 0.0]]),
+        gallery,
+        IdentityMatcher(gallery),
+        face_selection="gallery_match",
+    )
+    payload = engine.infer_image(np.zeros((112, 112, 3), dtype=np.uint8))
+    assert payload["bbox_relative"] == [0.5, 0.0, 0.5, 1.0]
+    assert payload["identity"]["person_id"] == "alice"
+
+
+def test_leave_one_out_can_select_best_query_face():
+    features = np.array([[1.0, 0.0], [0.98, 0.02]], dtype=np.float32)
+    weights = np.ones(2, dtype=np.float32)
+    gallery = IdentityGallery(
+        [
+            IdentityTemplates(
+                "alice",
+                weighted_centroid(features, weights),
+                features.copy(),
+                features,
+                2,
+                exemplar_weights=weights,
+                query_exemplars=features.copy(),
+            ),
+            IdentityTemplates(
+                "bob",
+                np.array([0.0, 1.0], dtype=np.float32),
+                np.array([[0.0, 1.0]], dtype=np.float32),
+                np.array([[0.0, 1.0]], dtype=np.float32),
+                1,
+            ),
+        ]
+    )
+    result = evaluate_gallery_leave_one_out(
+        gallery,
+        candidate_queries={
+            ("alice", 0): np.array([[0.5, 0.5], [1.0, 0.0]], dtype=np.float32)
+        },
+    )
+    first = next(
+        item
+        for item in result["details"]
+        if item["person_id"] == "alice" and item["exemplar_index"] == 0
+    )
+    assert first["candidate_count"] == 2
+    assert first["selected_candidate_index"] == 1
+    assert first["true_rank"] == 1

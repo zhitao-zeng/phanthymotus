@@ -39,6 +39,9 @@ class IdentityTemplates:
     subcenters: np.ndarray
     exemplars: np.ndarray
     source_count: int
+    exemplar_weights: np.ndarray | None = None
+    query_exemplars: np.ndarray | None = None
+    source_paths: tuple[str, ...] | None = None
 
 
 class IdentityGallery:
@@ -206,8 +209,8 @@ def _build_identity_templates(
     if not image_paths:
         raise GalleryBuildError(f"{person_dir.name}: no registration images")
 
-    accepted: list[tuple[np.ndarray, float]] = []
-    rejected: list[tuple[float, np.ndarray, float]] = []
+    accepted: list[tuple[np.ndarray, np.ndarray, float, str]] = []
+    rejected: list[tuple[float, np.ndarray, float, str]] = []
     detected_images = 0
     for image_path in image_paths:
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -225,17 +228,26 @@ def _build_identity_templates(
             continue
         passed, weight = face_quality(image, detection, aligned, config)
         if passed:
-            feature = recognizer.embed(aligned, flip_tta=config.flip_tta)
-            accepted.append((feature, weight))
+            primary = recognizer.embed(aligned, flip_tta=False)
+            feature = primary
+            if config.flip_tta:
+                flipped = recognizer.embed(cv2.flip(aligned, 1), flip_tta=False)
+                feature = l2_normalize(primary + flipped)
+            accepted.append((feature, primary, weight, str(image_path)))
         else:
-            rejected.append((weight, aligned, detection.score))
+            rejected.append((weight, aligned, detection.score, str(image_path)))
 
     if not accepted and rejected:
         # Do not silently delete an identity merely because its only source is
         # softer than a quality threshold. Keep its best detected registration
         # image and make the fallback visible in logs.
-        weight, aligned, _ = max(rejected, key=lambda item: item[0])
-        accepted.append((recognizer.embed(aligned, flip_tta=config.flip_tta), weight))
+        weight, aligned, _, image_path = max(rejected, key=lambda item: item[0])
+        primary = recognizer.embed(aligned, flip_tta=False)
+        feature = primary
+        if config.flip_tta:
+            flipped = recognizer.embed(cv2.flip(aligned, 1), flip_tta=False)
+            feature = l2_normalize(primary + flipped)
+        accepted.append((feature, primary, weight, image_path))
         log.warning(
             "[face] %s: all registrations failed quality filters; using best detection",
             person_dir.name,
@@ -244,8 +256,16 @@ def _build_identity_templates(
         detail = "no face detected" if detected_images == 0 else "alignment failed"
         raise GalleryBuildError(f"{person_dir.name}: {detail}")
 
-    features = np.vstack([feature for feature, _weight in accepted]).astype(np.float32)
-    weights = np.asarray([weight for _feature, weight in accepted], dtype=np.float32)
+    features = np.vstack(
+        [feature for feature, _primary, _weight, _path in accepted]
+    ).astype(np.float32)
+    query_features = np.vstack(
+        [primary for _feature, primary, _weight, _path in accepted]
+    ).astype(np.float32)
+    weights = np.asarray(
+        [weight for _feature, _primary, weight, _path in accepted], dtype=np.float32
+    )
+    source_paths = tuple(path for _feature, _primary, _weight, path in accepted)
     centroid = weighted_centroid(features, weights)
     subcenters = spherical_subcenters(
         features,
@@ -259,4 +279,7 @@ def _build_identity_templates(
         subcenters=subcenters,
         exemplars=features,
         source_count=len(image_paths),
+        exemplar_weights=weights,
+        query_exemplars=query_features,
+        source_paths=source_paths,
     )

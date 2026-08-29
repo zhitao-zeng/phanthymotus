@@ -28,7 +28,9 @@ class IdentityMatcher:
             [template.centroid for template in gallery.templates]
         ).astype(np.float32)
 
-    def match(self, embedding: np.ndarray) -> IdentityMatch | None:
+    def _combined_scores(
+        self, embedding: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         query = l2_normalize(embedding)
         centroid_scores = self.centroids @ query
         subcenter_scores = np.asarray(
@@ -42,16 +44,37 @@ class IdentityMatcher:
             self.centroid_weight * centroid_scores
             + (1.0 - self.centroid_weight) * subcenter_scores
         )
-        best = int(np.argmax(combined))
-        score = float(combined[best])
+        return combined, centroid_scores, subcenter_scores
+
+    def rank(
+        self,
+        embedding: np.ndarray,
+        *,
+        top_k: int | None = None,
+    ) -> list[IdentityMatch]:
+        combined, centroid_scores, subcenter_scores = self._combined_scores(embedding)
+        order = np.argsort(-combined, kind="stable")
+        if top_k is not None:
+            if top_k < 1:
+                raise ValueError("top_k must be at least 1")
+            order = order[:top_k]
+        return [
+            IdentityMatch(
+                person_id=self.person_ids[int(index)],
+                score=float(combined[index]),
+                centroid_score=float(centroid_scores[index]),
+                subcenter_score=float(subcenter_scores[index]),
+            )
+            for index in order
+        ]
+
+    def match(self, embedding: np.ndarray) -> IdentityMatch | None:
+        ranked = self.rank(embedding, top_k=1)
+        best = ranked[0]
+        score = best.score
         if self.unknown_threshold is not None and score < self.unknown_threshold:
             return None
-        return IdentityMatch(
-            person_id=self.person_ids[best],
-            score=score,
-            centroid_score=float(centroid_scores[best]),
-            subcenter_score=float(subcenter_scores[best]),
-        )
+        return best
 
     @staticmethod
     def confidence(score: float) -> float:
