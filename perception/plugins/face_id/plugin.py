@@ -337,13 +337,16 @@ class FaceRecognitionPlugin:
     def _stop(self, instance_id: str) -> dict:
         with self._state_lock:
             if instance_id:
-                node = self._nodes.pop(instance_id, None)
-                disposed = [] if node is None else [(instance_id, node)]
+                node = self._nodes.get(instance_id)
+                stopped = [] if node is None else [node]
             else:
-                disposed = list(self._nodes.items())
-                self._nodes = {}
-        for node_key, node in disposed:
-            self._dispose(node_key, node)
+                stopped = list(self._nodes.values())
+        # Keep the rclpy node, publisher and subscription registered across
+        # frequent stop/start cycles and only stop the worker. Repeatedly
+        # destroying native ROS handles while the executor spins can
+        # destabilize long-running services.
+        for node in stopped:
+            node.stop()
         return {"state": "idle"}
 
     def _dispose(self, node_key: str, node: _FaceNode) -> None:

@@ -88,18 +88,41 @@ def test_first_start_loads_once_and_publishes_schema(monkeypatch):
 
 def test_repeated_case_start_stop_reuses_engine(monkeypatch):
     plugin, executor, builder = _plugin(monkeypatch)
+    node = None
     for _ in range(5):
         plugin.dispatch("face", {"action": "start", "input_topic": "/camera/image"})
         assert len(executor.nodes) == 1
+        current = executor.nodes[0]
+        node = current if node is None else node
+        assert current is node
+        assert len(current.subscriptions) == 1
         plugin.dispatch("face", {"action": "stop"})
-        assert executor.nodes == []
+        assert executor.nodes == [node]
+        assert not node.worker_alive
     assert builder.calls == 1
     assert not builder.engines[0].closed
 
 
+def test_repeated_lifecycle_stress_keeps_one_node_and_no_workers(monkeypatch):
+    plugin, executor, builder = _plugin(monkeypatch)
+    node = None
+    for _ in range(500):
+        plugin.dispatch("face", {"action": "start", "input_topic": "/camera/image"})
+        current = executor.nodes[0]
+        node = current if node is None else node
+        assert current is node
+        plugin.dispatch("face", {"action": "stop"})
+        assert not current.worker_alive
+    assert executor.nodes == [node]
+    assert len(node.subscriptions) == 1
+    assert node._workers == []
+    assert builder.calls == 1
+
+
 def test_model_config_change_closes_cached_engine(monkeypatch):
-    plugin, _executor, builder = _plugin(monkeypatch)
+    plugin, executor, builder = _plugin(monkeypatch)
     plugin.dispatch("face", {"action": "start", "input_topic": "/camera/image"})
+    first_node = executor.nodes[0]
     plugin.dispatch("face", {"action": "stop"})
     first = builder.engines[0]
     result = plugin.dispatch(
@@ -107,6 +130,8 @@ def test_model_config_change_closes_cached_engine(monkeypatch):
     )
     assert result == {"status": "configured", "engine_loaded": False, "reused": False}
     assert first.closed
+    assert first_node.destroyed
+    assert executor.nodes == []
     plugin.dispatch("face", {"action": "start", "input_topic": "/camera/image"})
     assert builder.calls == 2
     assert builder.engines[1].cfg["recognizer"] == "mobilefacenet"
