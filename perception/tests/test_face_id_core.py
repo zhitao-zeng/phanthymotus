@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import cv2
+import json
 import numpy as np
 
 from plugins.face_id.alignment import ARCFACE_112_TEMPLATE, align_face
@@ -115,6 +116,20 @@ def test_scrfd_accepts_tensorrt_interleaved_output_order():
     detections = detector.detect(np.zeros((64, 64, 3), dtype=np.uint8))
     assert len(detections) == 1
     np.testing.assert_allclose(detections[0].bbox, [0, 0, 16, 16])
+
+
+def test_scrfd_threshold_override_is_per_call():
+    outputs = _scrfd_outputs()
+    outputs[0][0] = 0.1
+    detector = SCRFDDetector(
+        _StaticBackend(outputs),
+        input_size=(64, 64),
+        score_threshold=0.2,
+    )
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    assert detector.detect(image) == []
+    assert len(detector.detect(image, score_threshold=0.05)) == 1
+    assert detector.detect(image) == []
 
 
 def test_distance_decode_and_nms():
@@ -307,6 +322,113 @@ def test_end_to_end_engine_returns_current_single_face_schema():
     }
     engine.close()
     assert detector.closed and recognizer.closed
+
+
+def _diagnostic_gallery():
+    return IdentityGallery(
+        [
+            IdentityTemplates(
+                "alice",
+                np.array([1.0, 0.0], dtype=np.float32),
+                np.array([[1.0, 0.0]], dtype=np.float32),
+                np.array([[1.0, 0.0]], dtype=np.float32),
+                1,
+            ),
+            IdentityTemplates(
+                "bob",
+                np.array([0.0, 1.0], dtype=np.float32),
+                np.array([[0.0, 1.0]], dtype=np.float32),
+                np.array([[0.0, 1.0]], dtype=np.float32),
+                1,
+            ),
+        ]
+    )
+
+
+def _diagnostic_records(caplog):
+    prefix = "[face-diagnostic] "
+    return [
+        json.loads(record.message[len(prefix) :])
+        for record in caplog.records
+        if record.message.startswith(prefix)
+    ]
+
+
+def test_diagnostics_log_topk_without_changing_payload(caplog):
+    gallery = _diagnostic_gallery()
+    engine = FaceIdentityEngine(
+        _Detector(),
+        _Recognizer([1.0, 0.0]),
+        gallery,
+        IdentityMatcher(gallery),
+        face_selection="gallery_match",
+        diagnostics_enabled=True,
+        diagnostics_top_k=5,
+    )
+    with caplog.at_level("INFO", logger="plugins.face_id.engine"):
+        payload = engine.infer_image(np.zeros((112, 112, 3), dtype=np.uint8))
+    assert payload == {
+        "detect_confidence": 0.95,
+        "bbox_relative": [0.0, 0.0, 1.0, 1.0],
+        "identity": {"person_id": "alice", "confidence": 1.0},
+    }
+    records = _diagnostic_records(caplog)
+    assert len(records) == 1
+    assert records[0]["sequence"] == 1
+    assert records[0]["selected_candidate_index"] == 0
+    assert [item["person_id"] for item in records[0]["candidates"][0]["top"]] == [
+        "alice",
+        "bob",
+    ]
+    assert records[0]["candidates"][0]["quality"]["alignment_rmse"] < 0.01
+
+
+class _NoFaceThenWeakDetector(_Detector):
+    def __init__(self):
+        super().__init__()
+        self.thresholds = []
+
+    def detect(self, image, *, score_threshold=None):
+        self.thresholds.append(score_threshold)
+        if score_threshold == 0.05:
+            return [
+                FaceDetection(
+                    np.array([0, 0, 112, 112], dtype=np.float32),
+                    0.07,
+                    ARCFACE_112_TEMPLATE.copy(),
+                )
+            ]
+        return []
+
+
+def test_empty_diagnostics_probe_weak_faces_but_keep_empty_payload(caplog):
+    gallery = _diagnostic_gallery()
+    detector = _NoFaceThenWeakDetector()
+    engine = FaceIdentityEngine(
+        detector,
+        _Recognizer([1.0, 0.0]),
+        gallery,
+        IdentityMatcher(gallery),
+        diagnostics_enabled=True,
+        diagnostics_retry_thresholds=(0.1, 0.05),
+    )
+    with caplog.at_level("INFO", logger="plugins.face_id.engine"):
+        payload = engine.infer_image(np.zeros((112, 112, 3), dtype=np.uint8))
+    assert payload == {
+        "detect_confidence": 0.0,
+        "bbox_relative": None,
+        "identity": None,
+    }
+    assert detector.thresholds == [None, 0.1, 0.05]
+    record = _diagnostic_records(caplog)[0]
+    assert record["detections"] == 0
+    assert [probe["raw_detections"] for probe in record["empty_detection_probes"]] == [
+        0,
+        1,
+    ]
+    assert record["empty_detection_probes"][1]["candidates"][0]["top"][0][
+        "person_id"
+    ] == "alice"
 
 
 def test_gallery_selection_recognizes_all_faces_before_choosing():

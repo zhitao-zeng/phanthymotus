@@ -80,9 +80,21 @@ class SCRFDDetector:
         self.nms_threshold = float(nms_threshold)
         self._center_cache: dict[tuple[int, int, int, int], np.ndarray] = {}
 
-    def detect(self, image: np.ndarray) -> list[FaceDetection]:
+    def detect(
+        self,
+        image: np.ndarray,
+        *,
+        score_threshold: float | None = None,
+    ) -> list[FaceDetection]:
         if image is None or image.ndim != 3 or image.shape[2] != 3:
             raise ValueError("SCRFD expects a decoded BGR HWC image")
+        threshold = (
+            self.score_threshold
+            if score_threshold is None
+            else float(score_threshold)
+        )
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(f"invalid SCRFD score threshold: {threshold}")
         model_image, scale = self._resize_and_pad(image)
         blob = cv2.dnn.blobFromImage(
             model_image,
@@ -92,7 +104,12 @@ class SCRFDDetector:
             swapRB=True,
         )
         outputs = self.backend.infer(blob)
-        boxes, landmarks = self._decode(outputs, blob.shape[2], blob.shape[3])
+        boxes, landmarks = self._decode(
+            outputs,
+            blob.shape[2],
+            blob.shape[3],
+            score_threshold=threshold,
+        )
         if boxes.size == 0:
             return []
         boxes[:, :4] /= scale
@@ -134,6 +151,8 @@ class SCRFDDetector:
         outputs: list[np.ndarray],
         input_height: int,
         input_width: int,
+        *,
+        score_threshold: float,
     ) -> tuple[np.ndarray, np.ndarray]:
         count = len(outputs)
         if count == 9:
@@ -184,7 +203,7 @@ class SCRFDDetector:
                 raise ValueError(
                     f"SCRFD stride {stride} anchor mismatch: rows={rows}, anchors={len(centers)}"
                 )
-            selected = np.flatnonzero(scores >= self.score_threshold)
+            selected = np.flatnonzero(scores >= score_threshold)
             if selected.size == 0:
                 continue
             decoded_boxes = distance_to_bbox(centers, bbox_distance)

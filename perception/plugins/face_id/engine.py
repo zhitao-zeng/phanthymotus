@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -13,6 +14,7 @@ import numpy as np
 from .alignment import align_face
 from .backends import build_backend
 from .detector import SCRFDDetector
+from .diagnostics import detection_quality, ranked_matches
 from .gallery import GalleryQualityConfig, IdentityGallery, select_primary_face
 from .matcher import IdentityMatcher
 from .postprocess import face_payload
@@ -115,6 +117,10 @@ class FaceIdentityEngine:
         *,
         face_selection: str = "primary",
         query_flip_tta: bool = False,
+        diagnostics_enabled: bool = False,
+        diagnostics_top_k: int = 5,
+        diagnostics_retry_thresholds: tuple[float, ...] = (),
+        diagnostics_max_retry_candidates: int = 5,
         bbox_x_scale: float = 1.0,
         bbox_y_scale: float = 1.0,
         bbox_y_shift: float = 0.0,
@@ -127,11 +133,24 @@ class FaceIdentityEngine:
         if self.face_selection not in {"primary", "gallery_match"}:
             raise ValueError(f"unsupported face selection: {face_selection}")
         self.query_flip_tta = bool(query_flip_tta)
+        self.diagnostics_enabled = bool(diagnostics_enabled)
+        self.diagnostics_top_k = int(diagnostics_top_k)
+        if self.diagnostics_top_k < 2:
+            raise ValueError("diagnostics_top_k must be at least two")
+        self.diagnostics_retry_thresholds = tuple(
+            float(value) for value in diagnostics_retry_thresholds
+        )
+        self.diagnostics_max_retry_candidates = int(
+            diagnostics_max_retry_candidates
+        )
+        if self.diagnostics_max_retry_candidates < 1:
+            raise ValueError("diagnostics_max_retry_candidates must be positive")
         self.bbox_x_scale = float(bbox_x_scale)
         self.bbox_y_scale = float(bbox_y_scale)
         self.bbox_y_shift = float(bbox_y_shift)
         self._lock = threading.Lock()
         self._closed = False
+        self._diagnostic_sequence = 0
 
     def infer_face_identity(self, image_bytes: bytes) -> dict:
         encoded = np.frombuffer(image_bytes, dtype=np.uint8)
@@ -144,14 +163,42 @@ class FaceIdentityEngine:
         with self._lock:
             if self._closed:
                 raise RuntimeError("face identity engine is closed")
+            self._diagnostic_sequence += 1
+            sequence = self._diagnostic_sequence
             detections = self.detector.detect(image)
             if not detections:
+                if self.diagnostics_enabled:
+                    self._log_empty_diagnostics(sequence, image)
                 return empty_face_payload()
             if self.face_selection == "primary":
                 detection = select_primary_face(detections, image.shape)
-                match = self._match_detection(image, detection)
+                selected_index = next(
+                    index
+                    for index, candidate in enumerate(detections)
+                    if candidate is detection
+                )
+                ranked, diagnostic = self._analyze_detection(
+                    image,
+                    detection,
+                    selected_index,
+                )
+                match = self._accepted_match(ranked[0])
+                diagnostic_candidates = [diagnostic]
             else:
-                detection, match = self._select_by_gallery(image, detections)
+                (
+                    detection,
+                    match,
+                    selected_index,
+                    diagnostic_candidates,
+                ) = self._select_by_gallery(image, detections)
+            if self.diagnostics_enabled:
+                self._log_diagnostics(
+                    sequence,
+                    image,
+                    detections,
+                    selected_index,
+                    diagnostic_candidates,
+                )
             confidence = None if match is None else self.matcher.confidence(match.score)
             return face_payload(
                 detection,
@@ -163,30 +210,146 @@ class FaceIdentityEngine:
                 match_confidence=confidence,
             )
 
-    def _embedding(self, image: np.ndarray, detection) -> np.ndarray:
+    def _embedding(self, image: np.ndarray, detection) -> tuple[np.ndarray, np.ndarray]:
         aligned = align_face(image, detection.landmarks)
-        return self.recognizer.embed(aligned, flip_tta=self.query_flip_tta)
-
-    def _match_detection(self, image: np.ndarray, detection):
-        return self.matcher.match(self._embedding(image, detection))
-
-    def _select_by_gallery(self, image: np.ndarray, detections):
-        candidates = []
-        for detection in detections:
-            ranked = self.matcher.rank(self._embedding(image, detection), top_k=2)
-            top = ranked[0]
-            margin = top.score - ranked[1].score if len(ranked) > 1 else 0.0
-            candidates.append((top.score, margin, detection.score, detection, top))
-        _score, _margin, _detection_score, detection, match = max(
-            candidates,
-            key=lambda item: item[:3],
+        embedding = self.recognizer.embed(
+            aligned,
+            flip_tta=self.query_flip_tta,
         )
+        return embedding, aligned
+
+    def _analyze_detection(self, image: np.ndarray, detection, index: int):
+        embedding, aligned = self._embedding(image, detection)
+        ranked = self.matcher.rank(embedding, top_k=2)
+        diagnostic = None
+        if self.diagnostics_enabled:
+            try:
+                diagnostic_ranked = self.matcher.rank(
+                    embedding,
+                    top_k=self.diagnostics_top_k,
+                )
+                margin = (
+                    diagnostic_ranked[0].score - diagnostic_ranked[1].score
+                    if len(diagnostic_ranked) > 1
+                    else 0.0
+                )
+                diagnostic = {
+                    "candidate_index": int(index),
+                    "detection_score": round(float(detection.score), 6),
+                    "margin": round(float(margin), 6),
+                    "quality": detection_quality(image, detection, aligned),
+                    "top": ranked_matches(diagnostic_ranked),
+                }
+            except Exception as error:  # diagnostics must not affect inference
+                diagnostic = {
+                    "candidate_index": int(index),
+                    "diagnostic_error": f"{type(error).__name__}: {error}",
+                }
+        return ranked, diagnostic
+
+    def _accepted_match(self, match):
         if (
             self.matcher.unknown_threshold is not None
             and match.score < self.matcher.unknown_threshold
         ):
-            match = None
-        return detection, match
+            return None
+        return match
+
+    def _select_by_gallery(self, image: np.ndarray, detections):
+        candidates = []
+        diagnostics = []
+        for index, detection in enumerate(detections):
+            ranked, diagnostic = self._analyze_detection(image, detection, index)
+            top = ranked[0]
+            margin = top.score - ranked[1].score if len(ranked) > 1 else 0.0
+            candidates.append(
+                (top.score, margin, detection.score, -index, index, detection, top)
+            )
+            if diagnostic is not None:
+                diagnostics.append(diagnostic)
+        _score, _margin, _detection_score, _order, index, detection, match = max(
+            candidates,
+            key=lambda item: item[:4],
+        )
+        return detection, self._accepted_match(match), index, diagnostics
+
+    def _diagnostic_base(self, sequence: int, image: np.ndarray) -> dict:
+        return {
+            "detections": 0,
+            "image_height": int(image.shape[0]),
+            "image_width": int(image.shape[1]),
+            "sequence": int(sequence),
+            "version": 1,
+        }
+
+    def _log_diagnostics(
+        self,
+        sequence: int,
+        image: np.ndarray,
+        detections,
+        selected_index: int,
+        diagnostic_candidates: list[dict | None],
+    ) -> None:
+        record = self._diagnostic_base(sequence, image)
+        record.update(
+            {
+                "candidates": [
+                    candidate
+                    for candidate in diagnostic_candidates
+                    if candidate is not None
+                ],
+                "detections": len(detections),
+                "selected_candidate_index": int(selected_index),
+            }
+        )
+        log.info(
+            "[face-diagnostic] %s",
+            json.dumps(record, ensure_ascii=True, separators=(",", ":")),
+        )
+
+    def _log_empty_diagnostics(self, sequence: int, image: np.ndarray) -> None:
+        record = self._diagnostic_base(sequence, image)
+        probes = []
+        try:
+            for threshold in self.diagnostics_retry_thresholds:
+                detections = self.detector.detect(
+                    image,
+                    score_threshold=threshold,
+                )
+                candidates = []
+                for index, detection in enumerate(
+                    detections[: self.diagnostics_max_retry_candidates]
+                ):
+                    ranked, diagnostic = self._analyze_detection(
+                        image,
+                        detection,
+                        index,
+                    )
+                    if diagnostic is None:
+                        continue
+                    diagnostic["official_top1_score"] = round(
+                        float(ranked[0].score),
+                        6,
+                    )
+                    candidates.append(diagnostic)
+                probes.append(
+                    {
+                        "candidates": candidates,
+                        "max_detection_score": round(
+                            max((item.score for item in detections), default=0.0),
+                            6,
+                        ),
+                        "raw_detections": len(detections),
+                        "score_threshold": round(float(threshold), 6),
+                    }
+                )
+        except Exception as error:  # diagnostics must never change the payload
+            record["diagnostic_error"] = f"{type(error).__name__}: {error}"
+        record["empty_detection_probes"] = probes
+        log.info(
+            "[face-diagnostic] %s",
+            json.dumps(record, ensure_ascii=True, separators=(",", ":")),
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -348,6 +511,19 @@ def build_face_engine(cfg: dict) -> FaceIdentityEngine:
             unknown_threshold=None if unknown in (None, "") else float(unknown),
         )
         bbox_cfg = dict(cfg.get("bbox_calibration") or {})
+        diagnostics_cfg = dict(cfg.get("diagnostics") or {})
+        retry_thresholds = tuple(
+            float(value)
+            for value in diagnostics_cfg.get("retry_score_thresholds", [])
+        )
+        if any(
+            value < 0.0 or value >= detector.score_threshold
+            for value in retry_thresholds
+        ):
+            raise ValueError(
+                "diagnostic retry thresholds must be non-negative and lower "
+                "than detector_score_threshold"
+            )
         engine = FaceIdentityEngine(
             detector,
             recognizer,
@@ -355,6 +531,12 @@ def build_face_engine(cfg: dict) -> FaceIdentityEngine:
             matcher,
             face_selection=str(cfg.get("face_selection", "primary")),
             query_flip_tta=bool(cfg.get("query_flip_tta", False)),
+            diagnostics_enabled=bool(diagnostics_cfg.get("enabled", False)),
+            diagnostics_top_k=int(diagnostics_cfg.get("top_k", 5)),
+            diagnostics_retry_thresholds=retry_thresholds,
+            diagnostics_max_retry_candidates=int(
+                diagnostics_cfg.get("max_retry_candidates", 5)
+            ),
             bbox_x_scale=float(bbox_cfg.get("x_scale", 1.0)),
             bbox_y_scale=float(bbox_cfg.get("y_scale", 1.0)),
             bbox_y_shift=float(bbox_cfg.get("y_shift", 0.0)),

@@ -98,9 +98,14 @@ plugins:
     detector_score_threshold: 0.15
     detector_nms_threshold: 0.4
     face_selection: gallery_match
-    query_flip_tta: true
-    centroid_weight: 0.75
+    query_flip_tta: false
+    centroid_weight: 0.6
     unknown_threshold: null
+    diagnostics:
+      enabled: true
+      top_k: 5
+      retry_score_thresholds: [0.10, 0.05]
+      max_retry_candidates: 5
     gallery_quality:
       min_detection_score: 0.2
       min_face_size: 24
