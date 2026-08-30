@@ -95,8 +95,34 @@ class _NativeTensorRTEngine:
             pass
 
 
-def _prepare_yolo_image(image: np.ndarray, size: int) -> tuple[np.ndarray, float, int, int]:
-    letterboxed, ratio, dw, dh = letterbox(image, size)
+def _prepare_yolo_image(
+    image: np.ndarray,
+    size: int | tuple[int, int],
+) -> tuple[np.ndarray, float, int, int]:
+    if isinstance(size, int):
+        letterboxed, ratio, dw, dh = letterbox(image, size)
+    else:
+        import cv2
+
+        target_height, target_width = size
+        height, width = image.shape[:2]
+        ratio = min(target_height / height, target_width / width)
+        resized_height = int(round(height * ratio))
+        resized_width = int(round(width * ratio))
+        dh = (target_height - resized_height) // 2
+        dw = (target_width - resized_width) // 2
+        resized = cv2.resize(
+            image,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        letterboxed = np.full(
+            (target_height, target_width, 3), 114, dtype=np.uint8
+        )
+        letterboxed[
+            dh : dh + resized_height,
+            dw : dw + resized_width,
+        ] = resized
     rgb = letterboxed[:, :, ::-1]
     chw = np.transpose(rgb, (2, 0, 1))
     tensor = np.ascontiguousarray(chw, dtype=np.float32)[None] / 255.0

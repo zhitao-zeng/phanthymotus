@@ -29,7 +29,6 @@ from .contracts import (
 from .native_tensorrt_backends import (
     NativeTensorRTSegBackend,
     _NativeTensorRTEngine,
-    _YOLO_DEPTH_INPUT_SIZE,
     _prepare_yolo_image,
     _resize_align_corners,
     _scale_depth_to_original,
@@ -270,11 +269,14 @@ class ZipDepthYoloTensorRTDepthBackend:
                         self._vehicle_engine_path,
                         expected_task="depth",
                     )
-                    if vehicle.input_shape != (
-                        1,
-                        3,
-                        _YOLO_DEPTH_INPUT_SIZE,
-                        _YOLO_DEPTH_INPUT_SIZE,
+                    input_shape = vehicle.input_shape
+                    if (
+                        len(input_shape) != 4
+                        or input_shape[:2] != (1, 3)
+                        or input_shape[2] <= 0
+                        or input_shape[3] <= 0
+                        or input_shape[2] % 32
+                        or input_shape[3] % 32
                     ):
                         raise ObstacleDistanceError(
                             ErrorCode.MODEL_ERROR,
@@ -388,8 +390,13 @@ class ZipDepthYoloTensorRTDepthBackend:
         check_deadline(deadline_monotonic)
         image = decode_image(image_bytes)
         height, width = image.shape[:2]
-        tensor, _, _, _ = _prepare_yolo_image(image, _YOLO_DEPTH_INPUT_SIZE)
-        outputs = self._get_vehicle_engine().infer(tensor)
+        engine = self._get_vehicle_engine()
+        input_height, input_width = engine.input_shape[2:]
+        tensor, _, _, _ = _prepare_yolo_image(
+            image,
+            (input_height, input_width),
+        )
+        outputs = engine.infer(tensor)
         if len(outputs) != 1:
             raise ObstacleDistanceError(
                 ErrorCode.MODEL_ERROR,

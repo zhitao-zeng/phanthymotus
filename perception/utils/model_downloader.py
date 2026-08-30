@@ -523,7 +523,7 @@ OCR_MODEL_BUNDLES = {
 
 
 # ── Obstacle distance (ZipDepth + YOLO26n TensorRT engines) ─────────────
-OBSTACLE_MODEL_REVISION = "4b4543e018a842cbe4e3a656f3cc61f1ef536937"
+OBSTACLE_MODEL_REVISION = "0d73327210a3d7fcdd5d24d7a56ae124cf13a08e"
 OBSTACLE_MODEL_BASE = os.environ.get(
     "OBSTACLE_MODEL_BASE_URL",
     "https://www.modelscope.cn/models/Flame4pd/"
@@ -537,9 +537,9 @@ OBSTACLE_MODEL_BUNDLES = {
                 "size": 7935428,
                 "sha256": "aa34296bcaeed28a5176b423f074da3923c996e7be06702a3952d475000a8887",
             },
-            "yolo26n-depth-int8.engine": {
-                "size": 7778158,
-                "sha256": "8174652d6ba72af15c10caccf95629d585d33245e5242aa1f1734317d5a23f7c",
+            "yolo26n-depth-fp16-448x768.engine": {
+                "size": 13589166,
+                "sha256": "80359e397e4a2d0551005b39f191e98905134a86391315a08e6c363fb8c10d95",
             },
             "yolo26n-seg-int8.engine": {
                 "size": 5641961,
@@ -554,9 +554,9 @@ OBSTACLE_MODEL_BUNDLES = {
                 "size": 8151574,
                 "sha256": "a682f66c2be146b793e9c5dee9d19cb304cb7c1dec938a75243060f9572f9962",
             },
-            "yolo26n-depth-int8.engine": {
-                "size": 6746230,
-                "sha256": "816ca14c23af37ee2961ec09db51a54888462c5e4bb296bbaba2a569e6f2bb64",
+            "yolo26n-depth-fp16-448x768.engine": {
+                "size": 12915758,
+                "sha256": "75fe69afd54623d631a63ff2c38e1f8761ff749553660635379a4dd724757d47",
             },
             "yolo26n-seg-int8.engine": {
                 "size": 4929510,

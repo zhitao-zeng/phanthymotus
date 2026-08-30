@@ -157,7 +157,7 @@ class LocalDistanceAdapter:
         )
         for key, filename in (
             ("indoor_depth_engine", "zipdepth-base-npu-512x384-int8.engine"),
-            ("vehicle_depth_engine", "yolo26n-depth-int8.engine"),
+            ("vehicle_depth_engine", "yolo26n-depth-fp16-448x768.engine"),
             ("segmentation_engine", "yolo26n-seg-int8.engine"),
         ):
             self._cfg.setdefault(key, engine_paths[filename])
