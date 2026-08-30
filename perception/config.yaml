@@ -88,18 +88,18 @@ plugins:
   # gallery templates across benchmark cases.
   face:
     enabled: false
-    mounted_gallery_profile: lvface_cpu  # mobile_cpu | lvface_cpu
+    mounted_gallery_profile: mobile_cpu  # mobile_cpu | lvface_cpu
     backend: tensorrt
     model_dir: /models/face
     face_db_dir: /workspace/face_db
-    recognizer: lvface
+    recognizer: mobilefacenet
     device_id: 0
     detector_input_size: [640, 640]
     detector_score_threshold: 0.15
     detector_nms_threshold: 0.4
     face_selection: gallery_match
-    query_flip_tta: false
-    centroid_weight: 0.6
+    query_flip_tta: true
+    centroid_weight: 0.75
     unknown_threshold: null
     gallery_quality:
       min_detection_score: 0.2
