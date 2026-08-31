@@ -101,8 +101,23 @@ plugins:
     query_flip_tta: false
     centroid_weight: 0.6
     unknown_threshold: null
-    diagnostics:
+    empty_detection_retry:
       enabled: true
+      score_threshold: 0.10
+      rotations: [90, 180, 270]
+      tile_fraction: 0.75
+      min_face_ratio: 0.12
+    alignment_rescue:
+      enabled: true
+      rmse_min: 8.0
+      min_score_gain: 0.02
+      min_margin_gain: 0.0
+    subcenter_rescue:
+      enabled: true
+      margin_max: 0.035
+      min_margin_gain: 0.04
+    diagnostics:
+      enabled: false
       top_k: 5
       retry_score_thresholds: [0.10, 0.05]
       max_retry_candidates: 5

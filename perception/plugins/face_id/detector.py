@@ -86,15 +86,272 @@ class SCRFDDetector:
         *,
         score_threshold: float | None = None,
     ) -> list[FaceDetection]:
-        if image is None or image.ndim != 3 or image.shape[2] != 3:
-            raise ValueError("SCRFD expects a decoded BGR HWC image")
         threshold = (
             self.score_threshold
             if score_threshold is None
             else float(score_threshold)
         )
+        self._validate_threshold(threshold)
+        outputs, input_height, input_width, scale = self._infer(image)
+        return self._postprocess(
+            outputs,
+            input_height,
+            input_width,
+            scale,
+            image.shape,
+            score_threshold=threshold,
+        )
+
+    def detect_with_empty_retry(
+        self,
+        image: np.ndarray,
+        *,
+        retry_score_threshold: float,
+        rotations: tuple[int, ...] = (),
+        tile_fraction: float | None = None,
+        rescue_min_face_ratio: float = 0.0,
+    ) -> list[FaceDetection]:
+        """Retry an empty result with cheap decode and optional transformed views."""
+
+        retry_threshold = float(retry_score_threshold)
+        self._validate_threshold(retry_threshold)
+        if retry_threshold >= self.score_threshold:
+            raise ValueError(
+                "SCRFD empty retry threshold must be lower than the default "
+                f"score threshold: {retry_threshold} >= {self.score_threshold}"
+            )
+        outputs, input_height, input_width, scale = self._infer(image)
+        detections = self._postprocess(
+            outputs,
+            input_height,
+            input_width,
+            scale,
+            image.shape,
+            score_threshold=self.score_threshold,
+        )
+        if detections:
+            return detections
+        detections = self._postprocess(
+            outputs,
+            input_height,
+            input_width,
+            scale,
+            image.shape,
+            score_threshold=retry_threshold,
+        )
+        if detections:
+            return detections
+        rotated_detections = self._detect_rotated_views(
+            image,
+            rotations=rotations,
+            score_threshold=retry_threshold,
+            min_face_ratio=float(rescue_min_face_ratio),
+        )
+        if rotated_detections:
+            return self._merge_detections(rotated_detections)
+        if tile_fraction is None:
+            return []
+        return self._merge_detections(
+            self._detect_tiled_views(
+                image,
+                tile_fraction=float(tile_fraction),
+                score_threshold=retry_threshold,
+                min_face_ratio=float(rescue_min_face_ratio),
+            )
+        )
+
+    def _detect_rotated_views(
+        self,
+        image: np.ndarray,
+        *,
+        rotations: tuple[int, ...],
+        score_threshold: float,
+        min_face_ratio: float,
+    ) -> list[FaceDetection]:
+        detections: list[FaceDetection] = []
+        for degrees in rotations:
+            rotated, inverse = self._rotate_view(image, int(degrees))
+            for detection in self.detect(
+                rotated,
+                score_threshold=score_threshold,
+            ):
+                mapped = self._map_detection(
+                    detection,
+                    inverse,
+                    image.shape,
+                )
+                if mapped is not None and self._rescue_geometry_valid(
+                    mapped,
+                    image.shape,
+                    min_face_ratio=min_face_ratio,
+                ):
+                    detections.append(mapped)
+        return detections
+
+    def _detect_tiled_views(
+        self,
+        image: np.ndarray,
+        *,
+        tile_fraction: float,
+        score_threshold: float,
+        min_face_ratio: float,
+    ) -> list[FaceDetection]:
+        if not 0.5 <= tile_fraction < 1.0:
+            raise ValueError("SCRFD tile fraction must be in [0.5, 1.0)")
+        height, width = image.shape[:2]
+        crop_width = max(1, int(round(width * tile_fraction)))
+        crop_height = max(1, int(round(height * tile_fraction)))
+        max_x = max(0, width - crop_width)
+        max_y = max(0, height - crop_height)
+        origins = [
+            (max_x // 2, max_y // 2),
+            (0, 0),
+            (max_x, 0),
+            (0, max_y),
+            (max_x, max_y),
+        ]
+        detections: list[FaceDetection] = []
+        for offset_x, offset_y in dict.fromkeys(origins):
+            crop = image[
+                offset_y : offset_y + crop_height,
+                offset_x : offset_x + crop_width,
+            ]
+            affine = np.array(
+                [[1.0, 0.0, offset_x], [0.0, 1.0, offset_y]],
+                dtype=np.float32,
+            )
+            for detection in self.detect(
+                crop,
+                score_threshold=score_threshold,
+            ):
+                mapped = self._map_detection(detection, affine, image.shape)
+                if mapped is not None and self._rescue_geometry_valid(
+                    mapped,
+                    image.shape,
+                    min_face_ratio=min_face_ratio,
+                ):
+                    detections.append(mapped)
+        return detections
+
+    @staticmethod
+    def _rotate_view(
+        image: np.ndarray,
+        degrees: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        height, width = image.shape[:2]
+        if degrees == 90:
+            rotated = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+            forward = np.array(
+                [[0.0, -1.0, height - 1.0], [1.0, 0.0, 0.0]],
+                dtype=np.float32,
+            )
+        elif degrees == 180:
+            rotated = cv2.rotate(image, cv2.ROTATE_180)
+            forward = np.array(
+                [[-1.0, 0.0, width - 1.0], [0.0, -1.0, height - 1.0]],
+                dtype=np.float32,
+            )
+        elif degrees == 270:
+            rotated = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            forward = np.array(
+                [[0.0, 1.0, 0.0], [-1.0, 0.0, width - 1.0]],
+                dtype=np.float32,
+            )
+        else:
+            raise ValueError("SCRFD rescue rotations must be 90, 180, or 270")
+        return rotated, cv2.invertAffineTransform(forward).astype(np.float32)
+
+    @staticmethod
+    def _map_detection(
+        detection: FaceDetection,
+        affine: np.ndarray,
+        image_shape: tuple[int, ...],
+    ) -> FaceDetection | None:
+        matrix = np.asarray(affine, dtype=np.float32)
+        if matrix.shape != (2, 3) or not np.all(np.isfinite(matrix)):
+            raise ValueError("face detection mapping requires a finite 2x3 affine")
+        x1, y1, x2, y2 = detection.bbox
+        corners = np.array(
+            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+            dtype=np.float32,
+        )
+        homogeneous_corners = np.column_stack(
+            [corners, np.ones(4, dtype=np.float32)]
+        )
+        homogeneous_landmarks = np.column_stack(
+            [detection.landmarks, np.ones(5, dtype=np.float32)]
+        )
+        mapped_corners = homogeneous_corners @ matrix.T
+        mapped_landmarks = homogeneous_landmarks @ matrix.T
+        height, width = image_shape[:2]
+        mapped_bbox = np.array(
+            [
+                np.min(mapped_corners[:, 0]),
+                np.min(mapped_corners[:, 1]),
+                np.max(mapped_corners[:, 0]),
+                np.max(mapped_corners[:, 1]),
+            ],
+            dtype=np.float32,
+        )
+        mapped_bbox[[0, 2]] = np.clip(mapped_bbox[[0, 2]], 0, width - 1)
+        mapped_bbox[[1, 3]] = np.clip(mapped_bbox[[1, 3]], 0, height - 1)
+        mapped_landmarks[:, 0] = np.clip(mapped_landmarks[:, 0], 0, width - 1)
+        mapped_landmarks[:, 1] = np.clip(mapped_landmarks[:, 1], 0, height - 1)
+        if mapped_bbox[2] <= mapped_bbox[0] or mapped_bbox[3] <= mapped_bbox[1]:
+            return None
+        return FaceDetection(
+            mapped_bbox,
+            detection.score,
+            mapped_landmarks,
+        )
+
+    def _merge_detections(
+        self,
+        detections: list[FaceDetection],
+    ) -> list[FaceDetection]:
+        if not detections:
+            return []
+        boxes = np.vstack(
+            [
+                np.append(detection.bbox, detection.score)
+                for detection in detections
+            ]
+        ).astype(np.float32)
+        return [detections[index] for index in nms(boxes, self.nms_threshold)]
+
+    @staticmethod
+    def _rescue_geometry_valid(
+        detection: FaceDetection,
+        image_shape: tuple[int, ...],
+        *,
+        min_face_ratio: float,
+    ) -> bool:
+        if not 0.0 <= min_face_ratio <= 1.0:
+            raise ValueError("SCRFD rescue min_face_ratio must be in [0, 1]")
+        height, width = image_shape[:2]
+        x1, y1, x2, y2 = detection.bbox
+        face_ratio = min(float(x2 - x1), float(y2 - y1)) / max(
+            1.0,
+            min(height, width),
+        )
+        if face_ratio < min_face_ratio:
+            return False
+        eye_distance = float(
+            np.linalg.norm(detection.landmarks[0] - detection.landmarks[1])
+        )
+        return eye_distance >= 0.12 * min(float(x2 - x1), float(y2 - y1))
+
+    @staticmethod
+    def _validate_threshold(threshold: float) -> None:
         if not 0.0 <= threshold <= 1.0:
             raise ValueError(f"invalid SCRFD score threshold: {threshold}")
+
+    def _infer(
+        self,
+        image: np.ndarray,
+    ) -> tuple[list[np.ndarray], int, int, float]:
+        if image is None or image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError("SCRFD expects a decoded BGR HWC image")
         model_image, scale = self._resize_and_pad(image)
         blob = cv2.dnn.blobFromImage(
             model_image,
@@ -104,17 +361,29 @@ class SCRFDDetector:
             swapRB=True,
         )
         outputs = self.backend.infer(blob)
+        return outputs, int(blob.shape[2]), int(blob.shape[3]), scale
+
+    def _postprocess(
+        self,
+        outputs: list[np.ndarray],
+        input_height: int,
+        input_width: int,
+        scale: float,
+        image_shape: tuple[int, ...],
+        *,
+        score_threshold: float,
+    ) -> list[FaceDetection]:
         boxes, landmarks = self._decode(
             outputs,
-            blob.shape[2],
-            blob.shape[3],
-            score_threshold=threshold,
+            input_height,
+            input_width,
+            score_threshold=score_threshold,
         )
         if boxes.size == 0:
             return []
         boxes[:, :4] /= scale
         landmarks /= scale
-        height, width = image.shape[:2]
+        height, width = image_shape[:2]
         boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, width - 1)
         boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, height - 1)
         landmarks[:, :, 0] = np.clip(landmarks[:, :, 0], 0, width - 1)

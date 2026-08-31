@@ -12,7 +12,7 @@ from .schema import l2_normalize
 class FaceRecognizer:
     """Extract normalized identity embeddings from aligned 112x112 BGR faces."""
 
-    _SUPPORTED_MODELS = {"lvface", "mobilefacenet", "arcface"}
+    _SUPPORTED_MODELS = {"lvface", "mobilefacenet", "arcface", "adaface"}
 
     def __init__(self, backend: InferenceBackend, *, model_type: str = "lvface"):
         normalized = str(model_type).strip().lower().replace("-", "")
@@ -22,6 +22,8 @@ class FaceRecognizer:
             "mobilefacenet": "mobilefacenet",
             "mbf": "mobilefacenet",
             "arcface": "arcface",
+            "adaface": "adaface",
+            "adafaceir18": "adaface",
         }
         try:
             self.model_type = aliases[normalized]
@@ -41,8 +43,8 @@ class FaceRecognizer:
             raise ValueError(
                 "face recognizer expects an aligned BGR image with shape (112, 112, 3)"
             )
-        # LVFace's official ONNX example and InsightFace's ArcFace models use
-        # the same RGB CHW normalization to [-1, 1].
+        # The pinned LVFace, InsightFace and CVLFace AdaFace artifacts all use
+        # RGB CHW normalization to [-1, 1].
         rgb = cv2.cvtColor(aligned_face, cv2.COLOR_BGR2RGB)
         tensor = np.transpose(rgb, (2, 0, 1)).astype(np.float32)
         tensor = ((tensor / 255.0) - 0.5) / 0.5

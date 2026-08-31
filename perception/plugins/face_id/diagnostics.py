@@ -5,7 +5,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from .alignment import ARCFACE_112_TEMPLATE, estimate_face_transform
+from .alignment import alignment_rmse
 from .schema import FaceDetection, IdentityMatch
 
 
@@ -23,14 +23,7 @@ def detection_quality(
     eye_distance = float(
         np.linalg.norm(detection.landmarks[0] - detection.landmarks[1])
     )
-    matrix = estimate_face_transform(detection.landmarks)
-    homogeneous = np.column_stack(
-        [detection.landmarks, np.ones(5, dtype=np.float32)]
-    )
-    projected = homogeneous @ matrix.T
-    alignment_rmse = float(
-        np.sqrt(np.mean(np.sum((projected - ARCFACE_112_TEMPLATE) ** 2, axis=1)))
-    )
+    residual = alignment_rmse(detection.landmarks)
     gray = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
     eye_midpoint = (detection.landmarks[0] + detection.landmarks[1]) * 0.5
     yaw_proxy = float(
@@ -41,7 +34,7 @@ def detection_quality(
         [aligned[0], aligned[-1], aligned[:, 0], aligned[:, -1]], axis=0
     )
     return {
-        "alignment_rmse": round(alignment_rmse, 4),
+        "alignment_rmse": round(residual, 4),
         "bbox_area_ratio": round(
             box_width * box_height / max(1.0, image_width * image_height), 6
         ),

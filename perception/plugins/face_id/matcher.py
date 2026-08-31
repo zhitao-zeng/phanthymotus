@@ -76,6 +76,50 @@ class IdentityMatcher:
             return None
         return best
 
+    def rank_with_subcenter_rescue(
+        self,
+        embedding: np.ndarray,
+        *,
+        margin_max: float,
+        min_margin_gain: float,
+        top_k: int | None = None,
+    ) -> list[IdentityMatch]:
+        """Let exemplar/subcenter evidence overturn only a fragile Top-2 result."""
+
+        if margin_max < 0.0:
+            raise ValueError("subcenter rescue margin_max must be non-negative")
+        if min_margin_gain < 0.0:
+            raise ValueError("subcenter rescue margin gain must be non-negative")
+        if top_k is not None and top_k < 1:
+            raise ValueError("top_k must be at least 1")
+        requested = None if top_k is None else max(2, top_k)
+        baseline = self.rank(embedding, top_k=requested)
+        if len(baseline) < 2:
+            return baseline if top_k is None else baseline[:top_k]
+        baseline_margin = baseline[0].score - baseline[1].score
+        rescue_margin = baseline[1].subcenter_score - baseline[0].subcenter_score
+        if (
+            baseline_margin > margin_max
+            or rescue_margin < baseline_margin + min_margin_gain
+        ):
+            return baseline if top_k is None else baseline[:top_k]
+        reranked = [
+            IdentityMatch(
+                person_id=baseline[1].person_id,
+                score=baseline[1].subcenter_score,
+                centroid_score=baseline[1].centroid_score,
+                subcenter_score=baseline[1].subcenter_score,
+            ),
+            IdentityMatch(
+                person_id=baseline[0].person_id,
+                score=baseline[0].subcenter_score,
+                centroid_score=baseline[0].centroid_score,
+                subcenter_score=baseline[0].subcenter_score,
+            ),
+        ]
+        reranked.extend(baseline[2:])
+        return reranked if top_k is None else reranked[:top_k]
+
     @staticmethod
     def confidence(score: float) -> float:
         return float(np.clip((float(score) + 1.0) * 0.5, 0.0, 1.0))
