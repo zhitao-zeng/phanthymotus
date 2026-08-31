@@ -16,9 +16,10 @@ ARG JP_VERSION=511
 ARG ENABLE_VITS2_TRT=1
 ARG FACE_CPU_MODEL_BASE_URL=https://github.com/zhitao-zeng/phanthymotus/releases/download/face-id-models-v1
 ARG FACE_LVFACE_MODEL_URL=https://hf-mirror.com/bytedance-research/LVFace/resolve/b12702ab1f5c721748e054a66dc90e1edd1f0724/LVFace-T_Glint360K/LVFace-T_Glint360K.onnx
+ARG FACE_ADAFACE_MODEL_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/face-id-models-v2/adaface_ir18_webface4m.onnx
 
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
-ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT FACE_CPU_MODEL_BASE_URL FACE_LVFACE_MODEL_URL
+ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT FACE_CPU_MODEL_BASE_URL FACE_LVFACE_MODEL_URL FACE_ADAFACE_MODEL_URL
 
 # ── Everything that differs per JetPack line, resolved once ──────────────────
 # These facts used to be restated at each point of use — the numpy pin appeared
@@ -278,6 +279,11 @@ RUN mkdir -p /opt/phanthy-motus/models/face/lvface_cpu && \
     python3 -c "import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" \
       "${FACE_LVFACE_MODEL_URL}" /opt/phanthy-motus/models/face/lvface_cpu/lvface_t_glint360k.onnx && \
     echo "bf8da0e1e93c432d9a1d874a9ba0990f5859f970e8864b3990f2f33d11f9cdb3  /opt/phanthy-motus/models/face/lvface_cpu/lvface_t_glint360k.onnx" | sha256sum -c -
+
+RUN mkdir -p /opt/phanthy-motus/models/face/adaface_cpu && \
+    python3 -c "import shutil,sys,urllib.request; opener=urllib.request.build_opener(urllib.request.ProxyHandler({})); src=opener.open(sys.argv[1], timeout=120); dst=open(sys.argv[2], 'wb'); shutil.copyfileobj(src, dst); src.close(); dst.close()" \
+      "${FACE_ADAFACE_MODEL_URL}" /opt/phanthy-motus/models/face/adaface_cpu/adaface_ir18_webface4m.onnx && \
+    echo "2746c67f34fea1da389596635e6251f91812e29fc69748f68e823ef30cdd7bee  /opt/phanthy-motus/models/face/adaface_cpu/adaface_ir18_webface4m.onnx" | sha256sum -c -
 
 # ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
 # ldconfig shimmed for the same reason as the ffmpeg step above — this is the

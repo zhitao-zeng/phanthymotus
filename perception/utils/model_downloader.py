@@ -738,6 +738,41 @@ def ensure_face_lvface_cpu_model(model_dir: str) -> dict[str, str]:
     )
 
 
+FACE_ADAFACE_CPU_MODEL_FILES = {
+    "adaface_ir18_webface4m.onnx": {
+        "size": 96102446,
+        "sha256": "2746c67f34fea1da389596635e6251f91812e29fc69748f68e823ef30cdd7bee",
+    },
+}
+
+FACE_ADAFACE_CPU_DEFAULT_BASE = (
+    "http://172.28.4.81:34567/zengzhitao/embodied-ai/face-id-models-v2"
+)
+
+
+def ensure_face_adaface_cpu_model(model_dir: str) -> dict[str, str]:
+    """Ensure the fixed AdaFace IR18 ONNX used by the CPU control profile."""
+
+    model_dir = require_models_subpath(model_dir)
+    target_dir = os.path.join(model_dir, "adaface_cpu")
+    seed_dir = os.environ.get(
+        "FACE_ADAFACE_MODEL_SEED_DIR",
+        "/opt/phanthy-motus/models/face/adaface_cpu",
+    )
+    model_base = os.environ.get("FACE_ADAFACE_MODEL_BASE_URL", "").strip()
+    if _bundle_matches(seed_dir, FACE_ADAFACE_CPU_MODEL_FILES):
+        base_url = Path(seed_dir).resolve().as_uri()
+        log.info("[model_downloader] face: installing AdaFace from image seed")
+    elif model_base:
+        base_url = model_base.rstrip("/")
+    else:
+        base_url = FACE_ADAFACE_CPU_DEFAULT_BASE
+        log.info("[model_downloader] face: downloading AdaFace IR18 ONNX")
+    return ensure_verified_bundle(
+        "face/adaface_cpu", target_dir, base_url, FACE_ADAFACE_CPU_MODEL_FILES
+    )
+
+
 def ensure_verified_archive(name: str, model_dir: str, url: str, entry: dict) -> None:
     """Ensure a size/SHA256-pinned archive has been unpacked into model_dir.
 

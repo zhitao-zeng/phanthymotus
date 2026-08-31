@@ -615,6 +615,31 @@ def test_ensure_face_lvface_cpu_model_installs_verified_seed(tmp_path, monkeypat
     assert (target / "lvface_cpu" / "lvface.onnx").read_bytes() == b"recognizer"
 
 
+def test_ensure_face_adaface_cpu_model_installs_verified_seed(tmp_path, monkeypatch):
+    from utils import model_downloader
+
+    payloads = {"adaface.onnx": b"recognizer"}
+    seed = tmp_path / "seed"
+    target = tmp_path / "models" / "face"
+    seed.mkdir(parents=True)
+    (seed / "adaface.onnx").write_bytes(payloads["adaface.onnx"])
+    monkeypatch.setattr(
+        model_downloader,
+        "FACE_ADAFACE_CPU_MODEL_FILES",
+        _manifest(payloads),
+    )
+    monkeypatch.setenv("FACE_ADAFACE_MODEL_SEED_DIR", str(seed))
+    monkeypatch.delenv("FACE_ADAFACE_MODEL_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        model_downloader,
+        "require_models_subpath",
+        lambda path: str(target),
+    )
+    paths = model_downloader.ensure_face_adaface_cpu_model("/models/face")
+    assert set(paths) == set(payloads)
+    assert (target / "adaface_cpu" / "adaface.onnx").read_bytes() == b"recognizer"
+
+
 # ── SampledLogGate ───────────────────────────────────────────────────────────
 
 def test_sampled_log_gate_transitions_and_sampling():

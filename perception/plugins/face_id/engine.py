@@ -39,6 +39,15 @@ _RUNTIME_PROFILES = {
         "onnx_intra_op_threads": 1,
         "onnx_inter_op_threads": 1,
     },
+    "adaface_cpu": {
+        "backend": "opencv",
+        "detector_backend": "opencv",
+        "recognizer_backend": "onnx",
+        "recognizer": "adaface-ir18",
+        "onnx_providers": ["CPUExecutionProvider"],
+        "onnx_intra_op_threads": 1,
+        "onnx_inter_op_threads": 1,
+    },
 }
 
 
@@ -101,6 +110,12 @@ def _apply_runtime_profile(cfg: dict) -> dict:
             Path(str(cfg.get("model_dir", "/models/face")))
             / "lvface_cpu"
             / "lvface_t_glint360k.onnx"
+        )
+    if profile_name == "adaface_cpu" and not cfg.get("recognizer_model"):
+        resolved["recognizer_model"] = str(
+            Path(str(cfg.get("model_dir", "/models/face")))
+            / "adaface_cpu"
+            / "adaface_ir18_webface4m.onnx"
         )
     return resolved
 
@@ -633,6 +648,14 @@ def build_face_engine(cfg: dict) -> FaceIdentityEngine:
         from utils.model_downloader import ensure_face_lvface_cpu_model
 
         ensure_face_lvface_cpu_model(str(cfg.get("model_dir", "/models/face")))
+    if (
+        recognizer_type in {"adaface", "adaface-ir18"}
+        and recognizer_backend_name == "onnx"
+        and not Path(str(cfg.get("recognizer_model", ""))).is_file()
+    ):
+        from utils.model_downloader import ensure_face_adaface_cpu_model
+
+        ensure_face_adaface_cpu_model(str(cfg.get("model_dir", "/models/face")))
     detector_path = _resolve_model_path(
         cfg,
         key="detector_model",

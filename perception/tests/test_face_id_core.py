@@ -78,6 +78,11 @@ def test_runtime_profiles_share_detector_and_select_recognizer_backend():
     assert lvface["recognizer_backend"] == "onnx"
     assert lvface["recognizer"] == "lvface"
     assert lvface["onnx_intra_op_threads"] == 1
+    adaface = _apply_runtime_profile({"runtime_profile": "adaface_cpu"})
+    assert adaface["detector_backend"] == "opencv"
+    assert adaface["recognizer_backend"] == "onnx"
+    assert adaface["recognizer"] == "adaface-ir18"
+    assert adaface["onnx_intra_op_threads"] == 1
 
 
 def _scrfd_outputs(input_size=64):
