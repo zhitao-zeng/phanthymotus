@@ -162,7 +162,7 @@ class LocalDistanceAdapter:
             self._cfg.get("model_dir", "/models/obstacle/zipdepth-int8")
         )
         for key, filename in (
-            ("indoor_depth_engine", "zipdepth-base-npu-512x384-int8.engine"),
+            ("indoor_depth_engine", "indoor-metric.engine"),
             ("vehicle_depth_engine", "yolo26n-depth-int8.engine"),
             ("segmentation_engine", "yolo26n-seg-int8.engine"),
         ):
