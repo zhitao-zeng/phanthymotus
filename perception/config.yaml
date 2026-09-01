@@ -64,14 +64,16 @@ plugins:
   obstacle:
     enabled: true
     provider: local
-    # Route supported deployment image sizes to their model domains.
-    scene_mode: resolution
+    # V4 mixes indoor and vehicle JPGs without passing per-frame scene metadata.
+    # Route from image pixels; OBSTACLE_FIXED_SCENE can still override this for
+    # an explicitly single-domain deployment.
+    scene_mode: content
     unload_inactive_scene: true
-    resolution_scene_map:
-      "640x480": indoor
-      "1600x900": vehicle
     fixed_scene: ""
     model_dir: /models/obstacle/zipdepth-int8
+    scene_router_model: /models/obstacle/zipdepth-int8/resnet18_places365-static-qoperator-int8.onnx
+    scene_router_io_labels: /models/obstacle/zipdepth-int8/IO_places365.txt
+    scene_router_top_k: 3
     decision_threshold_m: 2.0
     fallback_distance_m: 3.0
     soft_timeout_s: 2.5

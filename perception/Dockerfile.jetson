@@ -122,8 +122,8 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 # ── OCR runtime deps (PP-OCRv6 TensorRT engines; TensorRT/CUDA come from base) ──
 # libvips42 (apt, above) is the runtime library pyvips dlopens for JPEG decode
 # + downscale; rapidocr is used --no-deps for its pure-Python DB/CTC post-
-# processing only (its bundled ONNX models are deleted, onnxruntime is not
-# installed). Every package is version-pinned; six and Pillow are NOT listed
+# processing only (its bundled ONNX models are deleted; the scene-router step
+# below owns the ONNX Runtime version). Every package is version-pinned; six and Pillow are NOT listed
 # because both bases already ship them (jp511: 1.14.0/10.4.0 via the VOP
 # layer, jp61: 1.16.0/9.0.1) and re-listing them unpinned would make the
 # resolution nondeterministic. numpy is pinned to the version each JetPack's
@@ -138,6 +138,17 @@ RUN if [ "${JP_VERSION}" = "61" ]; then NUMPY_VERSION=1.26.4; else NUMPY_VERSION
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} "pyvips==3.1.0" && \
     RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
     find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete
+
+# CPU scene routing for mixed indoor/vehicle JPG input. JP511 remains on the
+# last release with a Python 3.8 aarch64 wheel; JP6 uses the proven 1.23 line.
+RUN if [ "${JP_VERSION}" = "61" ]; then \
+      NUMPY_VERSION=1.26.4; ORT_VERSION=1.23.2; \
+    else \
+      NUMPY_VERSION=1.24.4; ORT_VERSION=1.17.3; \
+    fi; \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+      "numpy==${NUMPY_VERSION}" "onnxruntime==${ORT_VERSION}" && \
+    python3 -c "import numpy, onnxruntime; assert numpy.__version__ == '${NUMPY_VERSION}'; print('[build] scene router ORT ' + onnxruntime.__version__)"
 
 # ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
 # ldconfig shimmed for the same reason as the ffmpeg step above — this is the

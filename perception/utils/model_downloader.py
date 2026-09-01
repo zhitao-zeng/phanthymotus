@@ -566,6 +566,22 @@ OBSTACLE_MODEL_BUNDLES = {
     },
 }
 
+OBSTACLE_SCENE_ROUTER_BASE = os.environ.get(
+    "OBSTACLE_SCENE_ROUTER_BASE_URL",
+    "http://172.28.4.81:34567/zengzhitao/embodied-ai/"
+    "obstacle-distance/zipdepth-int8-jp6-trt10.4",
+)
+OBSTACLE_SCENE_ROUTER_FILES = {
+    "resnet18_places365-static-qoperator-int8.onnx": {
+        "size": 11495285,
+        "sha256": "eb4d668a92398b604dcc563423baf213a78b9d1cdaee012666fcd97adb0486ea",
+    },
+    "IO_places365.txt": {
+        "size": 6214,
+        "sha256": "49f8c7fbeeb70deb055c040a1807a95b234bbac92902e1b6edfffbdd8411e1f1",
+    },
+}
+
 
 def ensure_ocr_model(model_dir: str, family: str | None = None) -> dict[str, str]:
     """Ensure the OCR TensorRT bundle matching the runtime TensorRT is present."""
@@ -731,6 +747,15 @@ def ensure_obstacle_models(
     key = select_bundle_family(OBSTACLE_MODEL_BUNDLES, family)
     entry = OBSTACLE_MODEL_BUNDLES[key]
     log.info(f"[model_downloader] obstacle: using {key} bundle")
-    return ensure_verified_bundle(
+    paths = ensure_verified_bundle(
         f"obstacle/{key}", model_dir, entry["base_url"], entry["files"]
     )
+    paths.update(
+        ensure_verified_bundle(
+            "obstacle/scene-router",
+            model_dir,
+            OBSTACLE_SCENE_ROUTER_BASE,
+            OBSTACLE_SCENE_ROUTER_FILES,
+        )
+    )
+    return paths

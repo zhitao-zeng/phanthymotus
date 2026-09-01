@@ -92,11 +92,13 @@ class LocalDistanceAdapter:
         from .obstacle_distance_core.zipdepth_tensorrt_backends import (
             create_backends,
         )
+        from .obstacle_distance_core.places365_router import create_scene_router
         from utils.model_downloader import ensure_obstacle_models
 
         self._cfg = deepcopy(cfg or {})
         scene_mode = self._cfg.get("scene_mode", "fixed")
         environment_scene = os.environ.get("OBSTACLE_FIXED_SCENE")
+        self._scene_router = None
         self._resolution_scene_map: dict[tuple[int, int], str] = {}
         if environment_scene or scene_mode == "fixed":
             configured_scene = (
@@ -147,10 +149,14 @@ class LocalDistanceAdapter:
             # Unknown resolutions must produce missing_scene rather than silently
             # falling back to a stale fixed_scene value.
             self._cfg["fixed_scene"] = None
+        elif scene_mode == "content":
+            self._scene_hint = None
+            self._scene_mode = "content"
+            self._cfg["fixed_scene"] = None
         else:
             raise ValueError(
                 "obstacle ROS input has no scene metadata; scene_mode must be "
-                "fixed or resolution"
+                "fixed, content, or resolution"
             )
         engine_paths = ensure_obstacle_models(
             self._cfg.get("model_dir", "/models/obstacle/zipdepth-int8")
@@ -161,6 +167,16 @@ class LocalDistanceAdapter:
             ("segmentation_engine", "yolo26n-seg-int8.engine"),
         ):
             self._cfg.setdefault(key, engine_paths[filename])
+        if self._scene_mode == "content":
+            for key, filename in (
+                (
+                    "scene_router_model",
+                    "resnet18_places365-static-qoperator-int8.onnx",
+                ),
+                ("scene_router_io_labels", "IO_places365.txt"),
+            ):
+                self._cfg.setdefault(key, engine_paths[filename])
+            self._scene_router = create_scene_router(self._cfg)
         depth_backend, segmentation_backend = create_backends(self._cfg)
         self._backends = (depth_backend, segmentation_backend)
         self._estimator = ObstacleDistanceEstimator(
@@ -171,6 +187,7 @@ class LocalDistanceAdapter:
 
     def close(self) -> None:
         """Release the TensorRT engines held by the backends."""
+        self._scene_router = None
         backends = getattr(self, "_backends", ())
         self._backends = ()
         for backend in backends:
@@ -202,6 +219,8 @@ class LocalDistanceAdapter:
             else:
                 height, width = image.shape[:2]
                 scene_hint = self._resolution_scene_map.get((width, height))
+        elif self._scene_mode == "content":
+            scene_hint = self._scene_router.predict(image_bytes).value
         result = self._estimator.estimate(
             estimator_image_bytes,
             scene_hint=scene_hint,
