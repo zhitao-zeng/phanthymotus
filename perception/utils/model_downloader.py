@@ -56,13 +56,44 @@ MODELS = {
         "check_file": "tokens.txt",
     },
     "asr_x_asr": {
-        # Domain-adapted weights with the packaged wake-word hotword list.
-        "url": (
+        # Released X-ASR epoch-99 base weights with the general robot343 hotword
+        # list. Pin every file so deployments cannot follow a moving ModelScope
+        # branch.
+        "base_url": (
             "https://www.modelscope.cn/models/Flame4pd/"
             "x-asr-zh-en-punct-int8-robot/resolve/"
-            "0e1b721f9433e9c750d3857233372fddfe9e8bd3/"
-            "x-asr-c200-robot343-v1.zip"
+            "e111bb210b1aad07c6a16b75adb61b80ee841990"
         ),
+        "files": {
+            "encoder-epoch-99-avg-1.int8.onnx": {
+                "size": 161015713,
+                "sha256": "7f6aa62056efd8af9da13e0faa81cd3f284d2fb2e3b63de56fd2dfd3450910dc",
+            },
+            "decoder-epoch-99-avg-1.onnx": {
+                "size": 11309084,
+                "sha256": "72f47405d3c1033bebccbef82f90071e7b4ba3e71b9c986f2b74244b25723aed",
+            },
+            "joiner-epoch-99-avg-1.int8.onnx": {
+                "size": 2581422,
+                "sha256": "aedb7fa697b2ab43f20499826fff7c997eea7d67db77be97769aeeeb726e63b3",
+            },
+            "tokens.txt": {
+                "size": 58806,
+                "sha256": "b818a60878b9aae978cbb8ad594acbd403d76d1af2e31ef4197c84e2dbdba27c",
+            },
+            "bpe.model": {
+                "size": 119265,
+                "sha256": "f87a38025a5fdd1e4e9591f6a44bb81295097ce0b80df6f4ab9f44e52c64ca5f",
+            },
+            "bpe.vocab": {
+                "size": 69594,
+                "sha256": "28fc94d67aae53d8c58010fcfb16fc8c2f8dd263e03f3490c98210e354e8f914",
+            },
+            "hotwords.txt": {
+                "size": 3496,
+                "sha256": "202f2558ca13e19578d69c9c4b1e9402974efc9b0e35774f0ca24372cf063708",
+            },
+        },
         "check_file": "tokens.txt",
     },
     "tts": {
@@ -113,6 +144,11 @@ def ensure_model(name: str, model_dir: str) -> None:
     info = MODELS.get(name)
     if not info:
         raise ValueError(f"Unknown model name: {name}")
+
+    files = info.get("files")
+    if files:
+        ensure_verified_bundle(name, model_dir, info["base_url"], files)
+        return
 
     check_path = os.path.join(model_dir, info["check_file"])
     if os.path.exists(check_path):

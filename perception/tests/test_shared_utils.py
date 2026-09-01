@@ -491,6 +491,35 @@ def test_ensure_verified_bundle_retries_then_fails(tmp_path, monkeypatch):
     assert not (tmp_path / "m" / "det.engine").exists()
 
 
+def test_ensure_model_routes_file_manifests_to_verified_bundle(tmp_path, monkeypatch):
+    manifest = {"tokens.txt": {"size": 6, "sha256": "abc"}}
+    calls = []
+
+    monkeypatch.setitem(
+        model_downloader.MODELS,
+        "asr_verified",
+        {
+            "base_url": "https://example.invalid/revision",
+            "files": manifest,
+            "check_file": "tokens.txt",
+        },
+    )
+    monkeypatch.setattr(
+        model_downloader,
+        "ensure_verified_bundle",
+        lambda name, model_dir, base_url, files: calls.append(
+            (name, model_dir, base_url, files)
+        ),
+    )
+
+    model_dir = str(tmp_path / "asr")
+    model_downloader.ensure_model("asr_verified", model_dir)
+
+    assert calls == [
+        ("asr_verified", model_dir, "https://example.invalid/revision", manifest)
+    ]
+
+
 def test_select_bundle_family(tmp_path, monkeypatch):
     bundles = {
         "jp511": {"base_url": "https://x/jp511", "files": {}},
