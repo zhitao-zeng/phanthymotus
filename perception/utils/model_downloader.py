@@ -582,6 +582,32 @@ OBSTACLE_SCENE_ROUTER_FILES = {
     },
 }
 
+OBSTACLE_INDOOR_MODEL_BASE = os.environ.get(
+    "OBSTACLE_INDOOR_MODEL_BASE_URL",
+    "http://172.28.4.81:34567/zengzhitao/embodied-ai/"
+    "obstacle-distance/v4-indoor-dav2-small-epoch8",
+)
+OBSTACLE_INDOOR_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{OBSTACLE_INDOOR_MODEL_BASE}/jp61",
+        "files": {
+            "indoor-metric.engine": {
+                "size": 52033404,
+                "sha256": "f8f4b9631afbe5a19c17e8f1292e3c6f1553bb7797d743f4b5db7227193b4cb4",
+            },
+        },
+    },
+    "jp511": {
+        "base_url": f"{OBSTACLE_INDOOR_MODEL_BASE}/jp511",
+        "files": {
+            "indoor-metric.engine": {
+                "size": 51497923,
+                "sha256": "a4d2d5c70378e1920ed37a9c47f80aa0d9102b5a7d68305dda4635145009cb9c",
+            },
+        },
+    },
+}
+
 
 def ensure_ocr_model(model_dir: str, family: str | None = None) -> dict[str, str]:
     """Ensure the OCR TensorRT bundle matching the runtime TensorRT is present."""
@@ -749,6 +775,15 @@ def ensure_obstacle_models(
     log.info(f"[model_downloader] obstacle: using {key} bundle")
     paths = ensure_verified_bundle(
         f"obstacle/{key}", model_dir, entry["base_url"], entry["files"]
+    )
+    indoor_entry = OBSTACLE_INDOOR_MODEL_BUNDLES[key]
+    paths.update(
+        ensure_verified_bundle(
+            f"obstacle/indoor/{key}",
+            model_dir,
+            indoor_entry["base_url"],
+            indoor_entry["files"],
+        )
     )
     paths.update(
         ensure_verified_bundle(

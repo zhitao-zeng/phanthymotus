@@ -1,9 +1,7 @@
-"""Independent TensorRT backends for ZipDepth indoor decisions and YOLO vehicle depth.
+"""Independent TensorRT backends for indoor and vehicle depth.
 
-ZipDepth predicts affine-invariant inverse depth, not metric depth. The indoor
-branch converts a calibrated ROI statistic to a distance while preserving the
-configured decision boundary. Vehicle images use metric YOLO depth and
-segmentation.
+The indoor engine may provide the legacy affine-invariant ZipDepth output or a
+direct metric depth map. Vehicle images use metric YOLO depth and segmentation.
 """
 
 from __future__ import annotations
@@ -129,39 +127,27 @@ class ZipDepthYoloTensorRTDepthBackend:
         self._reference_width = _positive_integer(
             reference_size[1], name="ZipDepth ROI reference width"
         )
-        self._percentile = _finite_number(
-            indoor_config.get("inverse_depth_percentile", 95.0),
-            name="ZipDepth percentile",
-            minimum=0.0,
-            maximum=100.0,
-        )
-        self._score_threshold = _finite_number(
-            indoor_config.get("score_threshold", -0.06),
-            name="ZipDepth score threshold",
-        )
-        score_offsets = indoor_config.get("score_offset_by_runtime", {})
-        if not isinstance(score_offsets, Mapping):
+        self._indoor_output_semantics = str(
+            indoor_config.get("output_semantics", "inverse_depth")
+        ).strip().lower()
+        if self._indoor_output_semantics not in {"inverse_depth", "metric_depth"}:
             raise ObstacleDistanceError(
                 ErrorCode.MODEL_ERROR,
-                "ZipDepth runtime score offsets must be a mapping",
+                "indoor depth output semantics are invalid",
             )
-        self._score_offset = _finite_number(
-            score_offsets.get(tensorrt_family(), 0.0),
-            name="ZipDepth runtime score offset",
+        percentile_key = (
+            "depth_percentile"
+            if self._indoor_output_semantics == "metric_depth"
+            else "inverse_depth_percentile"
         )
-        self._distance_scale = _finite_number(
-            indoor_config.get(
-                "inverse_depth_distance_scale",
-                -27.0,
-            ),
-            name="ZipDepth distance scale",
+        percentile_default = (
+            1.0 if self._indoor_output_semantics == "metric_depth" else 95.0
         )
-        self._distance_bias_m = _finite_number(
-            indoor_config.get(
-                "inverse_depth_distance_bias_m",
-                3.7,
-            ),
-            name="ZipDepth distance bias",
+        self._percentile = _finite_number(
+            indoor_config.get(percentile_key, percentile_default),
+            name="indoor depth percentile",
+            minimum=0.0,
+            maximum=100.0,
         )
         self._decision_threshold_m = _finite_number(
             decision_threshold_m,
@@ -173,16 +159,6 @@ class ZipDepthYoloTensorRTDepthBackend:
                 ErrorCode.MODEL_ERROR,
                 "obstacle decision threshold is invalid",
             )
-        self._classification_margin_m = _finite_number(
-            indoor_config.get("classification_margin_m", 0.001),
-            name="ZipDepth classification margin",
-            minimum=0.0,
-        )
-        if not 0 < self._classification_margin_m < self._decision_threshold_m:
-            raise ObstacleDistanceError(
-                ErrorCode.MODEL_ERROR,
-                "ZipDepth classification margin is invalid",
-            )
         self._min_output_distance_m = _finite_number(
             indoor_config.get("min_output_distance_m", 0.0),
             name="ZipDepth minimum output distance",
@@ -193,15 +169,53 @@ class ZipDepthYoloTensorRTDepthBackend:
             name="ZipDepth maximum output distance",
             minimum=0.0,
         )
-        if (
-            self._min_output_distance_m
-            > self._decision_threshold_m - self._classification_margin_m
-            or self._max_output_distance_m < self._decision_threshold_m
-        ):
+        if self._min_output_distance_m >= self._max_output_distance_m:
             raise ObstacleDistanceError(
                 ErrorCode.MODEL_ERROR,
-                "ZipDepth output range is incompatible with the decision threshold",
+                "indoor depth output range is invalid",
             )
+        if self._indoor_output_semantics == "inverse_depth":
+            self._score_threshold = _finite_number(
+                indoor_config.get("score_threshold", -0.06),
+                name="ZipDepth score threshold",
+            )
+            score_offsets = indoor_config.get("score_offset_by_runtime", {})
+            if not isinstance(score_offsets, Mapping):
+                raise ObstacleDistanceError(
+                    ErrorCode.MODEL_ERROR,
+                    "ZipDepth runtime score offsets must be a mapping",
+                )
+            self._score_offset = _finite_number(
+                score_offsets.get(tensorrt_family(), 0.0),
+                name="ZipDepth runtime score offset",
+            )
+            self._distance_scale = _finite_number(
+                indoor_config.get("inverse_depth_distance_scale", -27.0),
+                name="ZipDepth distance scale",
+            )
+            self._distance_bias_m = _finite_number(
+                indoor_config.get("inverse_depth_distance_bias_m", 3.7),
+                name="ZipDepth distance bias",
+            )
+            self._classification_margin_m = _finite_number(
+                indoor_config.get("classification_margin_m", 0.001),
+                name="ZipDepth classification margin",
+                minimum=0.0,
+            )
+            if not 0 < self._classification_margin_m < self._decision_threshold_m:
+                raise ObstacleDistanceError(
+                    ErrorCode.MODEL_ERROR,
+                    "ZipDepth classification margin is invalid",
+                )
+            if (
+                self._min_output_distance_m
+                > self._decision_threshold_m - self._classification_margin_m
+                or self._max_output_distance_m < self._decision_threshold_m
+            ):
+                raise ObstacleDistanceError(
+                    ErrorCode.MODEL_ERROR,
+                    "ZipDepth output range is incompatible with the decision threshold",
+                )
         self._min_valid_pixels = _positive_integer(
             indoor_config.get("min_valid_pixels", 64),
             name="ZipDepth minimum valid pixels",
@@ -331,21 +345,33 @@ class ZipDepthYoloTensorRTDepthBackend:
                 ErrorCode.MODEL_ERROR,
                 "ZipDepth TensorRT engine must have one output",
             )
-        inverse_depth = np.asarray(outputs[0]).squeeze()
-        if inverse_depth.ndim != 2:
+        depth_output = np.asarray(outputs[0]).squeeze()
+        if depth_output.ndim != 2:
             raise ObstacleDistanceError(
                 ErrorCode.INVALID_DEPTH,
-                "ZipDepth output must be a two-dimensional map",
+                "indoor depth output must be a two-dimensional map",
             )
-        inverse_depth = _resize_align_corners(inverse_depth, height, width)
+        depth_output = _resize_align_corners(depth_output, height, width)
         r0, r1, c0, c1 = self._scaled_roi(height, width)
-        values = inverse_depth[r0:r1, c0:c1]
+        values = depth_output[r0:r1, c0:c1]
         values = values[np.isfinite(values)]
         if values.size < self._min_valid_pixels:
             raise ObstacleDistanceError(
                 ErrorCode.NO_VALID_DEPTH,
-                "ZipDepth ROI does not contain enough valid values",
+                "indoor depth ROI does not contain enough valid values",
             )
+        if self._indoor_output_semantics == "metric_depth":
+            distance_m = float(np.percentile(values, self._percentile))
+            distance_m = float(
+                np.clip(
+                    distance_m,
+                    self._min_output_distance_m,
+                    self._max_output_distance_m,
+                )
+            )
+            check_deadline(deadline_monotonic)
+            return distance_m
+
         inverse_depth_percentile = float(
             np.percentile(values, self._percentile)
         )

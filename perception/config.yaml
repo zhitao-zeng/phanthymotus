@@ -80,15 +80,9 @@ plugins:
     indoor:
       roi: [0, 300, 213, 426]
       roi_reference_size: [480, 640]
-      inverse_depth_percentile: 95.0
-      score_threshold: -0.06
-      score_offset_by_runtime:
-        jp511: 0.011
-      # Convert the ZipDepth inverse-depth ROI statistic to a bounded distance.
-      inverse_depth_distance_scale: -27.0
-      inverse_depth_distance_bias_m: 3.7
-      classification_margin_m: 0.001
-      min_output_distance_m: 0.0
+      output_semantics: metric_depth
+      depth_percentile: 1.0
+      min_output_distance_m: 0.3
       max_output_distance_m: 10.0
       min_valid_pixels: 64
     vehicle:
