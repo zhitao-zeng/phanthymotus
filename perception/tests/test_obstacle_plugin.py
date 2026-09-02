@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import threading
 import time
+from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,6 +28,12 @@ from vision_stubs import (  # noqa: F401
 # ── Obstacle ─────────────────────────────────────────────────────────────────
 
 import plugins.obstacle as obstacle_plugin  # noqa: E402
+from plugins.obstacle_distance_core.contracts import (  # noqa: E402
+    ErrorCode,
+    ObstacleDistanceError,
+    SceneDomain,
+    SceneRouteDecision,
+)
 
 
 class _FakeDistanceAdapter:
@@ -67,6 +75,212 @@ def _make_obstacle(monkeypatch, builder=None, cfg=None):
         dict(cfg or {"provider": "local"}), executor
     )
     return plugin, executor, builder
+
+
+def test_local_adapter_publishes_content_route_and_backend_metadata():
+    adapter = object.__new__(obstacle_plugin.LocalDistanceAdapter)
+    adapter._scene_hint = None
+    adapter._scene_mode = "content"
+    adapter._cfg = {
+        "indoor": {"backend_name": "zipdepth_distill_e8"}
+    }
+    adapter._requested_indoor_backend = "zipdepth_distill_e8"
+    backend_metadata = {
+        "actual": "zipdepth_distill_e8",
+        "reason": None,
+    }
+    adapter._depth_backend_router = SimpleNamespace(
+        begin_request=lambda: None,
+        request_metadata=lambda: (
+            backend_metadata["actual"],
+            backend_metadata["reason"],
+        ),
+    )
+    adapter._scene_router = SimpleNamespace(
+        predict_decision=lambda _: SceneRouteDecision(
+            domain=SceneDomain.INDOOR,
+            confidence=0.8,
+            top1_index=10,
+            top1_probability=0.4,
+            top2_index=20,
+            top2_probability=0.25,
+            top1_top2_margin=0.15,
+            outdoor_vote=1 / 3,
+            outdoor_probability=0.2,
+        )
+    )
+    adapter._estimator = SimpleNamespace(
+        estimate=lambda *_args, **_kwargs: SimpleNamespace(
+            distance_m=1.5,
+            near_obstacle=True,
+            scene="indoor",
+            status="ok",
+            error_code=None,
+            fallback=False,
+            approximate_geometry=False,
+            latency_ms=12.0,
+            cold_start=False,
+            timeout_budget_ms=2500.0,
+        )
+    )
+
+    result = adapter.estimate(b"jpeg")
+
+    assert result["route_label"] == "indoor"
+    assert result["route_confidence"] == pytest.approx(0.8)
+    assert result["route_margin"] == pytest.approx(0.15)
+    assert result["requested_backend"] == "zipdepth_distill_e8"
+    assert result["actual_backend"] == "zipdepth_distill_e8"
+    assert result["backend_fallback_reason"] is None
+
+    adapter._estimator = SimpleNamespace(
+        estimate=lambda *_args, **_kwargs: SimpleNamespace(
+            distance_m=3.0,
+            near_obstacle=False,
+            scene="indoor",
+            status="error",
+            error_code="timeout",
+            fallback=True,
+            approximate_geometry=False,
+            latency_ms=2500.0,
+            cold_start=True,
+            timeout_budget_ms=6000.0,
+        )
+    )
+    backend_metadata.update(actual=None, reason="timeout")
+    fallback = adapter.estimate(b"jpeg")
+    assert fallback["requested_backend"] == "zipdepth_distill_e8"
+    assert fallback["actual_backend"] is None
+    assert fallback["backend_fallback_reason"] == "timeout"
+    assert fallback["cold_start"] is True
+    assert fallback["timeout_budget_ms"] == pytest.approx(6000.0)
+
+
+def test_indoor_backend_falls_back_to_legacy_on_model_error_only():
+    class Primary:
+        def predict_indoor_distance(self, *_args):
+            raise ObstacleDistanceError(ErrorCode.MODEL_ERROR, "load failed")
+
+        def predict_depth(self, *_args):
+            raise AssertionError
+
+    class Legacy:
+        def predict_indoor_distance(self, *_args):
+            return 1.25
+
+    backend = obstacle_plugin._IndoorFallbackDepthBackend(
+        Primary(),
+        requested_name="dav2_e8",
+        fallback=Legacy(),
+        fallback_name="legacy",
+    )
+    backend.begin_request()
+
+    assert backend.predict_indoor_distance(b"jpeg", 10.0) == pytest.approx(1.25)
+    assert backend.request_metadata() == ("legacy", "model_error")
+
+    class TimeoutPrimary(Primary):
+        def predict_indoor_distance(self, *_args):
+            raise ObstacleDistanceError(ErrorCode.TIMEOUT, "too slow")
+
+    backend = obstacle_plugin._IndoorFallbackDepthBackend(
+        TimeoutPrimary(),
+        requested_name="dav2_e8",
+        fallback=Legacy(),
+        fallback_name="legacy",
+    )
+    backend.begin_request()
+    with pytest.raises(ObstacleDistanceError) as error:
+        backend.predict_indoor_distance(b"jpeg", 10.0)
+    assert error.value.code is ErrorCode.TIMEOUT
+    assert backend.request_metadata() == (None, "timeout")
+
+
+def test_local_adapter_selects_profile_and_builds_legacy_fallback(monkeypatch):
+    import plugins.obstacle_distance_core.estimator as estimator_module
+    import plugins.obstacle_distance_core.zipdepth_tensorrt_backends as trt_module
+    import utils.model_downloader as downloader
+
+    paths = {
+        "zipdepth-base-npu-512x384-int8.engine": "/models/legacy.engine",
+        "indoor-zipdepth-distill-e8.engine": "/models/zip.engine",
+        "indoor-dav2-e8.engine": "/models/dav2.engine",
+        "yolo26n-depth-int8.engine": "/models/depth.engine",
+        "yolo26n-seg-int8.engine": "/models/seg.engine",
+    }
+    monkeypatch.setattr(downloader, "ensure_obstacle_models", lambda _: paths)
+    captured = {}
+
+    class FakeDepth:
+        def __init__(self, name):
+            self.name = name
+
+        def predict_depth(self, *_args):
+            raise AssertionError
+
+        def predict_indoor_distance(self, *_args):
+            return 1.0
+
+        def close(self):
+            pass
+
+    class FakeSeg:
+        def predict_instances(self, *_args):
+            return ()
+
+        def close(self):
+            pass
+
+    def fake_create_backends(config):
+        captured["primary_config"] = deepcopy(config)
+        return FakeDepth("primary"), FakeSeg()
+
+    def fake_fallback(indoor_engine, vehicle_engine, **kwargs):
+        captured["fallback_engine"] = indoor_engine
+        captured["fallback_config"] = deepcopy(kwargs["indoor_config"])
+        return FakeDepth("fallback")
+
+    monkeypatch.setattr(trt_module, "create_backends", fake_create_backends)
+    monkeypatch.setattr(
+        trt_module, "ZipDepthYoloTensorRTDepthBackend", fake_fallback
+    )
+    monkeypatch.setattr(
+        estimator_module,
+        "ObstacleDistanceEstimator",
+        lambda depth, segmentation, config: SimpleNamespace(),
+    )
+    cfg = {
+        "provider": "local",
+        "scene_mode": "fixed",
+        "fixed_scene": "indoor",
+        "model_dir": "/models/obstacle",
+        "decision_threshold_m": 2.0,
+        "indoor": {
+            "backend_name": "dav2_e8",
+            "fallback_backend": "legacy",
+            "roi": [0, 300, 213, 426],
+            "roi_reference_size": [480, 640],
+            "backend_profiles": {
+                "dav2_e8": {
+                    "engine_file": "indoor-dav2-e8.engine",
+                    "output_semantics": "metric_depth",
+                },
+                "legacy": {
+                    "engine_file": "zipdepth-base-npu-512x384-int8.engine",
+                    "output_semantics": "inverse_depth",
+                },
+            },
+        },
+    }
+
+    adapter = obstacle_plugin.LocalDistanceAdapter(cfg)
+
+    assert captured["primary_config"]["indoor_depth_engine"] == "/models/dav2.engine"
+    assert captured["primary_config"]["indoor"]["backend_name"] == "dav2_e8"
+    assert captured["primary_config"]["indoor"]["output_semantics"] == "metric_depth"
+    assert captured["fallback_engine"] == "/models/legacy.engine"
+    assert captured["fallback_config"]["output_semantics"] == "inverse_depth"
+    assert adapter._requested_indoor_backend == "dav2_e8"
 
 
 def _obstacle_start_and_wait(plugin, executor, topic, instance_id="", count=1):

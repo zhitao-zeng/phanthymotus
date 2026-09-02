@@ -78,6 +78,33 @@ plugins:
     fallback_distance_m: 3.0
     soft_timeout_s: 2.5
     indoor:
+      backend_name: zipdepth_distill_e8
+      fallback_backend: legacy
+      backend_profiles:
+        legacy:
+          engine_file: zipdepth-base-npu-512x384-int8.engine
+          output_semantics: inverse_depth
+          inverse_depth_percentile: 95.0
+          score_threshold: -0.06
+          score_offset_by_runtime:
+            jp511: 0.011
+          inverse_depth_distance_scale: -27.0
+          inverse_depth_distance_bias_m: 3.7
+          classification_margin_m: 0.001
+          min_output_distance_m: 0.0
+          max_output_distance_m: 10.0
+        zipdepth_distill_e8:
+          engine_file: indoor-zipdepth-distill-e8.engine
+          output_semantics: metric_depth
+          depth_percentile: 1.0
+          min_output_distance_m: 0.3
+          max_output_distance_m: 10.0
+        dav2_e8:
+          engine_file: indoor-dav2-e8.engine
+          output_semantics: metric_depth
+          depth_percentile: 1.0
+          min_output_distance_m: 0.3
+          max_output_distance_m: 10.0
       roi: [0, 300, 213, 426]
       roi_reference_size: [480, 640]
       output_semantics: metric_depth

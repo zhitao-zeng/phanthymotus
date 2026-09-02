@@ -12,6 +12,19 @@ class SceneDomain(str, Enum):
     VEHICLE = "vehicle"
 
 
+@dataclass(frozen=True)
+class SceneRouteDecision:
+    domain: SceneDomain
+    confidence: float
+    top1_index: int
+    top1_probability: float
+    top2_index: int
+    top2_probability: float
+    top1_top2_margin: float
+    outdoor_vote: float
+    outdoor_probability: float
+
+
 class ErrorCode(str, Enum):
     INVALID_IMAGE = "invalid_image"
     MISSING_SCENE = "missing_scene"

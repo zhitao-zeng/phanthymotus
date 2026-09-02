@@ -25,7 +25,11 @@ from utils.log_sampling import SampledLogGate, escape_log_text
 from utils.qos import CAMERA_QOS
 from utils.ros_lifecycle import dispose_node
 
-from .obstacle_distance_core.contracts import SceneDomain
+from .obstacle_distance_core.contracts import (
+    ErrorCode,
+    ObstacleDistanceError,
+    SceneDomain,
+)
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +83,89 @@ TOOLS = [
 # ── Distance Estimation Pipeline ──────────────────────────────────────────────
 
 
+class _IndoorFallbackDepthBackend:
+    """Select one Indoor expert and optionally fall back to legacy on errors.
+
+    Vehicle depth always delegates to the selected backend. Metadata is kept
+    thread-local because one adapter may serve more than one ROS worker.
+    """
+
+    _FALLBACK_CODES = {
+        ErrorCode.MODEL_ERROR,
+        ErrorCode.INVALID_DEPTH,
+        ErrorCode.NO_VALID_DEPTH,
+    }
+
+    def __init__(
+        self,
+        primary,
+        *,
+        requested_name: str,
+        fallback=None,
+        fallback_name: str | None = None,
+    ) -> None:
+        self._primary = primary
+        self._requested_name = requested_name
+        self._fallback = fallback
+        self._fallback_name = fallback_name
+        self._request = threading.local()
+
+    def begin_request(self) -> None:
+        self._request.actual_backend = None
+        self._request.fallback_reason = None
+
+    def request_metadata(self) -> tuple[str | None, str | None]:
+        return (
+            getattr(self._request, "actual_backend", None),
+            getattr(self._request, "fallback_reason", None),
+        )
+
+    def predict_depth(self, image_bytes, domain, deadline_monotonic):
+        prediction = self._primary.predict_depth(
+            image_bytes, domain, deadline_monotonic
+        )
+        self._request.actual_backend = "vehicle_yolo"
+        return prediction
+
+    def predict_indoor_distance(self, image_bytes, deadline_monotonic):
+        try:
+            distance = self._primary.predict_indoor_distance(
+                image_bytes, deadline_monotonic
+            )
+        except ObstacleDistanceError as error:
+            self._request.fallback_reason = error.code.value
+            if (
+                self._fallback is None
+                or error.code not in self._FALLBACK_CODES
+            ):
+                raise
+            try:
+                distance = self._fallback.predict_indoor_distance(
+                    image_bytes, deadline_monotonic
+                )
+            except ObstacleDistanceError as fallback_error:
+                self._request.fallback_reason = (
+                    f"{error.code.value}->{fallback_error.code.value}"
+                )
+                raise
+            self._request.actual_backend = self._fallback_name
+            return distance
+        self._request.actual_backend = self._requested_name
+        return distance
+
+    def prepare_scene(self, domain) -> None:
+        for backend in (self._primary, self._fallback):
+            prepare = getattr(backend, "prepare_scene", None)
+            if callable(prepare):
+                prepare(domain)
+
+    def close(self) -> None:
+        for backend in (self._primary, self._fallback):
+            close = getattr(backend, "close", None)
+            if callable(close):
+                close()
+
+
 class LocalDistanceAdapter:
     """本地深度 + 分割管线（基于 obstacle_distance_core 估算器）。
 
@@ -90,6 +177,7 @@ class LocalDistanceAdapter:
     def __init__(self, cfg: dict):
         from .obstacle_distance_core.estimator import ObstacleDistanceEstimator
         from .obstacle_distance_core.zipdepth_tensorrt_backends import (
+            ZipDepthYoloTensorRTDepthBackend,
             create_backends,
         )
         from .obstacle_distance_core.places365_router import create_scene_router
@@ -162,11 +250,36 @@ class LocalDistanceAdapter:
             self._cfg.get("model_dir", "/models/obstacle/zipdepth-int8")
         )
         for key, filename in (
-            ("indoor_depth_engine", "indoor-metric.engine"),
             ("vehicle_depth_engine", "yolo26n-depth-int8.engine"),
             ("segmentation_engine", "yolo26n-seg-int8.engine"),
         ):
             self._cfg.setdefault(key, engine_paths[filename])
+        indoor = self._cfg.get("indoor")
+        if not isinstance(indoor, dict):
+            raise ValueError("indoor configuration must be a mapping")
+        profiles = indoor.get("backend_profiles")
+        if not isinstance(profiles, dict) or not profiles:
+            raise ValueError("indoor.backend_profiles must be nonempty")
+        requested_backend = str(
+            os.environ.get("OBSTACLE_INDOOR_BACKEND")
+            or indoor.get("backend_name", "legacy")
+        ).strip()
+        selected_profile = profiles.get(requested_backend)
+        if not isinstance(selected_profile, dict):
+            raise ValueError(
+                f"unknown indoor backend: {requested_backend!r}"
+            )
+        selected_indoor = deepcopy(indoor)
+        selected_indoor.pop("backend_profiles", None)
+        selected_indoor.update(selected_profile)
+        selected_indoor["backend_name"] = requested_backend
+        selected_engine_file = selected_indoor.pop("engine_file", None)
+        if selected_engine_file not in engine_paths:
+            raise ValueError(
+                f"indoor engine is unavailable: {selected_engine_file!r}"
+            )
+        self._cfg["indoor"] = selected_indoor
+        self._cfg["indoor_depth_engine"] = engine_paths[selected_engine_file]
         if self._scene_mode == "content":
             for key, filename in (
                 (
@@ -178,9 +291,42 @@ class LocalDistanceAdapter:
                 self._cfg.setdefault(key, engine_paths[filename])
             self._scene_router = create_scene_router(self._cfg)
         depth_backend, segmentation_backend = create_backends(self._cfg)
-        self._backends = (depth_backend, segmentation_backend)
-        self._estimator = ObstacleDistanceEstimator(
+        fallback_backend = None
+        fallback_name = indoor.get("fallback_backend")
+        if fallback_name and fallback_name != requested_backend:
+            fallback_profile = profiles.get(fallback_name)
+            if not isinstance(fallback_profile, dict):
+                raise ValueError(
+                    f"unknown indoor fallback backend: {fallback_name!r}"
+                )
+            fallback_indoor = deepcopy(indoor)
+            fallback_indoor.pop("backend_profiles", None)
+            fallback_indoor.update(fallback_profile)
+            fallback_engine_file = fallback_indoor.pop("engine_file", None)
+            if fallback_engine_file not in engine_paths:
+                raise ValueError(
+                    "indoor fallback engine is unavailable: "
+                    f"{fallback_engine_file!r}"
+                )
+            fallback_backend = ZipDepthYoloTensorRTDepthBackend(
+                engine_paths[fallback_engine_file],
+                self._cfg["vehicle_depth_engine"],
+                indoor_config=fallback_indoor,
+                decision_threshold_m=self._cfg.get(
+                    "decision_threshold_m", 2.0
+                ),
+            )
+        routed_depth_backend = _IndoorFallbackDepthBackend(
             depth_backend,
+            requested_name=requested_backend,
+            fallback=fallback_backend,
+            fallback_name=(str(fallback_name) if fallback_backend else None),
+        )
+        self._requested_indoor_backend = requested_backend
+        self._depth_backend_router = routed_depth_backend
+        self._backends = (routed_depth_backend, segmentation_backend)
+        self._estimator = ObstacleDistanceEstimator(
+            routed_depth_backend,
             segmentation_backend,
             self._cfg,
         )
@@ -202,6 +348,19 @@ class LocalDistanceAdapter:
         """估算最近障碍物距离。"""
         scene_hint = self._scene_hint
         estimator_image_bytes = image_bytes
+        self._depth_backend_router.begin_request()
+        route_metadata = {
+            "route_mode": self._scene_mode,
+            "route_label": scene_hint,
+            "route_confidence": 1.0 if scene_hint else None,
+            "route_top1_index": None,
+            "route_top1_probability": None,
+            "route_top2_index": None,
+            "route_top2_probability": None,
+            "route_margin": None,
+            "route_outdoor_vote": None,
+            "route_outdoor_probability": None,
+        }
         if self._scene_mode == "resolution":
             try:
                 import cv2
@@ -219,13 +378,41 @@ class LocalDistanceAdapter:
             else:
                 height, width = image.shape[:2]
                 scene_hint = self._resolution_scene_map.get((width, height))
+                route_metadata["route_label"] = scene_hint
+                route_metadata["route_confidence"] = (
+                    1.0 if scene_hint else None
+                )
         elif self._scene_mode == "content":
-            scene_hint = self._scene_router.predict(image_bytes).value
+            decision = self._scene_router.predict_decision(image_bytes)
+            scene_hint = decision.domain.value
+            route_metadata.update(
+                {
+                    "route_label": scene_hint,
+                    "route_confidence": decision.confidence,
+                    "route_top1_index": decision.top1_index,
+                    "route_top1_probability": decision.top1_probability,
+                    "route_top2_index": decision.top2_index,
+                    "route_top2_probability": decision.top2_probability,
+                    "route_margin": decision.top1_top2_margin,
+                    "route_outdoor_vote": decision.outdoor_vote,
+                    "route_outdoor_probability": decision.outdoor_probability,
+                }
+            )
         result = self._estimator.estimate(
             estimator_image_bytes,
             scene_hint=scene_hint,
         )
-        return {
+        requested_backend = (
+            self._requested_indoor_backend
+            if result.scene == SceneDomain.INDOOR.value
+            else "vehicle_yolo"
+        )
+        actual_backend, backend_fallback_reason = (
+            self._depth_backend_router.request_metadata()
+        )
+        if result.fallback and backend_fallback_reason is None:
+            backend_fallback_reason = result.error_code
+        response = {
             "pred_distance": result.distance_m,
             "distance_m": result.distance_m,
             "near_obstacle": result.near_obstacle,
@@ -235,7 +422,14 @@ class LocalDistanceAdapter:
             "fallback": result.fallback,
             "approximate_geometry": result.approximate_geometry,
             "latency_ms": result.latency_ms,
+            "cold_start": result.cold_start,
+            "timeout_budget_ms": result.timeout_budget_ms,
+            "requested_backend": requested_backend,
+            "actual_backend": actual_backend,
+            "backend_fallback_reason": backend_fallback_reason,
         }
+        response.update(route_metadata)
+        return response
 
 
 def _build_distance_adapter(cfg: dict) -> LocalDistanceAdapter:
@@ -361,10 +555,21 @@ class _ObstacleNode(Node):
                 if should_log:
                     emit = log.info if transition else log.debug
                     emit(
-                        "[obstacle] %s scene=%s error_code=%s latency_ms=%.1f "
-                        "distance_m=%s (frame %d)",
+                        "[obstacle] %s scene=%s route_confidence=%s "
+                        "route_margin=%s requested_backend=%s "
+                        "actual_backend=%s backend_fallback_reason=%s "
+                        "cold_start=%s timeout_budget_ms=%s error_code=%s "
+                        "latency_ms=%.1f distance_m=%s "
+                        "(frame %d)",
                         outcome,
                         result.get("scene"),
+                        result.get("route_confidence"),
+                        result.get("route_margin"),
+                        result.get("requested_backend"),
+                        result.get("actual_backend"),
+                        result.get("backend_fallback_reason"),
+                        result.get("cold_start"),
+                        result.get("timeout_budget_ms"),
                         result.get("error_code"),
                         float(result.get("latency_ms", 0.0)),
                         result.get("pred_distance"),

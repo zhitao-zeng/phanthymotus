@@ -468,6 +468,29 @@ def test_ensure_verified_bundle_retries_then_fails(tmp_path, monkeypatch):
     assert not (tmp_path / "m" / "det.engine").exists()
 
 
+def test_verified_bundle_can_rename_remote_source(tmp_path, monkeypatch):
+    payload = b"metric-engine"
+    calls: list[str] = []
+    _serve(monkeypatch, {"indoor-metric.engine": payload}, calls)
+    manifest = {
+        "indoor-dav2-e8.engine": {
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "source_name": "indoor-metric.engine",
+        }
+    }
+
+    paths = model_downloader.ensure_verified_bundle(
+        "obstacle/indoor-dav2/jp61",
+        str(tmp_path / "models"),
+        "https://example/dav2/jp61",
+        manifest,
+    )
+
+    assert calls == ["https://example/dav2/jp61/indoor-metric.engine"]
+    assert Path(paths["indoor-dav2-e8.engine"]).read_bytes() == payload
+
+
 def test_select_bundle_family(tmp_path, monkeypatch):
     bundles = {
         "jp511": {"base_url": "https://x/jp511", "files": {}},

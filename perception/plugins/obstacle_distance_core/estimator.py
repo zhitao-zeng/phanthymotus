@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections.abc import Sequence
 from copy import deepcopy
@@ -38,6 +39,8 @@ class DistanceResult:
     approximate_geometry: bool
     latency_ms: float
     timestamp: float
+    cold_start: bool
+    timeout_budget_ms: float
 
 
 def _finite_number(
@@ -137,6 +140,17 @@ class ObstacleDistanceEstimator:
             name="soft_timeout_s",
             positive=True,
         )
+        self._cold_start_timeout_s = _finite_number(
+            self._config.get("cold_start_timeout_s", self._soft_timeout_s),
+            name="cold_start_timeout_s",
+            positive=True,
+        )
+        if self._cold_start_timeout_s < self._soft_timeout_s:
+            raise ValueError(
+                "cold_start_timeout_s must be at least soft_timeout_s"
+            )
+        self._warm_domains: set[SceneDomain] = set()
+        self._warm_domains_lock = threading.Lock()
         self._unload_inactive_scene = (
             self._config.get("unload_inactive_scene") is True
         )
@@ -192,6 +206,8 @@ class ObstacleDistanceEstimator:
         approximate_geometry: bool,
         started_monotonic: float | None,
         timestamp: float,
+        cold_start: bool,
+        timeout_budget_ms: float,
         finished_monotonic: float | None = None,
     ) -> DistanceResult:
         return DistanceResult(
@@ -209,6 +225,8 @@ class ObstacleDistanceEstimator:
                 suppress_clock_errors=fallback,
             ),
             timestamp=timestamp,
+            cold_start=cold_start,
+            timeout_budget_ms=timeout_budget_ms,
         )
 
     def _fallback(
@@ -218,6 +236,8 @@ class ObstacleDistanceEstimator:
         scene: str,
         started_monotonic: float | None,
         timestamp: float,
+        cold_start: bool,
+        timeout_budget_ms: float,
     ) -> DistanceResult:
         safe_code = code if isinstance(code, ErrorCode) else ErrorCode.MODEL_ERROR
         try:
@@ -233,6 +253,8 @@ class ObstacleDistanceEstimator:
             approximate_geometry=False,
             started_monotonic=started_monotonic,
             timestamp=safe_timestamp,
+            cold_start=cold_start,
+            timeout_budget_ms=timeout_budget_ms,
         )
 
     def _check_deadline(self, deadline_monotonic: float) -> float:
@@ -441,6 +463,8 @@ class ObstacleDistanceEstimator:
         started_monotonic = None
         result_timestamp = 0.0
         scene = "unknown"
+        cold_start = False
+        timeout_budget_ms = self._soft_timeout_s * 1000.0
         try:
             if not isinstance(image_bytes, bytes) or not image_bytes:
                 raise ObstacleDistanceError(
@@ -452,11 +476,19 @@ class ObstacleDistanceEstimator:
                 fixed_scene=self._config.get("fixed_scene"),
             )
             scene = domain.value
+            with self._warm_domains_lock:
+                cold_start = domain not in self._warm_domains
+            timeout_s = (
+                self._cold_start_timeout_s
+                if cold_start
+                else self._soft_timeout_s
+            )
+            timeout_budget_ms = timeout_s * 1000.0
             started_monotonic = _time_value(self._monotonic())
             result_timestamp = _time_value(
                 timestamp if timestamp is not None else self._wall_time()
             )
-            deadline_monotonic = started_monotonic + self._soft_timeout_s
+            deadline_monotonic = started_monotonic + timeout_s
 
             approximate_geometry = False
             self._prepare_scene(domain)
@@ -494,6 +526,8 @@ class ObstacleDistanceEstimator:
                 )
             distance = self._validated_distance(distance)
             finished_monotonic = self._check_deadline(deadline_monotonic)
+            with self._warm_domains_lock:
+                self._warm_domains.add(domain)
             return self._result(
                 distance_m=distance,
                 scene=scene,
@@ -503,6 +537,8 @@ class ObstacleDistanceEstimator:
                 approximate_geometry=approximate_geometry,
                 started_monotonic=started_monotonic,
                 timestamp=result_timestamp,
+                cold_start=cold_start,
+                timeout_budget_ms=timeout_budget_ms,
                 finished_monotonic=finished_monotonic,
             )
         except ObstacleDistanceError as error:
@@ -511,6 +547,8 @@ class ObstacleDistanceEstimator:
                 scene=scene,
                 started_monotonic=started_monotonic,
                 timestamp=result_timestamp,
+                cold_start=cold_start,
+                timeout_budget_ms=timeout_budget_ms,
             )
         except Exception:
             return self._fallback(
@@ -518,4 +556,6 @@ class ObstacleDistanceEstimator:
                 scene=scene,
                 started_monotonic=started_monotonic,
                 timestamp=result_timestamp,
+                cold_start=cold_start,
+                timeout_budget_ms=timeout_budget_ms,
             )

@@ -7,7 +7,12 @@ from typing import Mapping
 
 import numpy as np
 
-from .contracts import ErrorCode, ObstacleDistanceError, SceneDomain
+from .contracts import (
+    ErrorCode,
+    ObstacleDistanceError,
+    SceneDomain,
+    SceneRouteDecision,
+)
 from .runtime_utils import decode_image, model_path
 
 
@@ -94,7 +99,47 @@ class Places365SceneRouter:
         self._input_name = inputs[0].name
         self._top_k = top_k
 
-    def predict(self, image_bytes: bytes) -> SceneDomain:
+    def _decision_from_logits(self, logits: np.ndarray) -> SceneRouteDecision:
+        if logits.shape != (365,) or not np.isfinite(logits).all():
+            raise ObstacleDistanceError(
+                ErrorCode.MODEL_ERROR,
+                "Places365 output is invalid",
+            )
+        top_indices = np.argpartition(-logits, self._top_k - 1)[: self._top_k]
+        top_indices = top_indices[np.argsort(-logits[top_indices])]
+        outdoor_vote = float(self._outdoor[top_indices].mean())
+        shifted = logits - float(logits.max())
+        probabilities = np.exp(shifted)
+        probabilities /= probabilities.sum()
+        top_two = np.argpartition(-probabilities, 1)[:2]
+        top_two = top_two[np.argsort(-probabilities[top_two])]
+        top1_index, top2_index = (int(value) for value in top_two)
+        top1_probability = float(probabilities[top1_index])
+        top2_probability = float(probabilities[top2_index])
+        outdoor_probability = float(probabilities[self._outdoor == 1].sum())
+        domain = (
+            SceneDomain.VEHICLE
+            if outdoor_vote >= 0.5
+            else SceneDomain.INDOOR
+        )
+        confidence = (
+            outdoor_probability
+            if domain is SceneDomain.VEHICLE
+            else 1.0 - outdoor_probability
+        )
+        return SceneRouteDecision(
+            domain=domain,
+            confidence=confidence,
+            top1_index=top1_index,
+            top1_probability=top1_probability,
+            top2_index=top2_index,
+            top2_probability=top2_probability,
+            top1_top2_margin=top1_probability - top2_probability,
+            outdoor_vote=outdoor_vote,
+            outdoor_probability=outdoor_probability,
+        )
+
+    def predict_decision(self, image_bytes: bytes) -> SceneRouteDecision:
         image = decode_image(image_bytes)
         tensor = _prepare_places365_image(image)
         try:
@@ -105,14 +150,10 @@ class Places365SceneRouter:
                 ErrorCode.MODEL_ERROR,
                 "Places365 inference failed",
             ) from None
-        if logits.shape != (365,) or not np.isfinite(logits).all():
-            raise ObstacleDistanceError(
-                ErrorCode.MODEL_ERROR,
-                "Places365 output is invalid",
-            )
-        top_indices = np.argpartition(-logits, self._top_k - 1)[: self._top_k]
-        outdoor_vote = float(self._outdoor[top_indices].mean())
-        return SceneDomain.VEHICLE if outdoor_vote >= 0.5 else SceneDomain.INDOOR
+        return self._decision_from_logits(logits)
+
+    def predict(self, image_bytes: bytes) -> SceneDomain:
+        return self.predict_decision(image_bytes).domain
 
 
 def create_scene_router(config: Mapping[str, object]) -> Places365SceneRouter:

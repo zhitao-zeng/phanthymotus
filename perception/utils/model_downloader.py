@@ -452,8 +452,11 @@ def _download_verified_bundle(
     with tempfile.TemporaryDirectory(prefix=staging_prefix, dir=model_dir) as staging:
         for filename, metadata in files.items():
             _check_bundle_relpath(filename)
+            source_name = metadata.get("source_name", filename)
+            _check_bundle_relpath(source_name)
             url = "/".join(
-                [base_url.rstrip("/")] + [quote(part) for part in filename.split("/")]
+                [base_url.rstrip("/")]
+                + [quote(part) for part in source_name.split("/")]
             )
             destination = os.path.join(staging, filename)
             os.makedirs(os.path.dirname(destination), exist_ok=True)
@@ -591,18 +594,48 @@ OBSTACLE_INDOOR_MODEL_BUNDLES = {
     "jp61": {
         "base_url": f"{OBSTACLE_INDOOR_MODEL_BASE}/jp61",
         "files": {
-            "indoor-metric.engine": {
+            "indoor-zipdepth-distill-e8.engine": {
                 "size": 13470508,
                 "sha256": "eedbe2e61468c41570adb39c83adba78d193725020e4b7c0af135cde7ccce668",
+                "source_name": "indoor-metric.engine",
             },
         },
     },
     "jp511": {
         "base_url": f"{OBSTACLE_INDOOR_MODEL_BASE}/jp511",
         "files": {
-            "indoor-metric.engine": {
+            "indoor-zipdepth-distill-e8.engine": {
                 "size": 13838325,
                 "sha256": "5981ad93dac69cf49c61e09f42ab391bad22b400221d903e10eeef0e6259acbd",
+                "source_name": "indoor-metric.engine",
+            },
+        },
+    },
+}
+
+OBSTACLE_DAV2_MODEL_BASE = os.environ.get(
+    "OBSTACLE_DAV2_MODEL_BASE_URL",
+    "http://172.28.4.81:34567/zengzhitao/embodied-ai/"
+    "obstacle-distance/v4-indoor-dav2-small-epoch8",
+)
+OBSTACLE_DAV2_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{OBSTACLE_DAV2_MODEL_BASE}/jp61",
+        "files": {
+            "indoor-dav2-e8.engine": {
+                "size": 52033404,
+                "sha256": "f8f4b9631afbe5a19c17e8f1292e3c6f1553bb7797d743f4b5db7227193b4cb4",
+                "source_name": "indoor-metric.engine",
+            },
+        },
+    },
+    "jp511": {
+        "base_url": f"{OBSTACLE_DAV2_MODEL_BASE}/jp511",
+        "files": {
+            "indoor-dav2-e8.engine": {
+                "size": 51497923,
+                "sha256": "a4d2d5c70378e1920ed37a9c47f80aa0d9102b5a7d68305dda4635145009cb9c",
+                "source_name": "indoor-metric.engine",
             },
         },
     },
@@ -783,6 +816,15 @@ def ensure_obstacle_models(
             model_dir,
             indoor_entry["base_url"],
             indoor_entry["files"],
+        )
+    )
+    dav2_entry = OBSTACLE_DAV2_MODEL_BUNDLES[key]
+    paths.update(
+        ensure_verified_bundle(
+            f"obstacle/indoor-dav2/{key}",
+            model_dir,
+            dav2_entry["base_url"],
+            dav2_entry["files"],
         )
     )
     paths.update(
