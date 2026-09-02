@@ -78,7 +78,7 @@ plugins:
     fallback_distance_m: 3.0
     soft_timeout_s: 2.5
     indoor:
-      backend_name: zipdepth_distill_e8
+      backend_name: legacy
       fallback_backend: legacy
       backend_profiles:
         legacy:
