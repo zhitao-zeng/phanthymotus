@@ -71,7 +71,7 @@ plugins:
     scene_router_model: /models/obstacle/zipdepth-int8/resnet18_places365-static-qoperator-int8.onnx
     scene_router_io_labels: /models/obstacle/zipdepth-int8/IO_places365.txt
     scene_router_top_k: 3
-    decision_threshold_m: 2.0
+    decision_threshold_m: 1.0
     fallback_distance_m: 3.0
     soft_timeout_s: 2.5
     indoor:

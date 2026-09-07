@@ -585,15 +585,15 @@ OBSTACLE_SCENE_ROUTER_FILES = {
 OBSTACLE_INDOOR_MODEL_BASE = os.environ.get(
     "OBSTACLE_INDOOR_MODEL_BASE_URL",
     "http://172.28.4.81:34567/zengzhitao/embodied-ai/"
-    "obstacle-distance/v4-indoor-zipdepth-epoch8",
+    "obstacle-distance/dav2-small-canonical-e2-fp16-v1",
 )
 OBSTACLE_INDOOR_MODEL_BUNDLES = {
     "jp61": {
         "base_url": f"{OBSTACLE_INDOOR_MODEL_BASE}/jp61",
         "files": {
             "indoor-metric.engine": {
-                "size": 13470508,
-                "sha256": "eedbe2e61468c41570adb39c83adba78d193725020e4b7c0af135cde7ccce668",
+                "size": 53636420,
+                "sha256": "2c9b5c2041c618cdaa2de13ac38396e729e3dcb21d9037a350c57f0973b40054",
             },
         },
     },
@@ -601,8 +601,8 @@ OBSTACLE_INDOOR_MODEL_BUNDLES = {
         "base_url": f"{OBSTACLE_INDOOR_MODEL_BASE}/jp511",
         "files": {
             "indoor-metric.engine": {
-                "size": 13838325,
-                "sha256": "5981ad93dac69cf49c61e09f42ab391bad22b400221d903e10eeef0e6259acbd",
+                "size": 51526115,
+                "sha256": "7b0a0b47befca4e2df4480dfcf81a5854917e92e3efcb7148e0a3e3aa1bab4ed",
             },
         },
     },

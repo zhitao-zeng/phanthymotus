@@ -302,6 +302,35 @@ class ZipDepthYoloTensorRTDepthBackend:
                 engine = self._vehicle
         return engine
 
+    def warmup(self, domain: SceneDomain) -> None:
+        """Run one inference so the first camera frame only pays warm latency."""
+        if domain is SceneDomain.INDOOR:
+            outputs = self._get_indoor_engine().infer(
+                np.zeros(
+                    (
+                        1,
+                        3,
+                        _ZIPDEPTH_INPUT_HEIGHT,
+                        _ZIPDEPTH_INPUT_WIDTH,
+                    ),
+                    dtype=np.float32,
+                )
+            )
+        elif domain is SceneDomain.VEHICLE:
+            outputs = self._get_vehicle_engine().infer(
+                np.zeros(
+                    (1, 3, _YOLO_DEPTH_INPUT_SIZE, _YOLO_DEPTH_INPUT_SIZE),
+                    dtype=np.float32,
+                )
+            )
+        else:
+            return
+        if len(outputs) != 1:
+            raise ObstacleDistanceError(
+                ErrorCode.MODEL_ERROR,
+                "depth TensorRT warmup must produce one output",
+            )
+
     def prepare_scene(self, domain: SceneDomain) -> None:
         """Release the mutually exclusive depth engine before a scene switch."""
         if domain is SceneDomain.INDOOR:

@@ -32,6 +32,10 @@ class _FakeDistanceAdapter:
     def __init__(self):
         self.closed = False
         self.estimates = 0
+        self.warmups = 0
+
+    def warmup(self):
+        self.warmups += 1
 
     def estimate(self, image_bytes: bytes) -> dict:
         self.estimates += 1
@@ -103,6 +107,33 @@ def test_obstacle_start_returns_loading_without_blocking(monkeypatch):
     assert elapsed < 0.1, f"start blocked for {elapsed:.3f}s"
     assert result == {"state": "loading", "input": "/cam/a", "output": "/cam/a/obstacle"}
     assert _wait_until(lambda: len(executor.nodes) == 1)
+    plugin.dispatch("obstacle", {"action": "stop"})
+
+
+def test_obstacle_remains_loading_until_adapter_warmup_finishes(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _BlockingWarmupAdapter(_FakeDistanceAdapter):
+        def warmup(self):
+            super().warmup()
+            entered.set()
+            assert release.wait(3), "warmup release was not signalled"
+
+    adapter = _BlockingWarmupAdapter()
+    plugin, executor, _ = _make_obstacle(monkeypatch, lambda _cfg: adapter)
+    result = plugin.dispatch(
+        "obstacle", {"action": "start", "input_topic": "/cam/a"}
+    )
+
+    assert result["state"] == "loading"
+    assert entered.wait(1), "background warmup did not start"
+    assert plugin.dispatch("obstacle", {"action": "info"})["state"] == "loading"
+    assert executor.nodes == []
+
+    release.set()
+    assert _wait_until(lambda: len(executor.nodes) == 1)
+    assert adapter.warmups == 1
     plugin.dispatch("obstacle", {"action": "stop"})
 
 

@@ -185,6 +185,14 @@ class LocalDistanceAdapter:
             self._cfg,
         )
 
+    def warmup(self) -> None:
+        """Load and execute the backend selected by a fixed deployment."""
+        if self._scene_mode != "fixed":
+            return
+        warmup = getattr(self._backends[0], "warmup", None)
+        if callable(warmup):
+            warmup(SceneDomain(self._scene_hint))
+
     def close(self) -> None:
         """Release the TensorRT engines held by the backends."""
         self._scene_router = None
@@ -242,6 +250,19 @@ def _build_distance_adapter(cfg: dict) -> LocalDistanceAdapter:
     if cfg.get("provider", "local") != "local":
         raise ValueError("obstacle provider must be local")
     return LocalDistanceAdapter(cfg)
+
+
+def _build_ready_distance_adapter(cfg: dict) -> LocalDistanceAdapter:
+    """Build and warm an adapter before the loader publishes it as ready."""
+    adapter = _build_distance_adapter(cfg)
+    try:
+        warmup = getattr(adapter, "warmup", None)
+        if callable(warmup):
+            warmup()
+    except Exception:
+        ObstacleDistancePlugin._close_adapter(adapter)
+        raise
+    return adapter
 
 
 # ── ROS2 Node (one per instance/topic) ────────────────────────────────────────
@@ -527,7 +548,7 @@ class ObstacleDistancePlugin:
                 cached = self._instance_adapters.get(node_key)
                 if cached is not None and cached[0] == effective:
                     return cached[1]
-            adapter = _build_distance_adapter(effective)
+            adapter = _build_ready_distance_adapter(effective)
             stale = None
             with self._state_lock:
                 still_wanted = (
@@ -552,7 +573,7 @@ class ObstacleDistancePlugin:
             adapter = self._adapter if generation == self._load_generation else None
         if adapter is None:
             try:
-                adapter = _build_distance_adapter(cfg)
+                adapter = _build_ready_distance_adapter(cfg)
             except Exception as error:  # noqa: BLE001 - surfaced via info
                 log.exception("[obstacle] adapter load failed")
                 with self._state_lock:
