@@ -56,26 +56,25 @@ MODELS = {
         "check_file": "tokens.txt",
     },
     "asr_x_asr": {
-        # Released X-ASR epoch-99 base weights with the general robot343 hotword
-        # list. Pin every file so deployments cannot follow a moving ModelScope
-        # branch.
+        # Domain-adapted X-ASR with pre-encoded bilingual hotwords.
+        # Pin every file so deployments cannot follow a moving model revision.
         "base_url": (
             "https://www.modelscope.cn/models/Flame4pd/"
-            "x-asr-zh-en-punct-int8-robot/resolve/"
-            "e111bb210b1aad07c6a16b75adb61b80ee841990"
+            "x-asr-exhibition-zh-en-int8/resolve/"
+            "a26e671d6656d3a124b19354ed7b0ab92c4e872c"
         ),
         "files": {
             "encoder-epoch-99-avg-1.int8.onnx": {
-                "size": 161015713,
-                "sha256": "7f6aa62056efd8af9da13e0faa81cd3f284d2fb2e3b63de56fd2dfd3450910dc",
+                "size": 160093173,
+                "sha256": "e7764438ee197500f1f7fbe45db26e26e9da7ada73f4ae5bff00607b1dae6e46",
             },
             "decoder-epoch-99-avg-1.onnx": {
                 "size": 11309084,
-                "sha256": "72f47405d3c1033bebccbef82f90071e7b4ba3e71b9c986f2b74244b25723aed",
+                "sha256": "d27b3b869b826c88429507c8104f99cccb2eb8cb0627b0f7f353a42332630026",
             },
             "joiner-epoch-99-avg-1.int8.onnx": {
                 "size": 2581422,
-                "sha256": "aedb7fa697b2ab43f20499826fff7c997eea7d67db77be97769aeeeb726e63b3",
+                "sha256": "3561f4412c6a12d23e35f6951abedc39eaca576cfd7bc215bbf82fad8ed309e3",
             },
             "tokens.txt": {
                 "size": 58806,
@@ -90,8 +89,12 @@ MODELS = {
                 "sha256": "28fc94d67aae53d8c58010fcfb16fc8c2f8dd263e03f3490c98210e354e8f914",
             },
             "hotwords.txt": {
-                "size": 3496,
-                "sha256": "202f2558ca13e19578d69c9c4b1e9402974efc9b0e35774f0ca24372cf063708",
+                "size": 3539,
+                "sha256": "578ed36b6fbe46a3cae352450a600f691091cc00fa05fae684fc256adcd77abd",
+            },
+            "hotwords.bpe.txt": {
+                "size": 5988,
+                "sha256": "aa3ef8cd7def298eafad69e4d1c1f49b9b3337a74f853bbd162ce9d98419838b",
             },
         },
         "check_file": "tokens.txt",

@@ -170,8 +170,8 @@ ENV YOLO_CONFIG_DIR=/work
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} "sherpa-onnx==1.13.6" && \
     python3 -c "import sherpa_onnx; assert sherpa_onnx.__version__ == '1.13.6'; print('sherpa-onnx', sherpa_onnx.__version__, 'CPU-only')"
 
-# Darvin starts ten evaluator instances. Seed the immutable c200 bundle once at
-# build time so those instances never race on a cold runtime download.
+# Seed the immutable X-ASR bundle at build time so concurrent instances
+# do not compete for a cold runtime download.
 COPY perception/utils/model_downloader.py /tmp/model_downloader.py
 RUN python3 -c "import sys; sys.path.insert(0, '/tmp'); from model_downloader import ensure_model; ensure_model('asr_x_asr', '/models/sherpa-onnx/x-asr-zh-en-v2')" && \
     rm -f /tmp/model_downloader.py

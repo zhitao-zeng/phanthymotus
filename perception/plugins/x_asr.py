@@ -124,7 +124,9 @@ class XASRAdapter:
         # a forced device=gpu is reported rather than silently honoured.
         provider = provider_for_device(device,
                                        (str(encoder), str(decoder), str(joiner)))
-        encoded_hotwords = _prepare_hotwords_file(hotwords)
+        encoded_hotwords = root / "hotwords.bpe.txt"
+        if not encoded_hotwords.is_file():
+            encoded_hotwords = _prepare_hotwords_file(hotwords)
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
             encoder=str(encoder),
             decoder=str(decoder),
