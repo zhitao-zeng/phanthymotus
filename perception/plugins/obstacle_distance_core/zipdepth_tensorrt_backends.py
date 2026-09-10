@@ -79,12 +79,16 @@ def _roi(value: object) -> tuple[int, int, int, int]:
     return row_start, row_end, col_start, col_end
 
 
-def _prepare_zipdepth_image(image: np.ndarray) -> np.ndarray:
+def _prepare_zipdepth_image(
+    image: np.ndarray,
+    input_height: int = _ZIPDEPTH_INPUT_HEIGHT,
+    input_width: int = _ZIPDEPTH_INPUT_WIDTH,
+) -> np.ndarray:
     import cv2
 
     resized = cv2.resize(
         image,
-        (_ZIPDEPTH_INPUT_WIDTH, _ZIPDEPTH_INPUT_HEIGHT),
+        (input_width, input_height),
         interpolation=cv2.INTER_LINEAR,
     )
     rgb = resized[:, :, ::-1]
@@ -251,11 +255,9 @@ class ZipDepthYoloTensorRTDepthBackend:
                 if self._indoor is None:
                     started = time.monotonic()
                     indoor = _NativeTensorRTEngine(self._indoor_engine_path)
-                    if indoor.input_shape != (
-                        1,
-                        3,
-                        _ZIPDEPTH_INPUT_HEIGHT,
-                        _ZIPDEPTH_INPUT_WIDTH,
+                    if indoor.input_shape not in (
+                        (1, 3, _ZIPDEPTH_INPUT_HEIGHT, _ZIPDEPTH_INPUT_WIDTH),
+                        (1, 3, 576, 768),
                     ):
                         raise ObstacleDistanceError(
                             ErrorCode.MODEL_ERROR,
@@ -305,17 +307,8 @@ class ZipDepthYoloTensorRTDepthBackend:
     def warmup(self, domain: SceneDomain) -> None:
         """Run one inference so the first camera frame only pays warm latency."""
         if domain is SceneDomain.INDOOR:
-            outputs = self._get_indoor_engine().infer(
-                np.zeros(
-                    (
-                        1,
-                        3,
-                        _ZIPDEPTH_INPUT_HEIGHT,
-                        _ZIPDEPTH_INPUT_WIDTH,
-                    ),
-                    dtype=np.float32,
-                )
-            )
+            engine = self._get_indoor_engine()
+            outputs = engine.infer(np.zeros(engine.input_shape, dtype=np.float32))
         elif domain is SceneDomain.VEHICLE:
             outputs = self._get_vehicle_engine().infer(
                 np.zeros(
@@ -366,9 +359,8 @@ class ZipDepthYoloTensorRTDepthBackend:
         check_deadline(deadline_monotonic)
         image = decode_image(image_bytes)
         height, width = image.shape[:2]
-        outputs = self._get_indoor_engine().infer(
-            _prepare_zipdepth_image(image)
-        )
+        engine = self._get_indoor_engine()
+        outputs = engine.infer(_prepare_zipdepth_image(image, *engine.input_shape[2:]))
         if len(outputs) != 1:
             raise ObstacleDistanceError(
                 ErrorCode.MODEL_ERROR,
