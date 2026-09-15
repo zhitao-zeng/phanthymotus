@@ -592,12 +592,12 @@ OBSTACLE_INDOOR_MODEL_BUNDLES = {
         "base_url": os.environ.get(
             "OBSTACLE_INDOOR_JP61_MODEL_BASE_URL",
             "http://172.28.4.81:34567/zengzhitao/embodied-ai/"
-            "obstacle-distance/dav2-small-canonical-e2-fp16-768-v1/jp61",
+            "obstacle-distance/yolo26l-indoor-metric-fp32-v1/jp61",
         ),
         "files": {
-            "indoor-metric.engine": {
-                "size": 53058628,
-                "sha256": "84675e1bf6712f31cc047530edbe137743dda43fbc06411f7436b4d3f705cf79",
+            "indoor-metric.onnx": {
+                "size": 106035760,
+                "sha256": "ea2fc787853bebf24e809b5671dc48d172555856b08b705e8dccff76139ec602",
             },
         },
     },

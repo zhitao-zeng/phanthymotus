@@ -161,8 +161,12 @@ class LocalDistanceAdapter:
         engine_paths = ensure_obstacle_models(
             self._cfg.get("model_dir", "/models/obstacle/zipdepth-int8")
         )
+        indoor_filename = (
+            "indoor-metric.onnx" if "indoor-metric.onnx" in engine_paths
+            else "indoor-metric.engine"
+        )
         for key, filename in (
-            ("indoor_depth_engine", "indoor-metric.engine"),
+            ("indoor_depth_engine", indoor_filename),
             ("vehicle_depth_engine", "yolo26n-depth-int8.engine"),
             ("segmentation_engine", "yolo26n-seg-int8.engine"),
         ):

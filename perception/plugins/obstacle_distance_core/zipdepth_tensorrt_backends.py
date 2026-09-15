@@ -33,6 +33,7 @@ from .native_tensorrt_backends import (
     _scale_depth_to_original,
 )
 from .runtime_utils import check_deadline, decode_image, model_path
+from .onnx_cuda_engine import CudaOnnxEngine
 
 
 _ZIPDEPTH_INPUT_HEIGHT = 384
@@ -111,7 +112,7 @@ class ZipDepthYoloTensorRTDepthBackend:
         # pay for the other domain's TensorRT engine and CUDA allocations.
         self._indoor_engine_path = indoor_engine
         self._vehicle_engine_path = vehicle_engine
-        self._indoor: _NativeTensorRTEngine | None = None
+        self._indoor: _NativeTensorRTEngine | CudaOnnxEngine | None = None
         self._vehicle: _NativeTensorRTEngine | None = None
         self._engine_init_lock = threading.Lock()
 
@@ -248,13 +249,17 @@ class ZipDepthYoloTensorRTDepthBackend:
             )
         return scaled
 
-    def _get_indoor_engine(self) -> _NativeTensorRTEngine:
+    def _get_indoor_engine(self) -> _NativeTensorRTEngine | CudaOnnxEngine:
         engine = self._indoor
         if engine is None:
             with self._engine_init_lock:
                 if self._indoor is None:
                     started = time.monotonic()
-                    indoor = _NativeTensorRTEngine(self._indoor_engine_path)
+                    engine_type = (
+                        CudaOnnxEngine if self._indoor_engine_path.lower().endswith(".onnx")
+                        else _NativeTensorRTEngine
+                    )
+                    indoor = engine_type(self._indoor_engine_path)
                     if indoor.input_shape not in (
                         (1, 3, _ZIPDEPTH_INPUT_HEIGHT, _ZIPDEPTH_INPUT_WIDTH),
                         (1, 3, 576, 768),
@@ -269,7 +274,8 @@ class ZipDepthYoloTensorRTDepthBackend:
                             "ZipDepth TensorRT engine must have one output",
                         )
                     log.info(
-                        "[obstacle] ZipDepth indoor engine loaded in %.1fms",
+                        "[obstacle] indoor %s loaded in %.1fms",
+                        engine_type.__name__,
                         1000.0 * (time.monotonic() - started),
                     )
                     self._indoor = indoor

@@ -117,7 +117,14 @@ RUN mkdir -p /work/weights/clip && \
 ENV YOLO_CONFIG_DIR=/work
 
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
+# JP6 reuses the upstream CUDA-enabled sherpa wheel so its cuDNN-9 provider
+# can also serve the standalone ONNX Runtime below. JP5 keeps its existing path.
+RUN if [ "${JP_VERSION}" = "61" ]; then \
+      pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+        "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/sherpa-onnx/jp61/sherpa_onnx-1.13.6%2Bcuda-cp310-cp310-linux_aarch64.whl"; \
+    else \
+      pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx; \
+    fi
 
 # ── OCR runtime deps (PP-OCRv6 TensorRT engines; TensorRT/CUDA come from base) ──
 # libvips42 (apt, above) is the runtime library pyvips dlopens for JPEG decode
@@ -139,16 +146,21 @@ RUN if [ "${JP_VERSION}" = "61" ]; then NUMPY_VERSION=1.26.4; else NUMPY_VERSION
     RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
     find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete
 
-# CPU scene routing for mixed indoor/vehicle JPG input. JP511 remains on the
-# last release with a Python 3.8 aarch64 wheel; JP6 uses the proven 1.23 line.
+# JP6 follows upstream's two-part CUDA ORT installation: a GPU wheel with the
+# provider bridge, then the cuDNN-9 CUDA/shared providers bundled by sherpa.
+# Merely copying providers into a CPU-only wheel does not enable CUDA.
+# JP511 retains the existing CPU scene-router dependency and TensorRT model.
 RUN if [ "${JP_VERSION}" = "61" ]; then \
-      NUMPY_VERSION=1.26.4; ORT_VERSION=1.23.2; \
+      pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} \
+        "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/onnxruntime/jp61/onnxruntime_gpu-1.18.0-cp310-cp310-linux_aarch64.whl" && \
+      cp /usr/local/lib/python3.10/dist-packages/sherpa_onnx/lib/libonnxruntime_providers_cuda.so \
+         /usr/local/lib/python3.10/dist-packages/onnxruntime/capi/ && \
+      cp /usr/local/lib/python3.10/dist-packages/sherpa_onnx/lib/libonnxruntime_providers_shared.so \
+         /usr/local/lib/python3.10/dist-packages/onnxruntime/capi/ && \
+      python3 -c "import onnxruntime as ort; assert 'CUDAExecutionProvider' in ort.get_available_providers(); print('[build] CUDA ORT ' + ort.__version__)"; \
     else \
-      NUMPY_VERSION=1.24.4; ORT_VERSION=1.17.3; \
-    fi; \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-      "numpy==${NUMPY_VERSION}" "onnxruntime==${ORT_VERSION}" && \
-    python3 -c "import numpy, onnxruntime; assert numpy.__version__ == '${NUMPY_VERSION}'; print('[build] scene router ORT ' + onnxruntime.__version__)"
+      pip3 install --no-cache-dir -i ${PYPI_MIRROR} "numpy==1.24.4" "onnxruntime==1.17.3"; \
+    fi
 
 # ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
 # ldconfig shimmed for the same reason as the ffmpeg step above — this is the
