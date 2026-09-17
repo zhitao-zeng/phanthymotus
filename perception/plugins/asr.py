@@ -634,13 +634,16 @@ class SherpaOnnxXASRAdapter(ASRAdapter):
     """Offline X-ASR transducer with general robot-domain hotword biasing."""
 
     def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2,
-                 max_active_paths: int = None, tail_padding_seconds: float = None):
+                 max_active_paths: int = None, tail_padding_seconds: float = None,
+                 prefix_lm_path: str = "", prefix_lm_scale: float = 0.0):
         from plugins.x_asr import XASRAdapter
 
         self._delegate = XASRAdapter(
             model_dir, device, num_threads,
             max_active_paths=max_active_paths,
             tail_padding_seconds=tail_padding_seconds,
+            prefix_lm_path=prefix_lm_path,
+            prefix_lm_scale=prefix_lm_scale,
         )
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
@@ -796,11 +799,17 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
     num_threads = int(cfg.get('num_threads', 2))
     if model_name == "x-asr-zh-en":
         tail_pad_ms = cfg.get('asr_tail_pad_ms')
+        lm_scale = float(cfg.get('asr_prefix_lm_scale', 0.0))
+        lm_dir = "/models/sherpa-onnx/x-asr-prefix-lm"
+        if lm_scale > 0:
+            ensure_model("asr_x_asr_prefix_lm", lm_dir)
         adapter = model_info["adapter"](
             model_dir,
             device,
             num_threads,
             max_active_paths=cfg.get('asr_beam_paths'),
+            prefix_lm_path=os.path.join(lm_dir, "model.onnx"),
+            prefix_lm_scale=lm_scale,
             tail_padding_seconds=(
                 None if tail_pad_ms is None else int(tail_pad_ms) / 1000.0
             ),

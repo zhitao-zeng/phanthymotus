@@ -39,6 +39,20 @@ def _progress_hook(name: str):
     return hook
 
 MODELS = {
+    "asr_x_asr_prefix_lm": {
+        "base_url": (
+            "https://www.modelscope.cn/models/Flame4pd/"
+            "x-asr-exhibition-prefix-lm/resolve/"
+            "084684b9523dadc2105165bfa70efbf4bf133851"
+        ),
+        "files": {
+            "model.onnx": {
+                "size": 14474728,
+                "sha256": "198ba6ad5cd74d33761e433b9838a4f4b3fdb708f5e1d877ae803b63e1aadd75",
+            },
+        },
+        "check_file": "model.onnx",
+    },
     "asr": {
         "url": f"{COS_BASE}/sherpa-onnx-streaming-paraformer-bilingual-zh-en.zip",
         "check_file": "tokens.txt",

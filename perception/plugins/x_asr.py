@@ -83,6 +83,8 @@ class XASRAdapter:
         num_threads: int = 2,
         max_active_paths: int = None,
         tail_padding_seconds: float = None,
+        prefix_lm_path: str = "",
+        prefix_lm_scale: float = 0.0,
     ):
         from utils.onnx_provider import provider_for_device
 
@@ -119,6 +121,17 @@ class XASRAdapter:
 
         import sherpa_onnx
 
+        lm_scale = float(prefix_lm_scale)
+        if not 0.0 <= lm_scale <= 1.0:
+            raise ValueError("prefix_lm_scale must be between 0 and 1")
+        lm_options = {}
+        if lm_scale > 0:
+            if getattr(sherpa_onnx, "XASR_PREFIX_LM_VERSION", 0) != 1:
+                raise RuntimeError("X-ASR prefix LM requires the prefix-enabled CPU runtime")
+            if not prefix_lm_path or not Path(prefix_lm_path).is_file():
+                raise FileNotFoundError("X-ASR prefix LM model is missing")
+            lm_options = {"lm": prefix_lm_path, "lm_scale": lm_scale}
+
         # This bundle only exists in mixed int8/fp32 form, so ASR_MODELS lists no
         # gpu entry for it and device is effectively always cpu. The call stays so
         # a forced device=gpu is reported rather than silently honoured.
@@ -142,17 +155,19 @@ class XASRAdapter:
             hotwords_score=HOTWORDS_SCORE,
             modeling_unit="bpe",
             bpe_vocab=str(bpe_vocab),
+            **lm_options,
         )
         self._decode_lock = threading.Lock()
         log.info(
             "[asr] X-ASR adapter loaded: encoder=%s, device=%s, provider=%s, "
-            "max_active_paths=%d, tail_padding=%.2fs, hotwords_score=%.1f",
+            "max_active_paths=%d, tail_padding=%.2fs, hotwords_score=%.1f, prefix_lm_scale=%.3f",
             encoder,
             device,
             provider,
             self._max_active_paths,
             self._tail_padding_seconds,
             HOTWORDS_SCORE,
+            lm_scale,
         )
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
