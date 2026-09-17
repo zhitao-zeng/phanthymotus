@@ -297,6 +297,19 @@ ENV PYTHONUNBUFFERED=1
 # exactly the "garbage characters" that make `docker logs` unreadable.
 ENV RCUTILS_COLORIZED_OUTPUT=0
 
+# JP6 uses the ABI-matched CPU prefix runtime. JP5 retains its existing CPU
+# runtime and decoding defaults until a matching package is available.
+RUN if [ "${JP_VERSION}" = "61" ]; then \
+    python3 /work/utils/install_prefix_runtime.py \
+      --base-url https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-prefix-lm/resolve/993cdbf816ae172f0b492b99a29386222f626b73 \
+      --filename sherpa_onnx-1.13.6+prefix1-cp310-cp310-linux_aarch64.whl \
+      --size 13931489 \
+      --sha256 def36dac62c64ed68f9cdd2bcb0e13c87d0023e84aad612727ed8b03d4943dc4 && \
+    python3 -c "from utils.model_downloader import ensure_model; ensure_model('asr_x_asr_prefix_lm', '/models/sherpa-onnx/x-asr-prefix-lm')" && \
+    python3 -c "import yaml; p='/work/config.yaml'; cfg=yaml.safe_load(open(p)); cfg['plugins']['asr'].update(asr_beam_paths=16, asr_prefix_lm_scale=0.05); yaml.safe_dump(cfg, open(p, 'w'), allow_unicode=True, sort_keys=False)"; \
+    fi
+ENV PYTHONPATH="/opt/asr-prefix-runtime:${PYTHONPATH}"
+
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
      source /opt/ros/humble/install/setup.bash && \
