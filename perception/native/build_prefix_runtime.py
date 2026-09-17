@@ -72,6 +72,7 @@ def main():
     options = ['-DCMAKE_BUILD_TYPE=Release', '-DSHERPA_ONNX_ENABLE_BINARY=OFF',
                '-DSHERPA_ONNX_ENABLE_PORTAUDIO=OFF', '-DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF',
                '-DSHERPA_ONNX_ENABLE_TTS=OFF', '-DSHERPA_ONNX_ENABLE_GPU=OFF',
+               '-DSHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION=OFF',
                '-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF']
     if args.deps_dir:
         for directory in sorted(args.deps_dir.resolve().glob('*-src')):
