@@ -15,7 +15,9 @@ plugins:
   obstacle:
     enabled: true
     fps: 2
-    max_depth_m: 10.0
+    decision_threshold_m: 1.0
+    soft_timeout_s: 2.5
+    fallback_distance_m: 3.0
   asr:
     enabled: false
     # Matches the configSchema default. SenseVoice on CPU is also the faster of

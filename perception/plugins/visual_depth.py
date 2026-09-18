@@ -469,8 +469,7 @@ class _DepthNode(Node):
         self._scale_label = "metric"
         self._max_depth_m = max_depth_m
 
-        self._depth_pub = self.create_publisher(CompressedImage, self._depth_topic, _PUB_QOS)
-        self._summary_pub = self.create_publisher(String, self._summary_topic, _PUB_QOS)
+        self._create_publishers()
         self._sub: Optional[object] = None
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
@@ -485,6 +484,10 @@ class _DepthNode(Node):
         # on its own ThreadingHTTPServer thread and the canvas issues
         # config→start→stop→start within seconds.
         self._lifecycle_lock = threading.RLock()
+
+    def _create_publishers(self):
+        self._depth_pub = self.create_publisher(CompressedImage, self._depth_topic, _PUB_QOS)
+        self._summary_pub = self.create_publisher(String, self._summary_topic, _PUB_QOS)
 
     def request_stop(self) -> None:
         """Signal cancellation without taking the lock, so stop can abort a start."""

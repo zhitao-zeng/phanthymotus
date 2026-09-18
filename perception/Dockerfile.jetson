@@ -581,6 +581,7 @@ COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
 COPY perception/deploy/    /deploy/
+COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
 
 # Keep the fixed depth artifact in an image-owned path, outside /models mounts.
 RUN python3 -c "from utils.model_downloader import DEPTH_MODEL_BUNDLES, ensure_verified_bundle; \
