@@ -1218,20 +1218,11 @@ VOP_MODEL_BUNDLES = {
 
 DEPTH_MODEL_BUNDLES = {
     "jp61": {
-        "base_url": f"{VISION_MODEL_BASE}/yolo26n-depth/tensorrt-jp61-trt10.4-orin-640",
+        "base_url": "http://172.28.4.81:34567/zengzhitao/embodied-ai/obstacle-distance/yolo26s-indoor-metric-fp16-trt-v1/jp61",
         "files": {
-            "yolo26n-depth.engine": {
-                "size": 14020431,
-                "sha256": "d7fd1096fd2d29226b85693693a9ec11b65b0097ad0e783803b5fc7218d8f23b",
-            },
-        },
-    },
-    "jp511": {
-        "base_url": f"{VISION_MODEL_BASE}/yolo26n-depth/tensorrt-jp511-trt8.5-orin-640",
-        "files": {
-            "yolo26n-depth.engine": {
-                "size": 13059848,
-                "sha256": "2f9da78b4eb689a30860996c7b962770fd09d4d86a4578f1010844c3ef6d68c5",
+            "indoor-metric.engine": {
+                "size": 30838180,
+                "sha256": "6b8afab1f7f4633ce9d100211e3f39622c0478f34cff39589f4e3222601dde26",
             },
         },
     },

@@ -12,8 +12,12 @@ file_intake:
   retention_days: 7
 
 plugins:
-  asr:
+  obstacle:
     enabled: true
+    fps: 2
+    max_depth_m: 10.0
+  asr:
+    enabled: false
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
     # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
     # the largest gpu upside (fp16).
@@ -64,7 +68,7 @@ plugins:
       asr_kws_threshold: 0.3
 
   tts:
-    enabled: true
+    enabled: false
     engine: vits2-zh-en
     backend: trt
     model_dir: /models/vits2
@@ -127,7 +131,7 @@ plugins:
     language: en-us
 
   vop:
-    enabled: true
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     # Runs a prebuilt TensorRT engine. `yolov8s-worldv2` still resolves here for
     # cards saved before the switch, but the engine it loads is this one.
@@ -151,13 +155,10 @@ plugins:
     # loaded lazily on the first `start`, so an enabled-but-unwired card costs
     # nothing; the cost appears once something actually subscribes. On a tight
     # machine that does not consume depth, set this to false.
-    enabled: true
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     fps: 2
-    # Output is METRES. ultralytics bakes its metric fit into the exported
-    # engine (Depth.forward applies cal_a/cal_b before the export branch), and
-    # the released yolo26n-depth weights ship with that fit done — verified on
-    # Orin5 against the reference .pt on the same photos.
+    # The indoor depth engine emits metres directly.
     #
     # These two are a *site* refit on top of it, for when the generic fit is
     # off for a particular camera: metres_out = metres_in**cal_a * exp(cal_b).
@@ -168,7 +169,7 @@ plugins:
     max_depth_m: 20.0
 
   ocr:
-    enabled: true
+    enabled: false
     provider: rapidocr
     model_dir: /models/ocr/ppocrv6-small-trt
     device_id: 0
@@ -192,9 +193,9 @@ plugins:
     min_interval_ms: 0
 
   soundevent:
-    enabled: true
+    enabled: false
   face_recognition:
-    enabled: true
+    enabled: false
     # InsightFace buffalo_sc: SCRFD-500M detector + ArcFace MobileFaceNet.
     # Plain ONNX, so one bundle serves both JetPack lines and x86 dev hosts.
     model_dir: /models/face/buffalo_sc
