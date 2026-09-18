@@ -480,12 +480,18 @@ def _download_verified_bundle(
 # A truncated 780 MB transfer passes that and then fails at session creation in a
 # way nobody can diagnose. Here every file is pinned by size and SHA256.
 #
-# Provenance: derived from pengzhendong's ModelScope mirrors of the k2-fsa model
-# zoo, accepted only after that mirror's int8 weights were confirmed byte-identical
-# to the copies we already deploy from COS. The fp16 files are converted from the
-# mirror's fp32 with tools/convert_onnx_fp16.py.
+# Provenance: the paraformer bundle comes from pengzhendong's ModelScope mirror of
+# the k2-fsa model zoo. SenseVoice fp32 is fetched from the official k2-fsa HF
+# repository at the revision recorded in SENSEVOICE_FP32_MODEL_BASE.
 SHERPA_GPU_MODEL_BASE = os.environ.get(
     "SHERPA_GPU_MODEL_BASE_URL", f"{COS_BASE}/sherpa-onnx-gpu"
+)
+SENSEVOICE_FP32_MODEL_BASE = os.environ.get(
+    "SENSEVOICE_FP32_MODEL_BASE_URL"
+) or (
+    "https://hf-mirror.com/csukuangfj/"
+    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/"
+    "8383e9e195c9159795370bcc46613f49aeb98134"
 )
 SHERPA_GPU_BUNDLES = {
     # Streaming paraformer, fp32. fp16 exists but is NOT used here: on CUDA it
@@ -509,14 +515,16 @@ SHERPA_GPU_BUNDLES = {
             },
         },
     },
-    # Offline SenseVoice, fp16 — faster than fp32 on CUDA (344 ms vs 416 ms), half
-    # the size, and transcript-identical to fp32 on both providers.
-    "asr_sensevoice_gpu": {
-        "base_url": f"{SHERPA_GPU_MODEL_BASE}/sense-voice-zh-en-ja-ko-yue-2024-07-17-fp16",
+    # Offline SenseVoice, official fp32 export. The smaller fp16 export is not an
+    # admissible product candidate: it deterministically returned an empty
+    # transcript for clear English on both JP5.1.1 and JP6.1 CUDA runtimes. The
+    # pinned upstream revision below did not reproduce that loss on fp32.
+    "asr_sensevoice_gpu_fp32": {
+        "base_url": SENSEVOICE_FP32_MODEL_BASE,
         "files": {
-            "model.fp16.onnx": {
-                "size": 470225401,
-                "sha256": "b6b71a306afa7ccb48d2319b91567dfeefeb51f0f4eed9c88ec139cb10c14e09",
+            "model.onnx": {
+                "size": 937617178,
+                "sha256": "03b38fc8fde6a821f0953a980399c34eb38787a9a3094b73d956335049bc2612",
             },
             "tokens.txt": {
                 "size": 315894,
@@ -528,13 +536,32 @@ SHERPA_GPU_BUNDLES = {
 
 
 def ensure_gpu_model(name: str, model_dir: str) -> dict[str, str]:
-    """Ensure a `device: gpu` weight bundle is present and SHA256-verified."""
+    """Ensure a `device: gpu` weight bundle is present.
+
+    A completed ASR cache is reused by filename and exact byte size. Hashing a
+    938 MB immutable model in every service process added startup I/O without
+    changing the inference decision. A new or size-mismatched download still
+    goes through ``ensure_verified_bundle`` and is SHA256-checked before publish.
+    Vision engine bundles keep their stricter per-start verification path.
+    """
     bundle = SHERPA_GPU_BUNDLES.get(name)
     if bundle is None:
         raise KeyError(
             f"No GPU weight bundle named {name!r}; "
             f"available: {sorted(SHERPA_GPU_BUNDLES)}"
         )
+    paths = {
+        filename: os.path.join(model_dir, filename)
+        for filename in bundle["files"]
+    }
+    if all(
+        os.path.isfile(path)
+        and os.path.getsize(path) == bundle["files"][filename]["size"]
+        for filename, path in paths.items()
+    ):
+        log.info("[model_downloader] %s: size-matched bundle already at %s",
+                 name, model_dir)
+        return paths
     return ensure_verified_bundle(name, model_dir, bundle["base_url"],
                                   bundle["files"])
 

@@ -30,8 +30,13 @@ ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
 # would produce a jp6.1 base pinned to jp5.11's numpy — silently, and only
 # failing later at import. One argument in, everything else derived.
 #
+#   JP_VERSION     retained in the image so runtime `device: auto` can make the
+#                  measured JP6-GPU / JP5-CPU selection without probing CUDA.
 #   NUMPY_VERSION  matches the torch/cv2 stack each base ships, so nothing in
 #                  the base image is upgraded or downgraded under it.
+#   SHERPA_GPU_WHEEL  non-empty only for JP6.1. JP5.1.1 deliberately installs
+#                  the CPU wheel because SenseVoice fp32 CUDA exceeded its
+#                  acceptable memory envelope.
 #   PY_ABI         read from the interpreter, not from the base image's
 #                  PYTHON_VERSION env: jp5.11's base does not set that variable
 #                  at all (it happened to work only because the shell default
@@ -40,13 +45,14 @@ ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
 #
 # It is also a record: `docker exec <c> cat /etc/jetpack.env` says what line an
 # image was built for, which is otherwise guesswork from the tag alone.
+ARG SHERPA_GPU_WHEEL_61=jp61/sherpa_onnx-1.13.6+cuda-cp310-cp310-linux_aarch64.whl
 RUN case "${JP_VERSION}" in \
-        511) NUMPY=1.24.4 ;; \
-        61)  NUMPY=1.26.4 ;; \
-        *)   NUMPY=1.24.4 ;; \
+        511) NUMPY=1.24.4; WHEEL= ;; \
+        61)  NUMPY=1.26.4; WHEEL="${SHERPA_GPU_WHEEL_61}" ;; \
+        *)   NUMPY=1.24.4; WHEEL= ;; \
     esac; \
-    printf 'NUMPY_VERSION=%s\nPY_ABI=%s\n' \
-        "${NUMPY}" \
+    printf 'JP_VERSION=%s\nNUMPY_VERSION=%s\nSHERPA_GPU_WHEEL=%s\nPY_ABI=%s\n' \
+        "${JP_VERSION}" "${NUMPY}" "${WHEEL}" \
         "$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')" \
         > /etc/jetpack.env && \
     echo "[build] jp${JP_VERSION}:" && cat /etc/jetpack.env
@@ -163,16 +169,43 @@ RUN mkdir -p /work/weights/clip && \
 # Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
 ENV YOLO_CONFIG_DIR=/work
 
-# ── sherpa-onnx (CPU-only ASR) ────────────────────────────────────
-# This image selects the INT8 CPU SenseVoice bundle. Pin the runtime used by
-# the successful CPU-only ASR image and omit the unused CUDA provider.
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} "sherpa-onnx==1.13.6" && \
-    python3 -c "import sherpa_onnx; assert sherpa_onnx.__version__ == '1.13.6'; print('sherpa-onnx', sherpa_onnx.__version__, 'CPU-only')"
+# ── sherpa-onnx (JP6 CUDA / JP5 CPU) ──────────────────────────────
+# JP6.1 installs the in-house CUDA-enabled 1.13.6 wheel. JP5.1.1 keeps the
+# PyPI CPU wheel: fp32 CUDA was fast there too, but raised the ASR process HWM
+# above 3 GB. The device/weights split is selected by config `device: auto`.
+RUN . /etc/jetpack.env; \
+    if [ -n "${SHERPA_GPU_WHEEL}" ]; then \
+        FILE="$(basename "${SHERPA_GPU_WHEEL}")" && \
+        echo "[build] sherpa-onnx: GPU wheel for jp${JP_VERSION} — ${SHERPA_GPU_WHEEL}" && \
+        python3 -c "import urllib.request, urllib.parse, sys; \
+key, dest = sys.argv[1], sys.argv[2]; \
+urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/sherpa-onnx/' + urllib.parse.quote(key), dest)" \
+            "${SHERPA_GPU_WHEEL}" "/tmp/${FILE}" && \
+        pip3 install --no-cache-dir "/tmp/${FILE}" && \
+        rm -f "/tmp/${FILE}" && \
+        python3 -c "import sherpa_onnx, pathlib; \
+lib = pathlib.Path(sherpa_onnx.__file__).parent / 'lib' / 'libonnxruntime_providers_cuda.so'; \
+assert sherpa_onnx.__version__.startswith('1.13.6'), sherpa_onnx.__version__; \
+assert lib.is_file(), 'CUDA provider missing from the installed wheel'; \
+print('sherpa-onnx', sherpa_onnx.__version__, 'with CUDA provider')"; \
+    else \
+        echo "[build] sherpa-onnx: CPU wheel for jp${JP_VERSION}" && \
+        pip3 install --no-cache-dir -i ${PYPI_MIRROR} "sherpa-onnx==1.13.6" && \
+        python3 -c "import sherpa_onnx; assert sherpa_onnx.__version__ == '1.13.6'; print('sherpa-onnx', sherpa_onnx.__version__, 'CPU-only')"; \
+    fi
 
-# Seed the immutable stock SenseVoice bundle once at image build time so
-# parallel service processes do not perform concurrent runtime downloads.
+# Seed the one bundle that `device: auto` will use on each image. The optional
+# base URL is only a distribution override (e.g. a local HTTP server during a
+# test build); the pinned file manifest remains the same.
+ARG SENSEVOICE_FP32_MODEL_BASE_URL=
 COPY perception/utils/model_downloader.py /tmp/model_downloader.py
-RUN python3 -c "import sys; sys.path.insert(0, '/tmp'); from model_downloader import ensure_model; ensure_model('asr_sensevoice', '/models/sherpa-onnx/sensevoice')" && \
+RUN . /etc/jetpack.env; \
+    if [ "${JP_VERSION}" = "61" ]; then \
+        if [ -z "${SENSEVOICE_FP32_MODEL_BASE_URL}" ]; then unset SENSEVOICE_FP32_MODEL_BASE_URL; else export SENSEVOICE_FP32_MODEL_BASE_URL; fi && \
+        python3 -c "import sys; sys.path.insert(0, '/tmp'); from model_downloader import ensure_gpu_model; ensure_gpu_model('asr_sensevoice_gpu_fp32', '/models/sherpa-onnx/sensevoice-gpu-fp32')"; \
+    else \
+        python3 -c "import sys; sys.path.insert(0, '/tmp'); from model_downloader import ensure_model; ensure_model('asr_sensevoice', '/models/sherpa-onnx/sensevoice')"; \
+    fi && \
     rm -f /tmp/model_downloader.py
 
 # ── OCR runtime deps (PP-OCRv6 TensorRT engines; TensorRT/CUDA come from base) ──
@@ -265,6 +298,7 @@ WORKDIR /work
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
+COPY perception/assets/    /work/assets/
 COPY perception/config.yaml /work/config.yaml
 COPY perception/deploy/    /deploy/
 

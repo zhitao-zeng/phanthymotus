@@ -77,8 +77,10 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 
 ## sherpa-onnx Device Selection
 
-`device: cpu | gpu` (under `plugins.asr` and `plugins.tts` in `config.yaml`, and on
-the dashboard's config form) selects where sherpa-onnx runs. It defaults to `cpu`.
+`device: auto | cpu | gpu` (under `plugins.asr` in `config.yaml`, and on the
+dashboard's config form) selects where sherpa-onnx runs. ASR defaults to `auto`:
+JP6.1 selects the admitted fp32 CUDA path; JP5.1.1 selects int8 CPU. An unknown
+host also stays on CPU. TTS still accepts only its existing `cpu | gpu` setting.
 
 **The model follows the device, not the other way round.** `ASR_MODELS` in
 `plugins/asr.py` maps each (model, device) pair to the weights that pair loads,
@@ -88,35 +90,33 @@ just a different provider string.
 
 | `asr_model` | `device: cpu` | `device: gpu` | gpu speed-up |
 |-------------|---------------|---------------|--------------|
-| `sensevoice-small` (default) | int8, 228 MB | **fp16, 448 MB** | **3.4x** per utterance ⚠️ |
+| `sensevoice-small` (default) | int8, 228 MiB (JP5 auto) | **fp32, 894 MiB** (JP6 auto) | **~3–5x** in the deployed split |
 | `paraformer-zh-en` (streaming) | int8, 226 MB | **fp32, 825 MB** | **1.77x** |
 | `x-asr-zh-en` | int8 + fp32 | — not offered | 0.80x, i.e. slower |
 | `paraformer-offline` | int8 | — not offered | unmeasured |
 | `zipformer-en` | int8 | — not offered | unmeasured |
 
-⚠️ **`sensevoice-small` on gpu drops some utterances entirely** — fp16 under the
-CUDA provider returns an empty transcript for certain inputs, silently and
-reproducibly, on both JetPack lines. Read § jp6.1, and a silent failure the gpu
-path has always had before enabling it; the speed-up is real but so is the loss.
+The older SenseVoice fp16 CUDA candidate is deliberately absent from the
+registry: it returned an empty transcript for clear English on both JetPack
+lines. The admitted GPU bundle is the official fp32 export pinned in
+`utils/model_downloader.py`; see § JP6.1 FP32 admission and rejected FP16 path.
 
-**gpu costs about 2 GB of RAM, and ~1.4 GB of that is unreturnable.** Measured with
-only ASR resident: the cpu adapter adds 542 MB and drops back to 129 MB when
-released; the gpu adapter adds 1968 MB and still holds 1516 MB after release,
-because a process that has touched CUDA does not give its context and memory pool
-back. On a 7.4 GB Orin already running vop (YOLO), OCR (TensorRT) and TTS, turning
-on gpu ASR was enough to exhaust memory: perception was restarted in a loop, Agent
-Core could not reach port 15720, and the dashboard rolled the project back and the
-cards vanished. Budget for it before enabling.
+Memory is why `auto` is asymmetric. In the exact final images, the 70-case run
+reached a process HWM of about **1.15 GiB** on JP6 fp32 CUDA and **0.47 GiB** on
+JP5 int8 CPU. The older JP5 CUDA experiment exceeded 3 GiB and could exhaust a
+7.4 GiB box once vop/OCR/TTS were resident, so the JP5 image intentionally does
+not carry a CUDA sherpa-onnx wheel. These are process HWM figures on unified-memory
+Jetsons, not a promise about whole-box headroom; platform concurrency still needs
+its own measurement.
 
 TTS is simpler: Matcha is fp32 only, so both devices load the same files and
 `device` only picks the provider (gpu measured ~4.3x). The `vits2_trt` engine
 ignores `device` entirely — it is a TensorRT engine and never touches ONNX Runtime.
 
-`device: gpu` also needs a CUDA sherpa-onnx wheel. Both Jetson images install one —
-jp5.11 and jp6.1 each have their own build, because the wheel is tied to a
-CUDA/cuDNN pair and a CPython ABI (see § The CUDA wheels). On x86 dev hosts, and on
-any JetPack line we have not built a wheel for, it falls back to `cpu` with a
-warning rather than failing to start.
+`device: gpu` also needs a CUDA sherpa-onnx wheel. The JP6.1 image installs the
+matching wheel; JP5.1.1 installs the pinned CPU wheel. A baked JP5 `device: gpu`
+therefore resolves to CPU before choosing weights, and a runtime config request
+for GPU is rejected instead of accidentally running fp32 weights on the CPU.
 
 ### Latency per utterance, which is what an operator feels
 
@@ -142,53 +142,46 @@ than being constant, which is why it felt worse the longer you talked.
 perception, because the failure path forks `ldconfig` and forking a 3.6 GB
 many-threaded process is expensive. Out-of-process timing hid the entire problem.
 
-Inference alone, for comparison — real VAD segments (1–4 s), one at a time, rest of
-perception running:
+Inference alone in the exact final images (business services left running):
 
-| | cpu (int8) | gpu (fp16) |
-|---|---|---|
-| first call, cold process | 165 ms | 1659–2269 ms |
-| sustained p50 (40 calls) | 195 ms | **58 ms** |
-| sustained p99 | 326 ms | **78 ms** |
-| after 60 s idle | 159 ms | 73 ms |
+| input set | JP5.1.1 auto (int8 CPU) median | JP6.1 auto (fp32 CUDA) median |
+|---|---:|---:|
+| fixed12 | 177.5 ms | **77.5 ms** |
+| v3 70, whole files | 366.4 ms | **76.6 ms** |
+| v3 70, reference crops | 213.6 ms | **63.8 ms** |
 
-No drift across 40 calls (both halves at a 57.7 ms p50) and no idle cliff. The gpu
-p99 beats the cpu median, because vop and OCR contend for cores but not for the GPU.
+This is a deployment comparison across two JetPack boxes rather than a controlled
+same-host provider benchmark. It nevertheless verifies that `auto` chose the
+intended model and provider in each production image.
 
-`_warmup_adapter()` decodes a second of silence after building to keep CUDA's
-first-inference cost off the first real utterance. Be aware it does not fully
-absorb it: a cold process still measured 2269 ms on its first *real* segment after
-warming on silence, so the warmup does not cover every input shape. It is worth
-keeping — silence costs ~1.7 s inside the `loading` window either way — but the
-first utterance after a model switch can still be slow. (An earlier measurement
-that suggested warmup reduced this to 82 ms was an artifact of test ordering: an
-unwarmed adapter earlier in the same process had already paid the CUDA init.)
+`_warmup_adapter()` decodes a second of silence inside the loading window. In the
+final JP6 fp32 image it cost 0.36–0.46 s; total adapter build, including loading the
+894 MiB model, was 4.6–5.0 s with a local cache. GPU cache hits check exact byte
+sizes rather than re-hashing 938 MB in every service process; a first download is
+still SHA256-verified before being published.
 
 The batch figures in § Measurements are larger (up to 23x) because they decode the
 model's own `test_wavs`, which are 7 s each. Those compare dtypes with each other;
 this table is what a user experiences.
 
-### jp6.1, and a silent failure the gpu path has always had
+### JP6.1 FP32 admission and rejected FP16 path
 
-Same measurement on orin6 (Orin NX, JetPack 6.1, CUDA 12.6, onnxruntime-gpu
-1.18.1, 6 cores), SenseVoice, `num_threads=2`, through `_build_asr_adapter` so the
-registry and provider selection are the production ones. `provider_for_device('gpu',
-fp16)` returns `'cuda'`, and 120 calls per device:
+The admitted path was run through `_build_asr_adapter` in the final JP6 image:
+sherpa-onnx `1.13.6+cuda`, `device=auto -> gpu`, official fp32 `model.onnx`,
+provider `cuda`, and the product homophone FST enabled. Results were:
 
-| audio | cpu (int8) p50 / p99 | gpu (fp16) p50 / p99 | speed-up |
-|---|---|---|---|
-| rig's own VAD captures, 0.8–2.1 s | 119 / 194 ms | **49 / 58 ms** | 2.4x / 3.3x |
-| KWS bundle test_wavs, 4.5–16.7 s | 462 / 1305 ms | **67 / 169 ms** | 6.9x / 7.7x |
+| set | normalized 1-CER | empty | mean / p95 model-stage latency | process HWM |
+|---|---:|---:|---:|---:|
+| fixed12 | 0.7895 | 0/12 | 79.5 / 133.9 ms | 1.154 GiB |
+| v3 whole files | 0.5840 | 0/70 | 112.5 / 236.5 ms | 1.147 GiB |
+| v3 reference crops | 0.7609 | 0/70 | 79.0 / 207.6 ms | 1.147 GiB |
 
-The gpu p99 is below the cpu *minimum* in both rows, which is the useful sanity
-check that CUDA is actually doing the work. Longer audio wins more, consistent with
-the jp5.11 numbers. Building the gpu adapter took 3.7 s with weights already
-local, 86.3 s including the 449 MB fp16 download. Whole-box `MemAvailable` fell
-~605 MB while gpu was resident — well short of the ~2 GB the jp5.11 table reports,
-so budget from a measurement on the box you are deploying to rather than from
-either figure.
+The two English reference crops remained non-empty; the long instruction in case
+56 was transcribed completely with zero normalized character errors. The
+homophone FST improved the whole-file score from 0.5813 to 0.5840 by correcting
+two `小贩小贩` occurrences, and was neutral on the cropped set.
 
-**But `device: gpu` can lose an utterance outright.** SenseVoice fp16 under the
+**Why fp16 is not deployed.** SenseVoice fp16 under the
 CUDA provider returns an **empty** transcript for some inputs — deterministically,
 5/5 attempts, on the KWS bundle's own `en_0.wav`: 6.6 s of clear English peaking at
 0.535 FS, louder than the `en_1.wav` that decodes fine. Eight of the nine files in
@@ -203,15 +196,15 @@ together:
 | `model.fp16.onnx` + cpu | correct |
 | `model.fp16.onnx` + cuda | **empty** |
 
-So the fp16 export is fine and the CUDA provider is at fault. Reproduced on **both**
+So the fp16 export is fine and that provider/dtype combination is at fault.
+Reproduced on **both**
 lines — onnxruntime-gpu 1.16.0 on orin5 and 1.18.1 on orin6, byte-identical
 `model.fp16.onnx` — so it is not a property of either wheel and not new. An earlier
 note in `ASR_MODELS` claimed fp16 was "transcript-identical to fp32 on both
 providers"; that was wrong, and the failure is silent. An empty transcript is
 indistinguishable from silence, so the utterance is dropped with nothing in the
-log to say so. Untested alternative: SenseVoice fp32 on CUDA, which measured
-11.52x on jp5.11 and would still beat cpu — no fp32 bundle is published, so
-switching the registry to it means building one first.
+log to say so. The registry therefore pins the official fp32 export and its
+revision instead; no runtime path prefers or falls back to `model.fp16.onnx`.
 
 ### Switching engine or device blocks for the bounded part
 

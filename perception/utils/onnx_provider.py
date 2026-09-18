@@ -1,7 +1,8 @@
 """
 utils/onnx_provider.py — Validate a device choice and pick the weights for it.
 
-The plugin config exposes `device: cpu | gpu`; `ASR_MODELS` in plugins/asr.py
+The plugin config exposes `device: auto | cpu | gpu`; plugins/asr.py resolves
+`auto` to a concrete device before this module is called. `ASR_MODELS` there
 declares, per model, which weights each device loads. This module does not decide
 *what* to run — the registry does — it decides whether a (device, weights) pair is
 allowed to run, and helps adapters find the right file.
@@ -49,17 +50,16 @@ Three things follow, and they are the three rules below:
 newer than int8, the CUDA provider has no kernels for it either, and the CPU side
 lacks the dot-product paths that make int8 fast.
 
-**gpu costs memory, and most of it is unreturnable.** Measured on the same box with
-only ASR resident, SenseVoice:
+**gpu costs memory, and most of it is unreturnable.** The historical JP5 fp16
+experiment measured with only ASR resident:
 
     cpu (int8)  build +542 MB, back to  129 MB after the adapter is dropped
     gpu (fp16)  build +1968 MB, still  1516 MB after the adapter is dropped
 
-The residue is the CUDA context and its memory pool: once a process has touched
-CUDA it does not give that back. On a 7.4 GB Orin already running vop (YOLO), OCR
-(TensorRT) and TTS, enabling gpu ASR was enough to exhaust memory and get
-perception restarted in a loop. So `cpu` stays the default even on images that
-*can* use the GPU — gpu is a deliberate choice for a box with headroom.
+The residue is the CUDA context and its memory pool. The admitted final split is
+therefore JP6 fp32 CUDA (about 1.15 GiB process HWM on the 70-case run) and JP5
+int8 CPU (about 0.47 GiB). `device: auto` applies that policy; JP5's image does not
+install a CUDA sherpa-onnx wheel.
 
 **And the first gpu inference is the expensive one.** 1659 ms against a 58 ms
 steady state: lazy kernel loading, cuDNN autotuning and the memory pool all land
@@ -85,11 +85,9 @@ def cuda_available() -> bool:
     """True when the installed sherpa_onnx wheel bundles the CUDA provider.
 
     The marker is `sherpa_onnx/lib/libonnxruntime_providers_cuda.so`, which only a
-    `-DSHERPA_ONNX_ENABLE_GPU=ON` build ships. Both Jetson lines install such a
-    wheel from COS — jp5.11 and jp6.1 have separate builds, because the wheel is
-    tied to an ONNX Runtime version (and through it a CUDA/cuDNN pair) and to a
-    CPython ABI. A JetPack line we have not built a wheel for, and x86 dev hosts,
-    get the PyPI CPU wheel — see Dockerfile.jetson. This deliberately does not
+    `-DSHERPA_ONNX_ENABLE_GPU=ON` build ships. The JP6.1 image installs that wheel
+    from COS; JP5.1.1 and x86 dev hosts get the PyPI CPU wheel — see
+    Dockerfile.jetson. This deliberately does not
     probe the driver or create a session: on Jetson the wheel is built for the same
     L4T release it is deployed on, and a probe would cost a full ONNX Runtime
     session at import.

@@ -22,8 +22,11 @@ sherpa_onnx is stubbed out because importing plugins.asr pulls it in transitivel
 
 from __future__ import annotations
 
+import io
+import struct
 import sys
 import types
+import wave
 from pathlib import Path
 
 import pytest
@@ -95,6 +98,28 @@ def test_download_keys_resolve():
                 f"{model}/cpu download key {key!r} is not a MODELS entry"
 
 
+def test_gpu_cache_hit_does_not_rehash_large_model(monkeypatch, tmp_path):
+    payload = b"already-downloaded"
+    bundle = {
+        "base_url": "https://unused.invalid",
+        "files": {
+            "model.onnx": {
+                "size": len(payload),
+                # Deliberately not the payload digest: a cache hit must not read
+                # the whole model merely to recompute SHA on every process start.
+                "sha256": "0" * 64,
+            },
+        },
+    }
+    (tmp_path / "model.onnx").write_bytes(payload)
+    monkeypatch.setitem(model_downloader.SHERPA_GPU_BUNDLES, "test_fast_cache", bundle)
+    monkeypatch.setattr(model_downloader, "ensure_verified_bundle",
+                        lambda *args, **kwargs: pytest.fail("cache was rehashed"))
+
+    paths = model_downloader.ensure_gpu_model("test_fast_cache", str(tmp_path))
+    assert paths == {"model.onnx": str(tmp_path / "model.onnx")}
+
+
 def test_model_dirs_are_unique():
     """Two entries sharing a directory would download over each other's weights."""
     dirs = [spec["dir"] for _, _, spec in _device_specs()]
@@ -120,10 +145,100 @@ def test_device_field_is_shown_exactly_for_models_with_gpu_weights():
     assert sorted(shown_for) == asr.asr_models_supporting("gpu")
 
 
-def test_device_schema_default_is_cpu():
+def test_device_schema_default_is_auto():
     schema = asr.TOOLS[0]["configSchema"]["properties"]
-    assert schema["device"]["default"] == "cpu"
-    assert sorted(schema["device"]["enum"]) == ["cpu", "gpu"]
+    assert schema["device"]["default"] == "auto"
+    assert sorted(schema["device"]["enum"]) == ["auto", "cpu", "gpu"]
+
+
+@pytest.mark.parametrize(("jp_version", "expected"), [
+    ("61", "gpu"),
+    ("6.1", "gpu"),
+    ("511", "cpu"),
+    ("5.1.1", "cpu"),
+])
+def test_auto_device_uses_measured_jetpack_split(monkeypatch, jp_version, expected):
+    monkeypatch.setenv("JP_VERSION", jp_version)
+    monkeypatch.delenv("JETPACK_VERSION", raising=False)
+    assert asr._resolve_asr_device("auto") == expected
+
+
+def test_auto_device_reads_image_record(monkeypatch, tmp_path):
+    record = tmp_path / "jetpack.env"
+    record.write_text("JP_VERSION=61\n", encoding="utf-8")
+    monkeypatch.delenv("JP_VERSION", raising=False)
+    monkeypatch.delenv("JETPACK_VERSION", raising=False)
+    monkeypatch.setattr(asr, "_JETPACK_ENV_PATH", record)
+    assert asr._resolve_asr_device("auto") == "gpu"
+
+
+def test_auto_device_is_cpu_on_unknown_host(monkeypatch, tmp_path):
+    monkeypatch.delenv("JP_VERSION", raising=False)
+    monkeypatch.delenv("JETPACK_VERSION", raising=False)
+    monkeypatch.setattr(asr, "_JETPACK_ENV_PATH", tmp_path / "missing")
+    assert asr._resolve_asr_device("auto") == "cpu"
+
+
+@pytest.mark.parametrize(("requested", "expected"), [
+    ("cpu", "cpu"),
+    ("gpu", "cpu"),
+    ("cuda", "cpu"),
+])
+def test_jp511_never_selects_fp32_weights_for_its_cpu_only_wheel(
+        monkeypatch, requested, expected):
+    monkeypatch.setenv("JP_VERSION", "511")
+    assert asr._resolve_asr_device(requested) == expected
+
+
+def test_jp61_allows_explicit_gpu(monkeypatch):
+    monkeypatch.setenv("JP_VERSION", "61")
+    assert asr._resolve_asr_device("gpu") == "gpu"
+
+
+def test_jp511_runtime_config_rejects_explicit_gpu(monkeypatch):
+    monkeypatch.setenv("JP_VERSION", "511")
+    plugin = asr.ASRPlugin.__new__(asr.ASRPlugin)
+    plugin._language = "zh-CN"
+    plugin._asr_model = "sensevoice-small"
+    plugin._device = "cpu"
+
+    result = plugin.dispatch("asr", {"action": "config", "device": "gpu"})
+    assert result["status"] == "error"
+    assert result["device"] == "cpu"
+    assert "no CUDA sherpa-onnx wheel" in result["message"]
+
+
+@pytest.mark.parametrize(("jp_version", "expected_device", "download_kind"), [
+    ("61", "gpu", "gpu"),
+    ("511", "cpu", "cpu"),
+])
+def test_build_auto_selects_the_matching_sensevoice_bundle(
+        monkeypatch, jp_version, expected_device, download_kind):
+    captured = {}
+    downloads = []
+
+    def adapter(model_dir, device, num_threads, **kwargs):
+        captured.update(model_dir=model_dir, device=device,
+                        num_threads=num_threads, **kwargs)
+        return object()
+
+    monkeypatch.setenv("JP_VERSION", jp_version)
+    monkeypatch.setattr("utils.model_downloader.ensure_model",
+                        lambda name, path: downloads.append(("cpu", name, path)))
+    monkeypatch.setattr("utils.model_downloader.ensure_gpu_model",
+                        lambda name, path: downloads.append(("gpu", name, path)))
+    monkeypatch.setitem(asr.ASR_MODELS["sensevoice-small"], "adapter", adapter)
+
+    asr._build_asr_adapter({
+        "asr_model": "sensevoice-small",
+        "device": "auto",
+        "warmup": False,
+    })
+
+    spec = asr.ASR_MODELS["sensevoice-small"]["devices"][expected_device]
+    assert captured["device"] == expected_device
+    assert captured["model_dir"] == spec["dir"]
+    assert downloads == [(download_kind, spec["download"], spec["dir"])]
 
 
 def test_asr_models_supporting():
@@ -194,7 +309,7 @@ def test_build_warms_up_unless_disabled(monkeypatch, cfg, expect_warm):
     monkeypatch.setattr("utils.model_downloader.ensure_model",
                         lambda *a, **k: None)
     monkeypatch.setitem(asr.ASR_MODELS["sensevoice-small"], "adapter",
-                        lambda model_dir, device, num_threads: object())
+                        lambda model_dir, device, num_threads, **kwargs: object())
 
     asr._build_asr_adapter({"asr_model": "sensevoice-small", "device": "cpu", **cfg})
     assert bool(warmed) is expect_warm
@@ -208,3 +323,109 @@ def test_warmup_failure_does_not_propagate():
             raise RuntimeError("no session")
 
     asr._warmup_adapter(_Broken(), "sensevoice-small", "gpu")  # must not raise
+
+
+# ── SenseVoice phrase-level homophone replacement ───────────────────────────
+
+def test_sensevoice_homophone_replacer_is_opt_in():
+    assert asr._sensevoice_homophone_assets({}, "/models/sensevoice") == ("", "")
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    ("小白的PM2 .5浓度是多少？", "小白的PM2.5浓度是多少？"),
+    ("D 电影。", "D电影。"),
+    ("Fancy ,fancy .Please visit .", "Fancy, fancy. Please visit."),
+    ("hello ,你面前有什么", "hello,你面前有什么"),
+])
+def test_sensevoice_hr_spacing_preserves_product_format(raw, expected):
+    assert asr._normalize_sensevoice_hr_spacing(raw) == expected
+
+
+def test_sensevoice_homophone_assets_resolve_under_model_dir(tmp_path):
+    hr_dir = tmp_path / "hr"
+    hr_dir.mkdir()
+    lexicon = hr_dir / "lexicon.txt"
+    rule_fst = hr_dir / "replace.fst"
+    lexicon.write_text("范 fan4\n", encoding="utf-8")
+    rule_fst.write_bytes(b"fst")
+
+    got = asr._sensevoice_homophone_assets(
+        {"sensevoice_homophone_replacer": {"enabled": True}},
+        str(tmp_path),
+    )
+    assert got == (str(lexicon), str(rule_fst))
+
+
+def test_sensevoice_homophone_assets_fail_if_incomplete(tmp_path):
+    with pytest.raises(FileNotFoundError, match="homophone-replacer assets"):
+        asr._sensevoice_homophone_assets(
+            {"sensevoice_homophone_replacer": {"enabled": True}},
+            str(tmp_path),
+        )
+
+
+def test_build_passes_sensevoice_homophone_assets(monkeypatch, tmp_path):
+    hr_dir = tmp_path / "hr"
+    hr_dir.mkdir()
+    lexicon = hr_dir / "lexicon.txt"
+    rule_fst = hr_dir / "replace.fst"
+    lexicon.write_text("范 fan4\n", encoding="utf-8")
+    rule_fst.write_bytes(b"fst")
+    captured = {}
+
+    def adapter(model_dir, device, num_threads, **kwargs):
+        captured.update(model_dir=model_dir, device=device,
+                        num_threads=num_threads, **kwargs)
+        return object()
+
+    monkeypatch.setattr("utils.model_downloader.ensure_model",
+                        lambda *args, **kwargs: None)
+    monkeypatch.setitem(asr.ASR_MODELS["sensevoice-small"], "adapter", adapter)
+    asr._build_asr_adapter({
+        "asr_model": "sensevoice-small",
+        "device": "cpu",
+        "model_dir": str(tmp_path),
+        "warmup": False,
+        "sensevoice_homophone_replacer": {"enabled": True},
+    })
+
+    assert captured["hr_lexicon"] == str(lexicon)
+    assert captured["hr_rule_fst"] == str(rule_fst)
+
+
+def test_sensevoice_offline_decode_does_not_append_streaming_tail():
+    accepted = {}
+
+    class _Stream:
+        result = types.SimpleNamespace(text="ok")
+
+        def accept_waveform(self, sample_rate, samples):
+            accepted["sample_rate"] = sample_rate
+            accepted["samples"] = list(samples)
+
+    class _Recognizer:
+        def create_stream(self):
+            return _Stream()
+
+        def decode_streams(self, streams):
+            assert len(streams) == 1
+
+    pcm_samples = (1024, -2048, 4096)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(asr.SAMPLE_RATE)
+        wav_file.writeframes(struct.pack("<3h", *pcm_samples))
+
+    adapter = asr.SherpaOnnxSenseVoiceAdapter.__new__(
+        asr.SherpaOnnxSenseVoiceAdapter
+    )
+    adapter._recognizer = _Recognizer()
+    adapter._homophone_replacer_enabled = False
+
+    assert adapter.transcribe(buffer.getvalue(), "zh-CN") == "ok"
+    assert accepted["sample_rate"] == asr.SAMPLE_RATE
+    assert accepted["samples"] == pytest.approx(
+        [sample / 32768.0 for sample in pcm_samples]
+    )

@@ -3,29 +3,26 @@ mcp_port: 15720
 plugins:
   asr:
     enabled: true
-    # Matches the configSchema default. SenseVoice on CPU is also the faster of
-    # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
-    # the largest gpu upside (fp16).
+    # Matches the configSchema default. The same SenseVoice candidate runs the
+    # official fp32 export on JP6.1 CUDA and the stock int8 export on JP5.1.1 CPU.
     asr_model: sensevoice-small   # x-asr-zh-en | paraformer-zh-en | paraformer-offline | zipformer-en | sensevoice-small
-    # cpu | gpu — which weights get loaded is per (model, device) in
-    # plugins/asr.py ASR_MODELS. gpu needs the CUDA sherpa-onnx wheel (jetson
-    # jp5.11 only) and is only offered for models where it was benchmarked and
-    # the transcripts were read: sensevoice-small (fp16) and paraformer-zh-en
-    # (fp32). Everything else is cpu-only — int8 weights are slower on CUDA, not
-    # faster, because ONNX Runtime's CUDA provider has no int8 kernels.
-    #
-    # gpu is ~3.4x faster per utterance (58 ms vs 195 ms p50 on 1-4 s of speech)
-    # and costs ~2 GB RAM against ~0.5 GB on cpu, ~1.4 GB of it a CUDA context
-    # the process never returns. On a 7.4 GB Orin already running vop + OCR +
-    # TTS that is enough to run the box out of memory, so cpu is the default
-    # even on images that could use the GPU. Numbers in utils/onnx_provider.py.
-    device: cpu
+    # auto | cpu | gpu. auto is intentionally asymmetric: JP6.1 -> fp32 CUDA;
+    # JP5.1.1 -> int8 CPU. The latter avoids the >3 GB process high-water mark
+    # measured with a JP5 CUDA context. Explicit gpu is available only in the JP6
+    # image; the JP5 image has no CUDA sherpa-onnx wheel and stays on CPU.
+    device: auto
     num_threads: 2   # cpu only; 4 buys ~1.2-1.5x. Ignored on gpu.
     # Decode 1 s of silence after the model loads. On gpu the first inference
     # costs ~1.7 s (lazy kernels, cuDNN autotune, memory pool) against a 58 ms
     # steady state; without this the operator pays it on their first utterance.
     warmup: true
     language: zh-CN
+    # SenseVoice has no beam-search hotword bias. sherpa-onnx instead applies a
+    # conservative phrase-level pinyin FST after greedy decoding.
+    sensevoice_homophone_replacer:
+      enabled: true
+      lexicon: /work/assets/sensevoice_hr/lexicon.txt
+      rule_fst: /work/assets/sensevoice_hr/replace.fst
     vad:
       model: sherpa_onnx    # sherpa_onnx | silero (same silero_vad.onnx, via sherpa-onnx) | webrtc
       threshold: 0.5

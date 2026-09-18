@@ -16,6 +16,7 @@ import threading
 import time
 import wave
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Optional
 
 import rclpy
@@ -379,12 +380,11 @@ TOOLS = [
                 # field for the rest rather than offering a choice that would be
                 # rejected. Keep the list in sync with ASR_MODELS — the unit test
                 # test_asr_device_registry.py asserts they match.
-                "device":        {"type": "string", "enum": ["cpu", "gpu"],
-                                  "description": "Inference device. gpu loads non-quantised weights "
-                                                 "(~2.5x faster per utterance) but costs ~2 GB RAM "
-                                                 "vs ~0.5 GB on cpu, ~1.4 GB of which a CUDA context "
-                                                 "never gives back — check headroom before enabling",
-                                  "default": "cpu", "scope": "shared",
+                "device":        {"type": "string", "enum": ["auto", "cpu", "gpu"],
+                                  "description": "Inference device. auto selects verified FP32 CUDA "
+                                                 "on JP6.1 and INT8 CPU on JP5.1.1; explicit gpu is "
+                                                 "available only when the image has a CUDA wheel",
+                                  "default": "auto", "scope": "shared",
                                   "x-show-when": {"asr_model": ["paraformer-zh-en", "sensevoice-small"]}},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
                 "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
@@ -555,20 +555,20 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
     code-switching scenarios. Uses sherpa_onnx.OfflineRecognizer.
     """
 
-    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
+    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2,
+                 hr_lexicon: str = "", hr_rule_fst: str = ""):
         from utils.onnx_provider import pick_weights, provider_for_device
 
         import sherpa_onnx
-        # The gpu bundle ships fp16 (fastest here); the cpu bundle ships int8.
-        # fp32 is listed as a middle fallback for a hand-assembled directory.
-        # fp16 on CUDA is NOT transcript-identical — see the note on the
-        # sensevoice gpu entry in ASR_MODELS.
-        names = ("model.fp16.onnx", "model.onnx", "model.int8.onnx") \
-            if device == "gpu" else \
+        # The dedicated gpu directory contains only the verified fp32 export.
+        # Do not fall back to fp16 here: that variant silently lost clear English
+        # utterances on both supported JetPack CUDA runtimes.
+        names = ("model.onnx",) if device == "gpu" else \
             ("model.int8.onnx", "model.onnx")
         model_path = pick_weights(model_dir, *names)
         tokens_path = os.path.join(model_dir, "tokens.txt")
         provider = provider_for_device(device, (model_path,))
+        self._homophone_replacer_enabled = bool(hr_lexicon)
 
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
             model=model_path,
@@ -577,9 +577,12 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
             provider=provider,
             use_itn=True,
             language="auto",
+            hr_lexicon=hr_lexicon,
+            hr_rule_fsts=hr_rule_fst,
         )
         log.info(f"[asr] sherpa-onnx sensevoice adapter loaded: model={model_path}, "
-                 f"device={device}, provider={provider}")
+                 f"device={device}, provider={provider}, "
+                 f"homophone_replacer={bool(hr_lexicon)}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         import io as _io, wave as _wave
@@ -591,17 +594,33 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
         # Avoid a tuple of Python ints followed by a list of Python floats. On a
         # 30-second utterance those short-lived objects cost tens of megabytes
         # per process, which is material when several services share one device.
-        tail_samples = int(SAMPLE_RATE * 0.5)
-        float_samples = np.empty(n + tail_samples, dtype=np.float32)
+        # SenseVoice is a bidirectional offline model.  Appending the 500 ms
+        # right-context flush used by streaming models changes its whole-utterance
+        # attention output and regresses all three frozen evaluation sets.
+        float_samples = np.empty(n, dtype=np.float32)
         float_samples[:n] = np.frombuffer(pcm, dtype="<i2")
         float_samples[:n] *= 1.0 / 32768.0
-        float_samples[n:] = 0.0
 
         stream = self._recognizer.create_stream()
         stream.accept_waveform(SAMPLE_RATE, float_samples)
         self._recognizer.decode_streams([stream])
         text = stream.result.text
+        if self._homophone_replacer_enabled:
+            text = _normalize_sensevoice_hr_spacing(text)
         return text.strip()
+
+
+def _normalize_sensevoice_hr_spacing(text: str) -> str:
+    """Undo formatting-only spaces introduced by the native replacer.
+
+    Keep spaces between English words, but preserve the pre-replacer product
+    convention at CJK/ASCII boundaries and around decimal punctuation.
+    """
+    text = _re.sub(r"\s+([,.;:!?，。！？；：])", r"\1", text)
+    text = _re.sub(r"(?<=[A-Za-z])([,.;!?])(?=[A-Za-z])", r"\1 ", text)
+    text = _re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[A-Za-z0-9])", "", text)
+    text = _re.sub(r"(?<=[A-Za-z0-9])\s+(?=[\u3400-\u9fff])", "", text)
+    return text
 
 
 class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
@@ -723,29 +742,68 @@ ASR_MODELS = {
         "devices": {
             "cpu": {"download": "asr_sensevoice", "dtype": "int8",
                     "dir": "/models/sherpa-onnx/sensevoice"},
-            # fp16: 344 ms vs 416 ms for fp32 on CUDA, and half the size.
-            #
-            # KNOWN DEFECT, not fixed here: fp16 under the CUDA provider returns an
-            # **empty** transcript for some inputs. Reproduced deterministically
-            # (5/5) on the KWS bundle's own en_0.wav, 6.6 s of clear English at
-            # 0.535 FS, while en_1.wav and all seven Chinese files decode
-            # identically to cpu. Isolated to the provider, not the weights: the
-            # same model.fp16.onnx on the *cpu* provider transcribes en_0
-            # correctly. Present on both lines — onnxruntime-gpu 1.16.0 (jp5.11)
-            # and 1.18.1 (jp6.1) — so it is not a property of either wheel.
-            #
-            # An earlier comment here claimed fp16 was "transcript-identical to
-            # fp32 on both providers". It is not, and the failure mode is silent:
-            # an empty transcript is indistinguishable from silence, so the
-            # utterance is simply lost. Weigh that against the ~7x latency win
-            # before turning `device: gpu` on for this model.
-            "gpu": {"download": "asr_sensevoice_gpu", "dtype": "fp16",
-                    "dir": "/models/sherpa-onnx/sensevoice-gpu"},
+            # Official fp32 export. On JP6.1 it preserved the tested Chinese and
+            # English transcripts while reducing fixed12 median model-stage
+            # latency to ~78 ms. JP5.1.1 does not select this entry in auto mode because its
+            # CUDA context pushed the process high-water mark above 3 GB.
+            "gpu": {"download": "asr_sensevoice_gpu_fp32", "dtype": "fp32",
+                    "dir": "/models/sherpa-onnx/sensevoice-gpu-fp32"},
         },
     },
 }
 
 DEFAULT_ASR_MODEL = "sensevoice-small"
+
+_JETPACK_ENV_PATH = Path("/etc/jetpack.env")
+
+
+def _jetpack_line() -> str:
+    """Return the image's compact JetPack line (``61`` / ``511``), if known."""
+    raw = os.environ.get("JETPACK_VERSION") or os.environ.get("JP_VERSION")
+    if not raw:
+        try:
+            values = {}
+            for line in _JETPACK_ENV_PATH.read_text(encoding="utf-8").splitlines():
+                key, sep, value = line.partition("=")
+                if sep:
+                    values[key.strip()] = value.strip()
+            raw = values.get("JP_VERSION") or values.get("JETPACK_VERSION")
+        except OSError:
+            return ""
+    compact = _re.sub(r"[^0-9]", "", str(raw))
+    if compact.startswith("511"):
+        return "511"
+    if compact.startswith("61"):
+        return "61"
+    return compact
+
+
+def _resolve_asr_device(value: str | None,
+                        legacy_hw_provider: str | None = None) -> str:
+    """Resolve ``auto`` without probing CUDA or allocating a CUDA context.
+
+    JP6.1 has a measured, transcript-checked FP32 SenseVoice path with acceptable
+    memory. JP5.1.1 deliberately stays on INT8 CPU: loading fp32 CUDA there raised
+    the ASR process high-water mark above 3 GB. An unknown host also stays on CPU.
+    """
+    raw = (value or "").strip().lower()
+    if raw != "auto":
+        from utils.onnx_provider import normalize_device
+        resolved = normalize_device(value, legacy_hw_provider)
+        if resolved == "gpu" and _jetpack_line() == "511":
+            # This image intentionally carries the CPU wheel only. Selecting the
+            # fp32 bundle and then letting provider_for_device fall back would run
+            # fp32 on CPU, which is much slower than the stock int8 path.
+            log.warning("[asr] device=gpu requested on JP5.1.1, whose image has "
+                        "no CUDA sherpa-onnx wheel; using cpu")
+            return "cpu"
+        return resolved
+
+    line = _jetpack_line()
+    resolved = "gpu" if line == "61" else "cpu"
+    log.info("[asr] device=auto resolved to %s (JetPack=%s)",
+             resolved, line or "unknown")
+    return resolved
 
 
 def asr_models_supporting(device: str) -> list[str]:
@@ -773,9 +831,35 @@ def _model_dir_for(cfg: dict, spec: dict) -> str:
     return requested
 
 
-def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
-    from utils.onnx_provider import normalize_device
+def _sensevoice_homophone_assets(cfg: dict, model_dir: str) -> tuple[str, str]:
+    """Resolve optional phrase-level homophone replacement assets.
 
+    SenseVoice uses greedy CTC decoding, so sherpa-onnx cannot apply transducer
+    hotword scores. Its homophone replacer is a post-decode FST; both resources
+    must be present or the configured candidate is not reproducible.
+    """
+    hr_cfg = cfg.get("sensevoice_homophone_replacer") or {}
+    if not hr_cfg.get("enabled", False):
+        return "", ""
+
+    root = Path(model_dir)
+    lexicon = Path(hr_cfg.get("lexicon", "hr/lexicon.txt"))
+    rule_fst = Path(hr_cfg.get("rule_fst", "hr/replace.fst"))
+    if not lexicon.is_absolute():
+        lexicon = root / lexicon
+    if not rule_fst.is_absolute():
+        rule_fst = root / rule_fst
+
+    missing = [str(path) for path in (lexicon, rule_fst) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "SenseVoice homophone-replacer assets are incomplete: "
+            + ", ".join(missing)
+        )
+    return str(lexicon), str(rule_fst)
+
+
+def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
     model_name = cfg.get('asr_model', DEFAULT_ASR_MODEL)
     model_info = ASR_MODELS.get(model_name)
     if not model_info:
@@ -784,7 +868,7 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
         model_name = DEFAULT_ASR_MODEL
         model_info = ASR_MODELS[model_name]
 
-    device = normalize_device(cfg.get('device'), cfg.get('hw_provider'))
+    device = _resolve_asr_device(cfg.get('device'), cfg.get('hw_provider'))
     if device not in model_info["devices"]:
         # Degrade rather than refuse to boot: a baked config.yaml asking for a
         # device this model has no verified weights for should still come up on
@@ -807,7 +891,17 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
         ensure_model(spec["download"], model_dir)
 
     num_threads = int(cfg.get('num_threads', 2))
-    adapter = model_info["adapter"](model_dir, device, num_threads)
+    if model_name == "sensevoice-small":
+        hr_lexicon, hr_rule_fst = _sensevoice_homophone_assets(cfg, model_dir)
+        adapter = model_info["adapter"](
+            model_dir,
+            device,
+            num_threads,
+            hr_lexicon=hr_lexicon,
+            hr_rule_fst=hr_rule_fst,
+        )
+    else:
+        adapter = model_info["adapter"](model_dir, device, num_threads)
     if cfg.get('warmup', True):
         _warmup_adapter(adapter, model_name, device)
     return adapter
@@ -1570,14 +1664,13 @@ class ASRPlugin:
     PREFIX = "asr"
 
     def __init__(self, plugin_cfg: dict, executor):
-        from utils.onnx_provider import normalize_device
         self._language     = plugin_cfg.get('language', 'zh-CN')
         self._asr_model    = plugin_cfg.get('asr_model', DEFAULT_ASR_MODEL)
         # Mirrors what _build_asr_adapter resolved, including its fall back to cpu
         # for a model with no weights for the requested device, so `info` and the
         # next `config` comparison report what is actually loaded.
-        self._device       = normalize_device(plugin_cfg.get('device'),
-                                             plugin_cfg.get('hw_provider'))
+        self._device       = _resolve_asr_device(plugin_cfg.get('device'),
+                                                plugin_cfg.get('hw_provider'))
         if self._device not in ASR_MODELS.get(self._asr_model, {}).get("devices", {}):
             self._device = "cpu"
         self._plugin_cfg   = plugin_cfg
@@ -1844,14 +1937,24 @@ class ASRPlugin:
             # so both go through the same background reload. Validated together
             # because a request can change both at once, and whether a device is
             # allowed depends on the model.
-            from utils.onnx_provider import normalize_device
             new_model = cfg.get('asr_model', self._asr_model)
-            new_device = (normalize_device(cfg['device']) if 'device' in cfg
+            new_device = (_resolve_asr_device(cfg['device']) if 'device' in cfg
                           else self._device)
+            requested_device = str(cfg.get('device', '')).strip().lower()
+            if requested_device in ('gpu', 'cuda', 'nvidia') and new_device != 'gpu':
+                return {"status": "error", "asr_model": self._asr_model,
+                        "device": self._device,
+                        "message": "This JetPack image has no CUDA sherpa-onnx "
+                                   "wheel; use device=cpu or device=auto"}
             if new_model not in ASR_MODELS:
                 return {"status": "error", "asr_model": self._asr_model,
                         "message": f"Unknown asr_model '{new_model}'; "
                                    f"available: {', '.join(sorted(ASR_MODELS))}"}
+            # `auto` is a platform policy, not a demand that every model own GPU
+            # weights. A CPU-only model selected on JP6 should remain usable.
+            requested_auto = str(cfg.get('device', '')).strip().lower() == 'auto'
+            if requested_auto and new_device not in ASR_MODELS[new_model]["devices"]:
+                new_device = "cpu"
             if new_device not in ASR_MODELS[new_model]["devices"]:
                 # Reject rather than silently degrade: someone is looking at the
                 # result of this call, and a request for gpu that quietly runs on
