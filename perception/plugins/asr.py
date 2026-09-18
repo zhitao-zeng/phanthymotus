@@ -1081,15 +1081,44 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             wf.writeframes(pcm_bytes)
         _enforce_retention()
 
+    last_ts = 0.0
+    tail_padded = False
     while not stop_evt.is_set():
         try:
             pcm, ts = pcm_q.get(timeout=1)
+            tail_padded = False
         except Exception:
-            continue
-
-        audio_count += 1
-        if audio_count == 1:
-            _log.info(f"[vad-worker] first audio chunk received! len={len(pcm)}")
+            # Audio stopped. The VAD only reports a segment once
+            # min_silence_duration of trailing silence has elapsed, and nothing
+            # in this process calls flush() — so an utterance that ends close to
+            # the end of the stream is never emitted at all. Measured on the 42
+            # V5 cases, that costs 63 deletions and 7.07 points of 1-CER, and it
+            # gets worse as silence_ms grows, because a longer window is a longer
+            # tail to lose.
+            #
+            # Feed the silence the VAD is waiting for rather than flushing it:
+            # the segment then closes through the normal path, so timestamps,
+            # pre-roll and the KWS gate all behave exactly as they do mid-stream.
+            # Once per quiet period, and only after real audio has arrived.
+            if audio_count == 0 or tail_padded:
+                continue
+            tail_padded = True
+            # Sweeping the pad on the 42 V5 cases: silence_ms + 100ms and + 400ms
+            # both leave 43 deletions; 800ms and beyond reach 34, the same count a
+            # direct flush() gives. Silero needs well over one min_silence_duration
+            # of real silence to close a segment, so pad to twice the window plus
+            # half a second. Overshooting only costs feeding zeros once per quiet
+            # period, while undershooting silently drops the utterance.
+            pad_samples = 2 * silence_samples + SAMPLE_RATE // 2
+            pcm = b'\x00\x00' * pad_samples
+            ts = last_ts + pad_samples / SAMPLE_RATE
+            _log.info(f"[vad-worker] input idle, padding {pad_samples} samples of "
+                      f"silence to close any open segment")
+        else:
+            last_ts = ts
+            audio_count += 1
+            if audio_count == 1:
+                _log.info(f"[vad-worker] first audio chunk received! len={len(pcm)}")
 
         # Convert PCM bytes to float samples
         n = len(pcm) // 2
