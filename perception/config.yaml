@@ -33,18 +33,29 @@ plugins:
     vad:
       model: sherpa_onnx    # sherpa_onnx | silero (same silero_vad.onnx, via sherpa-onnx) | webrtc
       threshold: 0.5
-      # silence_ms 700 / pre_roll_ms 250 measured 71.07% -> 79.87% 1-CER on the
-      # 42 V5 cases, but the gain does not come from excluding anything. A
-      # longer window merges nearby conversation into the same segment as the
-      # command, and the model then emits nothing for it — the background audio
-      # is still fed in, the decoder just leaves it blank in a long utterance
-      # dominated by near-field speech. Nothing guarantees that ordering holds:
-      # ID33 regressed from 7 substitutions to 12 under the same merge, and a
-      # closer bystander or a more distant speaker could invert it outright.
-      # Held back pending an independent dev/guard run that specifically probes
-      # the reverse failure, where the target is the voice being swallowed.
-      silence_ms: 400
-      pre_roll_ms: 500
+      # 400ms closes a segment after every brief pause, so conversation that is
+      # not addressed to the robot becomes its own segment and gets transcribed.
+      # 700 merges it into the same segment as the command instead, after which
+      # the decoder emits nothing for it. Note what that is not: the background
+      # audio is still fed in — ID37's single 0.26-17.41s segment covers all of
+      # it — and decoding that same span alone still produces text. The wider
+      # window does not exclude anything; a long utterance dominated by
+      # near-field speech simply leaves the rest blank. 71.07% -> 79.87% 1-CER
+      # over the 42 V5 cases.
+      #
+      # Since the mechanism is emergent rather than a gate, the reverse failure
+      # was probed directly: 60 constructed trials of real background, a 500ms
+      # gap, and a target of known text, swept across four target gains. The
+      # wider window won every gain by 5.97-13.98 points and never lost a whole
+      # utterance (0/60), but deletions rose by 16-18 characters per 60 at the
+      # higher gains — the command does shed fragments. Counter to intuition it
+      # is the louder target that sheds more, and ID28's background peaks above
+      # its target yet is still dropped, so relative level does not explain the
+      # behaviour and it should not be assumed to hold off the bench.
+      #
+      # pre_roll 250 holds deletions at 24 where 0 pushes them to 43.
+      silence_ms: 700
+      pre_roll_ms: 250
     kws:
       enabled: false
       model_dir: /models/sherpa-onnx/kws
