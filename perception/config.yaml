@@ -33,20 +33,18 @@ plugins:
     vad:
       model: sherpa_onnx    # sherpa_onnx | silero (same silero_vad.onnx, via sherpa-onnx) | webrtc
       threshold: 0.5
-      # Measured over the 42 V5 cases with the product's own idle-padding path.
-      # silence_ms 400 closes a segment after every brief pause, so nearby
-      # conversation that is not addressed to the robot becomes its own segment
-      # and gets transcribed: 7 of the 42 files lost 51 insertions once the
-      # segment count dropped. 700 needs a longer pause to close and those
-      # bursts stop forming segments at all. pre_roll 250 keeps deletions at 24
-      # where 0 pushes them to 43 — dropping a real command costs more than an
-      # extra word. Together 71.07% -> 79.87% 1-CER.
-      #
-      # These were tuned on V5, which is the acceptance set and has been looked
-      # at many times, so the number above is not evidence of generalisation.
-      # Validate on an independent dev/guard set before treating it as one.
-      silence_ms: 700
-      pre_roll_ms: 250
+      # silence_ms 700 / pre_roll_ms 250 measured 71.07% -> 79.87% 1-CER on the
+      # 42 V5 cases, but the gain does not come from excluding anything. A
+      # longer window merges nearby conversation into the same segment as the
+      # command, and the model then emits nothing for it — the background audio
+      # is still fed in, the decoder just leaves it blank in a long utterance
+      # dominated by near-field speech. Nothing guarantees that ordering holds:
+      # ID33 regressed from 7 substitutions to 12 under the same merge, and a
+      # closer bystander or a more distant speaker could invert it outright.
+      # Held back pending an independent dev/guard run that specifically probes
+      # the reverse failure, where the target is the voice being swallowed.
+      silence_ms: 400
+      pre_roll_ms: 500
     kws:
       enabled: false
       model_dir: /models/sherpa-onnx/kws
