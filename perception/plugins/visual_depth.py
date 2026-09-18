@@ -23,27 +23,10 @@ Two constraints worth knowing before changing anything here:
   published at the model's native resolution renders as a blank panel with
   nothing logged anywhere. Everything is resampled to 640x480 before publishing.
 
-* **The output is metres, straight out of the engine.** This file used to claim
-  the opposite — that the numbers were a relative scale until someone ran
-  `model.calibrate()` — and labelled every payload `"scale": "relative"`. That
-  was wrong, and it is the more dangerous direction of wrong: an agent told the
-  distances are meaningless will not use them.
-
-  The head predicts a relative log-depth field, but the metric transform is
-  applied *inside* `Depth.forward` (`depth.pow(cal_a) * cal_b.exp()`, ultralytics
-  `nn/modules/head.py`) **before** the export branch — so it is baked into the
-  exported ONNX and into our TensorRT engine. The released yolo26n-depth weights
-  ship with that fit already done (cal_a=1.0, cal_b=-0.1938).
-
-  Measured on Orin5 against the reference `.pt`, same photos: a landscape gives
-  2.4–35.7 m here vs 2.6–48.1 m there; ultralytics' bus.jpg gives 1.3–16.3 m vs
-  2.2–17.8 m. Metres, with the error you would expect from fp16 at 640.
-
-  What `model.calibrate()` buys is a refit for *your* camera. Until that is done
-  these are metres from a general-purpose fit — good enough to compare and to
-  reason about, not survey-grade. `cal_a` / `cal_b` in the config apply such a
-  refit on top of the engine's own, using ultralytics' own parameterisation so a
-  fit obtained there can be pasted here unchanged.
+* The indoor YOLO26-S engine emits metres directly and takes stretched RGB
+  images in [0, 1]. Its metric transformation is included in the export.
+  The optional cal_a/cal_b site calibration remains separate and defaults to
+  identity. A site's calibration must be measured for that camera.
 """
 
 from __future__ import annotations
@@ -669,11 +652,11 @@ class VideoDepthPerceptionPlugin:
 
             model_dir = os.environ.get("DEPTH_MODEL_DIR", "/models/depth")
             progress_cb, _ = fetch_status(
-                lambda text: setattr(self, "_model_load_status", text), "yolo26n-depth")
+                lambda text: setattr(self, "_model_load_status", text), "yolo26s-depth")
             paths = ensure_depth_model(model_dir, progress_cb=progress_cb)
             engine = next(p for name, p in paths.items() if name.endswith(".engine"))
             log.info(f"[visual_depth] loading engine: {engine}")
-            self._model = VisionEngineSession(engine)
+            self._model = VisionEngineSession(engine, resize_mode="stretch")
             log.info(f"[visual_depth] engine loaded, input={self._model.input_size}")
 
     def _start_node(self, node_key: str, input_topic: Optional[str]):
@@ -901,11 +884,11 @@ class VideoDepthPerceptionPlugin:
         if action == "info":
             if self._model_loading:
                 return {"name": "VideoDepthPerception", "manufacture": "Embodied",
-                        "model": "yolo26n-depth", "state": "loading",
+                        "model": "yolo26s-depth", "state": "loading",
                         "desc": "Loading depth engine..."}
             if self._model_load_error:
                 return {"name": "VideoDepthPerception", "manufacture": "Embodied",
-                        "model": "yolo26n-depth", "state": "error",
+                        "model": "yolo26s-depth", "state": "error",
                         "desc": f"Engine load failed: {self._model_load_error}"}
 
             with self._nodes_lock:
@@ -945,7 +928,7 @@ class VideoDepthPerceptionPlugin:
             scale = "metric"
             info = {
                 "name": "VideoDepthPerception", "manufacture": "Embodied",
-                "model": "yolo26n-depth",
+                "model": "yolo26s-depth",
                 "state": "running" if instances else "idle",
                 "scale": scale,
                 "instances": instances,

@@ -199,7 +199,7 @@ def decode_detections(outputs, meta: LetterboxMeta, conf: float) -> tuple[np.nda
 
 # ── depth decoding ───────────────────────────────────────────────────────────
 
-def decode_depth(outputs, meta: LetterboxMeta) -> np.ndarray:
+def decode_depth(outputs, meta: Optional[LetterboxMeta]) -> np.ndarray:
     """Decode a dense depth output and crop the letterbox padding back off.
 
     Like decode_detections, this takes the engine's full output list and picks
@@ -220,6 +220,10 @@ def decode_depth(outputs, meta: LetterboxMeta) -> np.ndarray:
         shapes = [tuple(np.asarray(a).shape) for a in _as_candidates(outputs)]
         raise VisionDecodeError(f"no engine output {shapes} is a 2-D depth map")
 
+    # Stretched depth inputs use the entire canvas and have no padded border.
+    if meta is None:
+        return array
+
     inner_w = max(1, round(meta.orig_w * meta.scale))
     inner_h = max(1, round(meta.orig_h * meta.scale))
     pad_x, pad_y = int(meta.pad_x), int(meta.pad_y)
@@ -234,13 +238,19 @@ def decode_depth(outputs, meta: LetterboxMeta) -> np.ndarray:
 # ── engine session ───────────────────────────────────────────────────────────
 
 class VisionEngineSession:
-    """One TensorRT engine plus the letterbox that feeds it.
+    """One TensorRT engine with its matching image resize policy.
 
     Thread safety comes from TensorRTEngine, which serializes `infer`; this
     class adds no mutable state of its own beyond the cached input geometry.
+    Detection and released depth models use letterbox. Depth models trained
+    on stretched images use the full canvas and return no padding metadata.
     """
 
-    def __init__(self, engine_path, *, device_id: int = 0):
+    def __init__(self, engine_path, *, device_id: int = 0,
+                 resize_mode: str = "letterbox"):
+        if resize_mode not in ("letterbox", "stretch"):
+            raise ValueError(f"unsupported resize mode: {resize_mode}")
+        self._resize_mode = resize_mode
         from utils.tensorrt_runtime import TensorRTEngine
 
         self._engine = TensorRTEngine(engine_path, device_id=device_id)
@@ -285,8 +295,15 @@ class VisionEngineSession:
             return list(names)
         return []
 
-    def infer(self, frame: np.ndarray) -> tuple[list, LetterboxMeta]:
-        canvas, meta = letterbox(frame, self._in_w, self._in_h)
+    def infer(self, frame: np.ndarray) -> tuple[list, Optional[LetterboxMeta]]:
+        if self._resize_mode == "stretch":
+            import cv2
+
+            canvas = cv2.resize(frame, (self._in_w, self._in_h),
+                                interpolation=cv2.INTER_LINEAR)
+            meta = None
+        else:
+            canvas, meta = letterbox(frame, self._in_w, self._in_h)
         blob = to_blob(canvas, self._engine.input_dtype)
         return self._engine.infer(blob), meta
 
