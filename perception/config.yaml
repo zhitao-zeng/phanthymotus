@@ -6,11 +6,18 @@ plugins:
     # Matches the configSchema default. The same SenseVoice candidate runs the
     # official fp32 export on JP6.1 CUDA and the stock int8 export on JP5.1.1 CPU.
     asr_model: sensevoice-small   # x-asr-zh-en | paraformer-zh-en | paraformer-offline | zipformer-en | sensevoice-small
-    # auto | cpu | gpu. auto is intentionally asymmetric: JP6.1 -> fp32 CUDA;
-    # JP5.1.1 -> int8 CPU. The latter avoids the >3 GB process high-water mark
-    # measured with a JP5 CUDA context. Explicit gpu is available only in the JP6
-    # image; the JP5 image has no CUDA sherpa-onnx wheel and stays on CPU.
-    device: auto
+    # auto | cpu | gpu. auto is asymmetric by design: JP6.1 -> fp32 CUDA,
+    # JP5.1.1 -> int8 CPU, the latter avoiding the >3 GB process high-water mark
+    # a JP5 CUDA context produced. Explicit gpu exists only in the JP6 image.
+    #
+    # cpu, not auto, because auto makes the JP6 build fetch the 938 MB fp32
+    # bundle from hf-mirror.com, and the leaderboard build host answers 403 for
+    # that domain — the 2026-09-19 run died there before any audio was decoded.
+    # Everything the X-ASR line pulls comes from ModelScope and COS, which that
+    # host can reach. Mirroring the bundle there would restore auto; until then
+    # a GPU path nobody has validated on hardware is not worth a build that
+    # cannot run.
+    device: cpu
     num_threads: 2   # cpu only; 4 buys ~1.2-1.5x. Ignored on gpu.
     # Decode 1 s of silence after the model loads. On gpu the first inference
     # costs ~1.7 s (lazy kernels, cuDNN autotune, memory pool) against a 58 ms
