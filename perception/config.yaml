@@ -26,8 +26,23 @@ plugins:
     vad:
       model: sherpa_onnx    # sherpa_onnx | silero (same silero_vad.onnx, via sherpa-onnx) | webrtc
       threshold: 0.5
-      silence_ms: 400
-      pre_roll_ms: 500
+      # 400ms closes a segment at every brief pause, so a bystander's sentence
+      # becomes its own segment and gets transcribed. 700 merges it into the
+      # segment carrying the command and the decoder stops emitting it. Measured
+      # on the 42 V5 cases with this model: 58.53% -> 72.13% 1-CER, insertions
+      # 180 -> 93.
+      #
+      # This was first found on the X-ASR transducer, where it is worth +10.59
+      # on the leaderboard. It was not obvious it would carry: SenseVoice
+      # decodes CTC greedily, and nothing about "a long utterance leaves the
+      # rest blank" follows from scoring frames without an emitted prefix. It
+      # carries, and by more (+13.60 here against +8.80 there) — but the reason
+      # is still not understood on either architecture, so treat it as measured
+      # behaviour rather than a property to rely on.
+      #
+      # Tuned on V5, which is the acceptance set. Same-set reading.
+      silence_ms: 700
+      pre_roll_ms: 250
     save_vad_segments: false
     kws:
       enabled: false
