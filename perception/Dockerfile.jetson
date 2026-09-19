@@ -194,13 +194,21 @@ print('sherpa-onnx', sherpa_onnx.__version__, 'with CUDA provider')"; \
         python3 -c "import sherpa_onnx; assert sherpa_onnx.__version__ == '1.13.6'; print('sherpa-onnx', sherpa_onnx.__version__, 'CPU-only')"; \
     fi
 
-# Seed the one bundle that `device: auto` will use on each image. The optional
-# base URL is only a distribution override (e.g. a local HTTP server during a
-# test build); the pinned file manifest remains the same.
+# Seed the bundle the image will actually run. This used to key off JP_VERSION
+# alone and pull the 938 MB fp32 bundle on every JP6.1 build, independent of
+# what `device` was set to — so pinning the config to cpu did not stop it. The
+# fp32 bundle comes from hf-mirror.com, which the leaderboard build host answers
+# 403 for, and the 2026-09-19 build died there (job 85dd4855) before decoding
+# anything.
+#
+# SENSEVOICE_GPU_BUNDLE opts in instead, defaulting off. Set it to 1 only where
+# that domain is reachable, or after mirroring the bundle to COS alongside
+# everything else this image pulls.
 ARG SENSEVOICE_FP32_MODEL_BASE_URL=
+ARG SENSEVOICE_GPU_BUNDLE=0
 COPY perception/utils/model_downloader.py /tmp/model_downloader.py
 RUN . /etc/jetpack.env; \
-    if [ "${JP_VERSION}" = "61" ]; then \
+    if [ "${JP_VERSION}" = "61" ] && [ "${SENSEVOICE_GPU_BUNDLE}" = "1" ]; then \
         if [ -z "${SENSEVOICE_FP32_MODEL_BASE_URL}" ]; then unset SENSEVOICE_FP32_MODEL_BASE_URL; else export SENSEVOICE_FP32_MODEL_BASE_URL; fi && \
         python3 -c "import sys; sys.path.insert(0, '/tmp'); from model_downloader import ensure_gpu_model; ensure_gpu_model('asr_sensevoice_gpu_fp32', '/models/sherpa-onnx/sensevoice-gpu-fp32')"; \
     else \
