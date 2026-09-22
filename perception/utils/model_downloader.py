@@ -1216,22 +1216,26 @@ VOP_MODEL_BUNDLES = {
     },
 }
 
+_DEPTH_MODEL_BASE = (
+    "https://modelscope.cn/api/v1/models/Flame4pd/obstacle-indoor-yolo26s-trt/repo"
+    "?Revision=dd09f801bf732586b09ba9c1aa15f944d465c535&FilePath="
+)
 DEPTH_MODEL_BUNDLES = {
     "jp61": {
-        "base_url": f"{VISION_MODEL_BASE}/yolo26n-depth/tensorrt-jp61-trt10.4-orin-640",
+        "base_url": _DEPTH_MODEL_BASE + "jp61/{file}",
         "files": {
-            "yolo26n-depth.engine": {
-                "size": 14020431,
-                "sha256": "d7fd1096fd2d29226b85693693a9ec11b65b0097ad0e783803b5fc7218d8f23b",
+            "indoor-metric.engine": {
+                "size": 30838180,
+                "sha256": "6b8afab1f7f4633ce9d100211e3f39622c0478f34cff39589f4e3222601dde26",
             },
         },
     },
     "jp511": {
-        "base_url": f"{VISION_MODEL_BASE}/yolo26n-depth/tensorrt-jp511-trt8.5-orin-640",
+        "base_url": _DEPTH_MODEL_BASE + "jp511/{file}",
         "files": {
-            "yolo26n-depth.engine": {
-                "size": 13059848,
-                "sha256": "2f9da78b4eb689a30860996c7b962770fd09d4d86a4578f1010844c3ef6d68c5",
+            "indoor-metric.engine": {
+                "size": 27019922,
+                "sha256": "4cb00f5bd4d2609c8a91eb0a9b8759484699eb7075a6c806ecafa5bd590a4029",
             },
         },
     },
@@ -1281,5 +1285,11 @@ def ensure_vop_model(model_dir: str, family: str | None = None,
 def ensure_depth_model(model_dir: str, family: str | None = None,
                        progress_cb=None) -> dict[str, str]:
     """Ensure the monocular depth engine matching the runtime TensorRT is present."""
-    return _ensure_vision_bundle("depth", DEPTH_MODEL_BUNDLES, model_dir, family,
+    key = select_bundle_family(DEPTH_MODEL_BUNDLES, family)
+    files = DEPTH_MODEL_BUNDLES[key]["files"]
+    # Image-owned weights remain visible when /models is a host mount.
+    seed_dir = "/opt/vision-depth"
+    if _bundle_matches(seed_dir, files):
+        return {name: os.path.join(seed_dir, name) for name in files}
+    return _ensure_vision_bundle("depth", DEPTH_MODEL_BUNDLES, model_dir, key,
                                  progress_cb=progress_cb)

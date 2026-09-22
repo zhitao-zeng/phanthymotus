@@ -581,6 +581,12 @@ COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
 COPY perception/deploy/    /deploy/
+COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
+
+# Install the matching prebuilt engine outside the writable /models mount.
+RUN python3 -c "from utils.model_downloader import DEPTH_MODEL_BUNDLES, ensure_verified_bundle; \
+b = DEPTH_MODEL_BUNDLES['jp${JP_VERSION}']; \
+ensure_verified_bundle('indoor-depth', '/opt/vision-depth', b['base_url'], b['files'])"
 
 # ── Thai frontend self-check, on the real interpreter ──────────────────────────
 # Runs the frontend that was just copied in, on the Python this image actually
