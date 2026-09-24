@@ -154,7 +154,7 @@ plugins:
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
     fps: 2
-    # The indoor YOLO26-S depth engine emits metres directly.
+    # The DepthART Metric-S engine emits metres directly.
     #
     # These two are a *site* refit on top of it, for when the generic fit is
     # off for a particular camera: metres_out = metres_in**cal_a * exp(cal_b).
