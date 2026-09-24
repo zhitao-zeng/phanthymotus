@@ -2,7 +2,7 @@
 """
 plugins/visual_depth.py — VideoDepthPerceptionPlugin: monocular depth from a plain RGB camera.
 
-Subscribes to image/jpeg topics, runs a prebuilt YOLO26-depth TensorRT engine,
+Subscribes to image/jpeg topics, runs a K-aware DepthART Metric-S model,
 and publishes two things per frame:
 
     {input}/visual_depth          image/depth-zlib   for the dashboard's renderer
@@ -23,8 +23,8 @@ Two constraints worth knowing before changing anything here:
   published at the model's native resolution renders as a blank panel with
   nothing logged anywhere. Everything is resampled to 640x480 before publishing.
 
-* The indoor YOLO26-S engine emits metres directly and takes stretched RGB
-  images in [0, 1]. Its metric transformation is included in the export.
+* DepthART Metric-S emits metres directly and uses the published camera focal
+  convention. Its preprocessing preserves image aspect ratio and scales K.
   The optional cal_a/cal_b site calibration remains separate and defaults to
   identity. A site's calibration must be measured for that camera.
 """
@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import queue
 import threading
 import time
@@ -646,18 +645,11 @@ class VideoDepthPerceptionPlugin:
         with self._model_lock:
             if self._model is not None:
                 return
-            from plugins.vision_runtime import VisionEngineSession
-            from utils.model_downloader import ensure_depth_model
-            from utils.model_progress import fetch_status
+            from plugins.depthart_runtime import DepthARTSession
 
-            model_dir = os.environ.get("DEPTH_MODEL_DIR", "/models/depth")
-            progress_cb, _ = fetch_status(
-                lambda text: setattr(self, "_model_load_status", text), "yolo26s-depth")
-            paths = ensure_depth_model(model_dir, progress_cb=progress_cb)
-            engine = next(p for name, p in paths.items() if name.endswith(".engine"))
-            log.info(f"[visual_depth] loading engine: {engine}")
-            self._model = VisionEngineSession(engine, resize_mode="stretch")
-            log.info(f"[visual_depth] engine loaded, input={self._model.input_size}")
+            self._model_load_status = "Loading DepthART Metric-S"
+            self._model = DepthARTSession()
+            log.info("[visual_depth] DepthART Metric-S loaded")
 
     def _start_node(self, node_key: str, input_topic: Optional[str]):
         """Register before starting, so a concurrent stop can always cancel it."""
@@ -884,12 +876,12 @@ class VideoDepthPerceptionPlugin:
         if action == "info":
             if self._model_loading:
                 return {"name": "VideoDepthPerception", "manufacture": "Embodied",
-                        "model": "yolo26s-depth", "state": "loading",
-                        "desc": "Loading depth engine..."}
+                        "model": "depthart-metric-s", "state": "loading",
+                        "desc": "Loading depth model..."}
             if self._model_load_error:
                 return {"name": "VideoDepthPerception", "manufacture": "Embodied",
-                        "model": "yolo26s-depth", "state": "error",
-                        "desc": f"Engine load failed: {self._model_load_error}"}
+                        "model": "depthart-metric-s", "state": "error",
+                        "desc": f"Model load failed: {self._model_load_error}"}
 
             with self._nodes_lock:
                 nodes = dict(self._nodes)
@@ -928,13 +920,13 @@ class VideoDepthPerceptionPlugin:
             scale = "metric"
             info = {
                 "name": "VideoDepthPerception", "manufacture": "Embodied",
-                "model": "yolo26s-depth",
+                "model": "depthart-metric-s",
                 "state": "running" if instances else "idle",
                 "scale": scale,
                 "instances": instances,
                 "topic_in": topics_in,
                 "topic_out": topics_out,
-                "desc": "Monocular depth estimation (YOLO26-depth, TensorRT)",
+                "desc": "Monocular depth estimation (DepthART Metric-S, TensorRT)",
             }
             info["unit"] = "m"
             info["calibration"] = self._calibration_label()
@@ -962,24 +954,20 @@ class VideoDepthPerceptionPlugin:
                                             or "Engine is still loading, please wait...")}
                     if self._model_load_error:
                         return {"state": "error", "message": f"Engine failed to load: {self._model_load_error}"}
-
-                    def _bg_start():
-                        self._model_loading = True
-                        self._model_load_error = None
+                    # One-shot publishers can send a frame as soon as start
+                    # returns. Register the subscriber after loading the model
+                    # so the first frame is not lost during CUDA initialization.
+                    self._model_loading = True
+                    self._model_load_error = None
+                    try:
+                        self._ensure_model()
+                    except Exception as error:
+                        self._model_load_error = str(error)
+                        log.error("[visual_depth] model load failed: %s", error, exc_info=True)
+                        return {"state": "error", "message": f"Model failed to load: {error}"}
+                    finally:
+                        self._model_loading = False
                         self._model_load_status = None
-                        try:
-                            self._ensure_model()
-                            self._model_loading = False
-                            self._model_load_status = None
-                            self._start_node(node_key, input_topic)
-                        except Exception as e:
-                            self._model_loading = False
-                            self._model_load_error = str(e)
-                            log.error(f"[visual_depth] engine load failed: {e}", exc_info=True)
-
-                    threading.Thread(target=_bg_start, daemon=True, name="visual_depth_model_load").start()
-                    return {"state": "loading", "input": input_topic,
-                            "message": "Engine loading in background, will start automatically"}
                 self._start_node(node_key, input_topic)
                 with self._nodes_lock:
                     running = self._nodes.get(node_key)

@@ -583,10 +583,12 @@ COPY perception/config.yaml /work/config.yaml
 COPY perception/deploy/    /deploy/
 COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
 
-# Install the matching prebuilt engine outside the writable /models mount.
-RUN python3 -c "from utils.model_downloader import DEPTH_MODEL_BUNDLES, ensure_verified_bundle; \
-b = DEPTH_MODEL_BUNDLES['jp${JP_VERSION}']; \
-ensure_verified_bundle('indoor-depth', '/opt/vision-depth', b['base_url'], b['files'])"
+# Keep the fixed JP6 TensorRT engine and plugin in the image, outside the
+# writable /models mount. JetPack 5 needs its own native engine and plugin.
+RUN if [ "${JP_VERSION}" != "61" ]; then \
+      echo '[build] DepthART TensorRT runtime requires JP_VERSION=61' >&2; exit 1; \
+    fi && \
+    python3 /deploy/download_depthart_trt.py
 
 # ── Thai frontend self-check, on the real interpreter ──────────────────────────
 # Runs the frontend that was just copied in, on the Python this image actually
