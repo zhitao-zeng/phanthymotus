@@ -1,4 +1,4 @@
-"""Install an immutable CPU prefix-LM wheel in an isolated image directory."""
+"""Install an immutable prefix-LM sherpa-onnx wheel (CPU or CUDA build) in an isolated image directory."""
 import argparse
 from pathlib import Path
 import platform
@@ -27,7 +27,7 @@ def main():
     subprocess.run([sys.executable, '-c',
                     "import sys; sys.path.insert(0, '/opt/asr-prefix-runtime'); "
                     "import sherpa_onnx; assert sherpa_onnx.XASR_PREFIX_LM_VERSION == 1; "
-                    "print('CPU prefix LM runtime', sherpa_onnx.__version__)"], check=True)
+                    "print('prefix LM runtime', sherpa_onnx.__version__)"], check=True)
 
 
 if __name__ == '__main__':

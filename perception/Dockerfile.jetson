@@ -163,10 +163,9 @@ RUN mkdir -p /work/weights/clip && \
 # Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
 ENV YOLO_CONFIG_DIR=/work
 
-# ── sherpa-onnx (CPU-only Darvin ASR) ─────────────────────────────
-# Both submitted models use INT8 CPU inference. Pin the exact PyPI CPU runtime
-# used by the successful d5f672d V3 image; do not download or install a CUDA
-# provider that this ASR-only image cannot select.
+# ── sherpa-onnx (Darvin ASR) ──────────────────────────────────────
+# Pin the exact PyPI CPU runtime used by the successful d5f672d V3 image. JP5
+# runs on it; JP6 overlays the CUDA prefix runtime further down.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} "sherpa-onnx==1.13.6" && \
     python3 -c "import sherpa_onnx; assert sherpa_onnx.__version__ == '1.13.6'; print('sherpa-onnx', sherpa_onnx.__version__, 'CPU-only')"
 
@@ -297,16 +296,20 @@ ENV PYTHONUNBUFFERED=1
 # exactly the "garbage characters" that make `docker logs` unreadable.
 ENV RCUTILS_COLORIZED_OUTPUT=0
 
-# JP6 uses the ABI-matched CPU prefix runtime. JP5 retains its existing CPU
-# runtime and decoding defaults until a matching package is available.
+# JP6 runs X-ASR on the GPU: the prefix runtime rebuilt with the CUDA provider
+# against JetPack 6.1's ONNX Runtime 1.18.1, plus the fp32 bundle seeded at
+# build time for the same reason as the int8 one above. JP5 retains its
+# existing CPU runtime and decoding defaults until a matching package is
+# available.
 RUN if [ "${JP_VERSION}" = "61" ]; then \
     python3 /work/utils/install_prefix_runtime.py \
-      --base-url https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-prefix-lm/resolve/993cdbf816ae172f0b492b99a29386222f626b73 \
-      --filename sherpa_onnx-1.13.6+prefix1-cp310-cp310-linux_aarch64.whl \
-      --size 13931489 \
-      --sha256 def36dac62c64ed68f9cdd2bcb0e13c87d0023e84aad612727ed8b03d4943dc4 && \
+      --base-url https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-prefix-lm/resolve/9c3cb7ebcf9ed69bd7419e64020175d910bfa35c \
+      --filename sherpa_onnx-1.13.6+cuda.prefix1-cp310-cp310-linux_aarch64.whl \
+      --size 81958372 \
+      --sha256 3bd081410855f7589bbb2a333cad1dc628c7f858426bedc768604610505d649f && \
     python3 -c "from utils.model_downloader import ensure_model; ensure_model('asr_x_asr_prefix_lm', '/models/sherpa-onnx/x-asr-prefix-lm')" && \
-    python3 -c "import yaml; p='/work/config.yaml'; cfg=yaml.safe_load(open(p)); cfg['plugins']['asr'].update(asr_beam_paths=16, asr_prefix_lm_scale=0.05); yaml.safe_dump(cfg, open(p, 'w'), allow_unicode=True, sort_keys=False)"; \
+    python3 -c "from utils.model_downloader import ensure_gpu_model; ensure_gpu_model('asr_x_asr_gpu', '/models/sherpa-onnx/x-asr-zh-en-fp32')" && \
+    python3 -c "import yaml; p='/work/config.yaml'; cfg=yaml.safe_load(open(p)); cfg['plugins']['asr'].update(asr_beam_paths=16, asr_prefix_lm_scale=0.05, device='gpu'); yaml.safe_dump(cfg, open(p, 'w'), allow_unicode=True, sort_keys=False)"; \
     fi
 ENV PYTHONPATH="/opt/asr-prefix-runtime:${PYTHONPATH}"
 

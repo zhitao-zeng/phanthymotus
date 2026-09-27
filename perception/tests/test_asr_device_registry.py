@@ -129,8 +129,9 @@ def test_device_schema_default_is_cpu():
 def test_asr_models_supporting():
     assert "sensevoice-small" in asr.asr_models_supporting("gpu")
     assert "paraformer-zh-en" in asr.asr_models_supporting("gpu")
-    # Measured 0.80x on CUDA — deliberately absent.
-    assert "x-asr-zh-en" not in asr.asr_models_supporting("gpu")
+    # The int8 bundle measured 0.80x on CUDA; the gpu entry is the fp32 bundle.
+    assert "x-asr-zh-en" in asr.asr_models_supporting("gpu")
+    assert asr.ASR_MODELS["x-asr-zh-en"]["devices"]["gpu"]["dtype"] == "fp32"
     assert asr.asr_models_supporting("cpu") == sorted(asr.ASR_MODELS)
 
 
@@ -150,6 +151,31 @@ def test_model_dir_from_another_entry_is_ignored():
     spec = asr.ASR_MODELS["sensevoice-small"]["devices"]["gpu"]
     other = asr.ASR_MODELS["paraformer-zh-en"]["devices"]["cpu"]["dir"]
     assert asr._model_dir_for({"model_dir": other}, spec) == spec["dir"]
+
+
+def test_x_asr_gpu_build_fetches_the_fp32_bundle_and_the_prefix_lm(monkeypatch):
+    """The prefix LM is fetched after the device's weights; on gpu the weights
+    branch imports only ensure_gpu_model, which once left ensure_model unbound."""
+    from utils import model_downloader
+    fetched = []
+    monkeypatch.setattr(model_downloader, "ensure_gpu_model",
+                        lambda name, d: fetched.append(("gpu", name, d)))
+    monkeypatch.setattr(model_downloader, "ensure_model",
+                        lambda name, d: fetched.append(("cpu", name, d)))
+    built = {}
+
+    class Adapter:
+        def __init__(self, model_dir, device, num_threads, **kwargs):
+            built.update(model_dir=model_dir, device=device, **kwargs)
+
+    monkeypatch.setitem(asr.ASR_MODELS["x-asr-zh-en"], "adapter", Adapter)
+    asr._build_asr_adapter({"asr_model": "x-asr-zh-en", "device": "gpu",
+                            "asr_prefix_lm_scale": 0.05, "warmup": False})
+    gpu = asr.ASR_MODELS["x-asr-zh-en"]["devices"]["gpu"]
+    assert fetched == [("gpu", "asr_x_asr_gpu", gpu["dir"]),
+                       ("cpu", "asr_x_asr_prefix_lm", "/models/sherpa-onnx/x-asr-prefix-lm")]
+    assert built["device"] == "gpu" and built["model_dir"] == gpu["dir"]
+    assert built["prefix_lm_scale"] == 0.05
 
 
 # ── warmup ───────────────────────────────────────────────────────────────────

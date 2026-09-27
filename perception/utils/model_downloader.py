@@ -586,6 +586,37 @@ SHERPA_GPU_BUNDLES = {
 }
 
 
+# Domain-adapted X-ASR, fp32. The encoder and joiner are the fp32 files of the
+# same export whose int8 files are the `asr_x_asr` bundle (the int8 encoder,
+# int8 joiner and fp32 decoder in that export match asr_x_asr's SHA256); the
+# other six files are asr_x_asr's own. On ModelScope, not COS, like the other
+# X-ASR artifacts: the leaderboard build host reaches both, but not hf-mirror.com.
+SHERPA_GPU_BUNDLES["asr_x_asr_gpu"] = {
+    "base_url": (
+        "https://www.modelscope.cn/models/Flame4pd/"
+        "x-asr-exhibition-zh-en-fp32/resolve/"
+        "d2e48f5e15b9ce62b4f2110ab1e052fc28aafc04"
+    ),
+    "files": {
+        "encoder-epoch-99-avg-1.onnx": {
+            "size": 597233354,
+            "sha256": "2b54fc9564b5343edea63cc414b0f06804b22595a50b795c0959d618be2251a0",
+        },
+        "decoder-epoch-99-avg-1.onnx": {
+            "size": 11309084,
+            "sha256": "d27b3b869b826c88429507c8104f99cccb2eb8cb0627b0f7f353a42332630026",
+        },
+        "joiner-epoch-99-avg-1.onnx": {
+            "size": 10260467,
+            "sha256": "f93b6701062bf26e300305fa6f1173bcf6927c33bbcc9260f1eddf4a0daf0e49",
+        },
+        **{name: MODELS["asr_x_asr"]["files"][name]
+           for name in ("tokens.txt", "bpe.model", "bpe.vocab",
+                        "hotwords.txt", "hotwords.bpe.txt")},
+    },
+}
+
+
 def ensure_gpu_model(name: str, model_dir: str) -> dict[str, str]:
     """Ensure a `device: gpu` weight bundle is present and SHA256-verified."""
     bundle = SHERPA_GPU_BUNDLES.get(name)

@@ -97,9 +97,12 @@ class XASRAdapter:
             else float(tail_padding_seconds)
         )
         root = Path(model_dir)
-        encoder = root / "encoder-epoch-99-avg-1.int8.onnx"
+        # The cpu bundle is int8 (encoder+joiner) and the gpu bundle fp32; the
+        # decoder is the same fp32 file in both. ASR_MODELS picks the directory.
+        dtype = "" if device == "gpu" else ".int8"
+        encoder = root / f"encoder-epoch-99-avg-1{dtype}.onnx"
         decoder = root / "decoder-epoch-99-avg-1.onnx"
-        joiner = root / "joiner-epoch-99-avg-1.int8.onnx"
+        joiner = root / f"joiner-epoch-99-avg-1{dtype}.onnx"
         tokens = root / "tokens.txt"
         bpe_model = root / "bpe.model"
         bpe_vocab = root / "bpe.vocab"
@@ -127,14 +130,13 @@ class XASRAdapter:
         lm_options = {}
         if lm_scale > 0:
             if getattr(sherpa_onnx, "XASR_PREFIX_LM_VERSION", 0) != 1:
-                raise RuntimeError("X-ASR prefix LM requires the prefix-enabled CPU runtime")
+                raise RuntimeError("X-ASR prefix LM requires the prefix-enabled sherpa-onnx runtime")
             if not prefix_lm_path or not Path(prefix_lm_path).is_file():
                 raise FileNotFoundError("X-ASR prefix LM model is missing")
             lm_options = {"lm": prefix_lm_path, "lm_scale": lm_scale}
 
-        # This bundle only exists in mixed int8/fp32 form, so ASR_MODELS lists no
-        # gpu entry for it and device is effectively always cpu. The call stays so
-        # a forced device=gpu is reported rather than silently honoured.
+        # Refuses int8 on the GPU and falls back to cpu when the installed wheel
+        # has no CUDA provider, so a mismatched device/bundle is reported.
         provider = provider_for_device(device,
                                        (str(encoder), str(decoder), str(joiner)))
         encoded_hotwords = root / "hotwords.bpe.txt"

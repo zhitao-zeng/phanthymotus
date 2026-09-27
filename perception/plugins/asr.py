@@ -371,7 +371,7 @@ TOOLS = [
                                                  "vs ~0.5 GB on cpu, ~1.4 GB of which a CUDA context "
                                                  "never gives back — check headroom before enabling",
                                   "default": "cpu", "scope": "shared",
-                                  "x-show-when": {"asr_model": ["paraformer-zh-en", "sensevoice-small"]}},
+                                  "x-show-when": {"asr_model": ["paraformer-zh-en", "sensevoice-small", "x-asr-zh-en"]}},
                 "asr_beam_paths": {"type": "integer", "description": "X-ASR modified beam search active paths", "default": 3, "scope": "shared", "x-show-when": {"asr_model": "x-asr-zh-en"}},
                 "asr_tail_pad_ms": {"type": "integer", "description": "Silence padding (ms) appended before X-ASR decodes an utterance", "default": 300, "scope": "shared", "x-show-when": {"asr_model": "x-asr-zh-en"}},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
@@ -670,11 +670,17 @@ ASR_MODELS = {
         "label": "X-ASR Bilingual (zh+en, offline transducer)",
         "adapter": SherpaOnnxXASRAdapter,
         "devices": {
-            # No gpu entry: measured 0.80x on CUDA at matched threads. Its bundle
-            # is mixed precision (int8 encoder+joiner, fp32 decoder) and the int8
-            # parts are enough to make the GPU lose.
             "cpu": {"download": "asr_x_asr", "dtype": "int8",
                     "dir": "/models/sherpa-onnx/x-asr-zh-en-v2"},
+            # The int8 bundle measured 0.80x on CUDA, so gpu loads the fp32 export
+            # of the same checkpoint instead. JP6.1 Orin, beam 16 + prefix LM 0.05:
+            # RTF 0.128 vs 0.175 on cpu int8 at 3 cores (0.130 vs 0.238 at 2),
+            # 86/102 transcripts identical to cpu, the rest precision differences;
+            # V5 1-CER 79.60% vs 79.07%. That RTF had the prefix LM on the CPU;
+            # from_transducer puts it on the model's provider, which measured
+            # 0.147 with all 102 transcripts identical.
+            "gpu": {"download": "asr_x_asr_gpu", "dtype": "fp32",
+                    "dir": "/models/sherpa-onnx/x-asr-zh-en-fp32"},
         },
     },
     "paraformer-zh-en": {
@@ -802,6 +808,9 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
         lm_scale = float(cfg.get('asr_prefix_lm_scale', 0.0))
         lm_dir = "/models/sherpa-onnx/x-asr-prefix-lm"
         if lm_scale > 0:
+            # Imported here too: on gpu the weights branch above imported only
+            # ensure_gpu_model.
+            from utils.model_downloader import ensure_model
             ensure_model("asr_x_asr_prefix_lm", lm_dir)
         adapter = model_info["adapter"](
             model_dir,
