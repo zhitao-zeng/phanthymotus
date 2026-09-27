@@ -91,3 +91,62 @@ def test_gpu_on_the_int8_bundle_reports_what_is_missing(monkeypatch, tmp_path):
     _fake_sherpa(monkeypatch, tmp_path, with_cuda=True)
     with pytest.raises(FileNotFoundError, match="encoder-epoch-99-avg-1.onnx"):
         XASRAdapter(str(_bundle(tmp_path / "int8", ".int8")), "gpu")
+
+
+# ── entity boost ─────────────────────────────────────────────────────────────
+#
+# At score 2.5 the first token of 万神殿 ranked 31st-41st against beam 16, so the
+# hotword bonus, added only to survivors, never reached it. The patched decoder
+# ranks a hotword's next token early when its per-token score reaches
+# SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE; only the boosted phrases may qualify.
+
+HOTWORDS = "小 范 :2.5\n万 神 殿 :2.5\nPhanthyMovie :2.5\n"
+
+
+def _boosted_bundle(root: Path) -> Path:
+    _bundle(root, ".int8")
+    (root / "hotwords.bpe.txt").write_text(HOTWORDS, encoding="utf-8")
+    (root / "lm.onnx").write_bytes(b"")
+    return root
+
+
+def _prefix_runtime(monkeypatch, tmp_path):
+    calls = _fake_sherpa(monkeypatch, tmp_path, with_cuda=False)
+    monkeypatch.setattr(sys.modules["sherpa_onnx"], "XASR_PREFIX_LM_VERSION", 1, raising=False)
+    monkeypatch.delenv("SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE", raising=False)
+    return calls
+
+
+def test_boost_raises_only_the_named_phrase_and_sets_the_early_threshold(monkeypatch, tmp_path):
+    import os
+    calls = _prefix_runtime(monkeypatch, tmp_path)
+    root = _boosted_bundle(tmp_path / "b")
+    XASRAdapter(str(root), "cpu", prefix_lm_path=str(root / "lm.onnx"), prefix_lm_scale=0.05,
+                entity_boost={"万神殿": 4.0})
+    boosted = Path(calls["hotwords_file"]).read_text(encoding="utf-8")
+    assert boosted == "小 范 :2.5\n万 神 殿 :4.0\nPhanthyMovie :2.5\n"
+    assert float(os.environ["SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE"]) == 3.9
+
+
+def test_boost_of_a_phrase_that_is_not_a_hotword_fails(monkeypatch, tmp_path):
+    _prefix_runtime(monkeypatch, tmp_path)
+    root = _boosted_bundle(tmp_path / "b")
+    with pytest.raises(ValueError, match="万神店"):
+        XASRAdapter(str(root), "cpu", prefix_lm_path=str(root / "lm.onnx"), prefix_lm_scale=0.05,
+                    entity_boost={"万神店": 4.0})
+
+
+def test_boost_without_the_prefix_lm_fails(monkeypatch, tmp_path):
+    _prefix_runtime(monkeypatch, tmp_path)
+    root = _boosted_bundle(tmp_path / "b")
+    with pytest.raises(ValueError, match="prefix LM"):
+        XASRAdapter(str(root), "cpu", entity_boost={"万神殿": 4.0})
+
+
+def test_no_boost_leaves_the_hotwords_and_threshold_alone(monkeypatch, tmp_path):
+    import os
+    calls = _prefix_runtime(monkeypatch, tmp_path)
+    root = _boosted_bundle(tmp_path / "b")
+    XASRAdapter(str(root), "cpu", prefix_lm_path=str(root / "lm.onnx"), prefix_lm_scale=0.05)
+    assert Path(calls["hotwords_file"]) == root / "hotwords.bpe.txt"
+    assert "SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE" not in os.environ

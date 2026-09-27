@@ -635,7 +635,8 @@ class SherpaOnnxXASRAdapter(ASRAdapter):
 
     def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2,
                  max_active_paths: int = None, tail_padding_seconds: float = None,
-                 prefix_lm_path: str = "", prefix_lm_scale: float = 0.0):
+                 prefix_lm_path: str = "", prefix_lm_scale: float = 0.0,
+                 entity_boost: dict = None):
         from plugins.x_asr import XASRAdapter
 
         self._delegate = XASRAdapter(
@@ -644,6 +645,7 @@ class SherpaOnnxXASRAdapter(ASRAdapter):
             tail_padding_seconds=tail_padding_seconds,
             prefix_lm_path=prefix_lm_path,
             prefix_lm_scale=prefix_lm_scale,
+            entity_boost=entity_boost,
         )
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
@@ -819,6 +821,7 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
             max_active_paths=cfg.get('asr_beam_paths'),
             prefix_lm_path=os.path.join(lm_dir, "model.onnx"),
             prefix_lm_scale=lm_scale,
+            entity_boost=cfg.get('asr_entity_boost'),
             tail_padding_seconds=(
                 None if tail_pad_ms is None else int(tail_pad_ms) / 1000.0
             ),

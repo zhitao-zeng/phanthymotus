@@ -52,13 +52,51 @@ def _prepare_hotwords_file(
 
     if not lines:
         raise ValueError(f"No usable hotwords in {source}")
+    return _write_atomically(output, lines)
 
+
+def _boost_hotwords(
+    encoded: Path,
+    boosts: dict,
+    output_dir: Path = Path("/tmp/asr_x_asr_hotwords"),
+) -> Path:
+    """Raise the score of the named phrases in an encoded hotwords file.
+
+    Keys are compact phrases ("万神殿"); every key must already be a hotword,
+    so a typo fails here instead of silently boosting nothing.
+    """
+    boosts = {"".join(str(k).split()): float(v) for k, v in boosts.items()}
+    source_bytes = encoded.read_bytes()
+    digest = hashlib.sha256(
+        source_bytes + b"\0" + repr(sorted(boosts.items())).encode("utf-8")
+    ).hexdigest()[:16]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / f"hotwords-boosted-{digest}.txt"
+    if output.is_file():
+        return output
+
+    found: set[str] = set()
+    lines: list[str] = []
+    for raw_line in source_bytes.decode("utf-8").splitlines():
+        phrase, sep, _ = raw_line.rpartition(" :")
+        compact = "".join(phrase.split())
+        if sep and compact in boosts:
+            raw_line = f"{phrase} :{boosts[compact]}"
+            found.add(compact)
+        lines.append(raw_line + "\n")
+    missing = sorted(set(boosts) - found)
+    if missing:
+        raise ValueError(f"Boosted phrases are not hotwords in {encoded}: {', '.join(missing)}")
+    return _write_atomically(output, lines)
+
+
+def _write_atomically(output: Path, lines: list[str]) -> Path:
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
-            dir=output_dir,
+            dir=output.parent,
             prefix=f".{output.name}.",
             delete=False,
         ) as stream:
@@ -85,6 +123,7 @@ class XASRAdapter:
         tail_padding_seconds: float = None,
         prefix_lm_path: str = "",
         prefix_lm_scale: float = 0.0,
+        entity_boost: dict = None,
     ):
         from utils.onnx_provider import provider_for_device
 
@@ -142,6 +181,21 @@ class XASRAdapter:
         encoded_hotwords = root / "hotwords.bpe.txt"
         if not encoded_hotwords.is_file():
             encoded_hotwords = _prepare_hotwords_file(hotwords)
+        early_min = None
+        if entity_boost:
+            # The patched decoder adds a hotword's next-token score to the pruning
+            # rank, not only to the survivors, for hotwords whose per-token score
+            # reaches SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE. It reads the variable at
+            # every decode and only ranks early alongside the prefix LM. The
+            # threshold sits just under the boosted scores so the plain 2.5
+            # hotwords keep their usual, after-pruning effect.
+            if not lm_options:
+                raise ValueError("entity_boost needs the prefix LM (prefix_lm_scale > 0)")
+            early_min = min(float(v) for v in entity_boost.values()) - 0.1
+            if early_min <= HOTWORDS_SCORE:
+                raise ValueError(f"entity_boost scores must exceed {HOTWORDS_SCORE + 0.1}")
+            encoded_hotwords = _boost_hotwords(encoded_hotwords, entity_boost)
+            os.environ["SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE"] = f"{early_min:g}"
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
             encoder=str(encoder),
             decoder=str(decoder),
@@ -162,7 +216,8 @@ class XASRAdapter:
         self._decode_lock = threading.Lock()
         log.info(
             "[asr] X-ASR adapter loaded: encoder=%s, device=%s, provider=%s, "
-            "max_active_paths=%d, tail_padding=%.2fs, hotwords_score=%.1f, prefix_lm_scale=%.3f",
+            "max_active_paths=%d, tail_padding=%.2fs, hotwords_score=%.1f, prefix_lm_scale=%.3f, "
+            "entity_boost=%s early_min=%s",
             encoder,
             device,
             provider,
@@ -170,6 +225,8 @@ class XASRAdapter:
             self._tail_padding_seconds,
             HOTWORDS_SCORE,
             lm_scale,
+            entity_boost or {},
+            early_min,
         )
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
