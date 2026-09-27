@@ -296,17 +296,23 @@ ENV PYTHONUNBUFFERED=1
 # exactly the "garbage characters" that make `docker logs` unreadable.
 ENV RCUTILS_COLORIZED_OUTPUT=0
 
-# JP6 runs X-ASR on the GPU: the prefix runtime rebuilt with the CUDA provider
-# against JetPack 6.1's ONNX Runtime 1.18.1, plus the fp32 bundle seeded at
-# build time for the same reason as the int8 one above. JP5 retains its
-# existing CPU runtime and decoding defaults until a matching package is
-# available.
-RUN if [ "${JP_VERSION}" = "61" ]; then \
+# Both lines run X-ASR on the GPU: the prefix runtime rebuilt with the CUDA
+# provider against each line's ONNX Runtime and CPython (jp6.1: 1.18.1, cp310;
+# jp5.11: 1.16.0, cp38), plus the fp32 bundle seeded at build time for the
+# same reason as the int8 one above.
+RUN case "${JP_VERSION}" in \
+      61)  REV=9c3cb7ebcf9ed69bd7419e64020175d910bfa35c; PY=cp310; \
+           SIZE=81958372; SHA=3bd081410855f7589bbb2a333cad1dc628c7f858426bedc768604610505d649f ;; \
+      511) REV=09d6c5ab685c8c563b041407bb51f9b7413a4fc2; PY=cp38; \
+           SIZE=62734936; SHA=d9c0336d5095cb1ee856a361140d1d107f50b9a908571d4f6fef4351cb0aacb4 ;; \
+      *)   REV= ;; \
+    esac; \
+    if [ -n "${REV}" ]; then \
     python3 /work/utils/install_prefix_runtime.py \
-      --base-url https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-prefix-lm/resolve/9c3cb7ebcf9ed69bd7419e64020175d910bfa35c \
-      --filename sherpa_onnx-1.13.6+cuda.prefix1-cp310-cp310-linux_aarch64.whl \
-      --size 81958372 \
-      --sha256 3bd081410855f7589bbb2a333cad1dc628c7f858426bedc768604610505d649f && \
+      --base-url https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-prefix-lm/resolve/${REV} \
+      --filename sherpa_onnx-1.13.6+cuda.prefix1-${PY}-${PY}-linux_aarch64.whl \
+      --size ${SIZE} \
+      --sha256 ${SHA} && \
     python3 -c "from utils.model_downloader import ensure_model; ensure_model('asr_x_asr_prefix_lm', '/models/sherpa-onnx/x-asr-prefix-lm')" && \
     python3 -c "from utils.model_downloader import ensure_gpu_model; ensure_gpu_model('asr_x_asr_gpu', '/models/sherpa-onnx/x-asr-zh-en-fp32')" && \
     python3 -c "import yaml; p='/work/config.yaml'; cfg=yaml.safe_load(open(p)); cfg['plugins']['asr'].update(asr_beam_paths=16, asr_prefix_lm_scale=0.05, device='gpu'); yaml.safe_dump(cfg, open(p, 'w'), allow_unicode=True, sort_keys=False)"; \
