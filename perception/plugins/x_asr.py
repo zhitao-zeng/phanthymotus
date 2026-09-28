@@ -124,6 +124,8 @@ class XASRAdapter:
         prefix_lm_path: str = "",
         prefix_lm_scale: float = 0.0,
         entity_boost: dict = None,
+        native_lm_path: str = "",
+        native_lm_scale: float = 0.0,
     ):
         from utils.onnx_provider import provider_for_device
 
@@ -173,6 +175,15 @@ class XASRAdapter:
             if not prefix_lm_path or not Path(prefix_lm_path).is_file():
                 raise FileNotFoundError("X-ASR prefix LM model is missing")
             lm_options = {"lm": prefix_lm_path, "lm_scale": lm_scale}
+        native_scale = float(native_lm_scale)
+        if not 0.0 <= native_scale <= 1.0:
+            raise ValueError("native_lm_scale must be between 0 and 1")
+        if native_scale:
+            if lm_options or entity_boost:
+                raise ValueError("Native LM cannot be combined with prefix LM or early entity boosting")
+            if not native_lm_path or not Path(native_lm_path).is_file():
+                raise FileNotFoundError("X-ASR native LM model is missing")
+            lm_options = {"lm": native_lm_path, "lm_scale": native_scale}
 
         # Refuses int8 on the GPU and falls back to cpu when the installed wheel
         # has no CUDA provider, so a mismatched device/bundle is reported.
@@ -217,7 +228,7 @@ class XASRAdapter:
         log.info(
             "[asr] X-ASR adapter loaded: encoder=%s, device=%s, provider=%s, "
             "max_active_paths=%d, tail_padding=%.2fs, hotwords_score=%.1f, prefix_lm_scale=%.3f, "
-            "entity_boost=%s early_min=%s",
+            "entity_boost=%s early_min=%s native_lm_scale=%.3f",
             encoder,
             device,
             provider,
@@ -227,6 +238,7 @@ class XASRAdapter:
             lm_scale,
             entity_boost or {},
             early_min,
+            native_scale,
         )
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:

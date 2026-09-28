@@ -39,6 +39,20 @@ def _progress_hook(name: str):
     return hook
 
 MODELS = {
+    "asr_x_asr_native_lm": {
+        "base_url": (
+            "https://www.modelscope.cn/models/Flame4pd/"
+            "x-asr-exhibition-prefix-lm/resolve/"
+            "7aa95d2cb38ab1e77b536f632de6b5e02a6514e7"
+        ),
+        "files": {
+            "model.native.onnx": {
+                "size": 14486784,
+                "sha256": "14adaa8c607b6d81a1911ae77d72874b3934bd84f54567157f53da4ad9abd97a",
+            },
+        },
+        "check_file": "model.native.onnx",
+    },
     "asr_x_asr_prefix_lm": {
         "base_url": (
             "https://www.modelscope.cn/models/Flame4pd/"

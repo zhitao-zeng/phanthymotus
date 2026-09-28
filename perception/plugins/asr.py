@@ -636,7 +636,7 @@ class SherpaOnnxXASRAdapter(ASRAdapter):
     def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2,
                  max_active_paths: int = None, tail_padding_seconds: float = None,
                  prefix_lm_path: str = "", prefix_lm_scale: float = 0.0,
-                 entity_boost: dict = None):
+                 entity_boost: dict = None, native_lm_path: str = "", native_lm_scale: float = 0.0):
         from plugins.x_asr import XASRAdapter
 
         self._delegate = XASRAdapter(
@@ -646,6 +646,8 @@ class SherpaOnnxXASRAdapter(ASRAdapter):
             prefix_lm_path=prefix_lm_path,
             prefix_lm_scale=prefix_lm_scale,
             entity_boost=entity_boost,
+            native_lm_path=native_lm_path,
+            native_lm_scale=native_lm_scale,
         )
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
@@ -814,6 +816,11 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
             # ensure_gpu_model.
             from utils.model_downloader import ensure_model
             ensure_model("asr_x_asr_prefix_lm", lm_dir)
+        native_scale = float(cfg.get('asr_native_lm_scale', 0.0))
+        native_dir = "/models/sherpa-onnx/x-asr-native-lm"
+        if native_scale > 0:
+            from utils.model_downloader import ensure_model
+            ensure_model("asr_x_asr_native_lm", native_dir)
         adapter = model_info["adapter"](
             model_dir,
             device,
@@ -822,6 +829,8 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
             prefix_lm_path=os.path.join(lm_dir, "model.onnx"),
             prefix_lm_scale=lm_scale,
             entity_boost=cfg.get('asr_entity_boost'),
+            native_lm_path=os.path.join(native_dir, "model.native.onnx"),
+            native_lm_scale=native_scale,
             tail_padding_seconds=(
                 None if tail_pad_ms is None else int(tail_pad_ms) / 1000.0
             ),
