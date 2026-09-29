@@ -296,21 +296,25 @@ ENV PYTHONUNBUFFERED=1
 # exactly the "garbage characters" that make `docker logs` unreadable.
 ENV RCUTILS_COLORIZED_OUTPUT=0
 
-# Native end-of-beam LM rescoring uses main's full CUDA runtime unchanged.
+# CUDA prefix scoring and early hotword ranking use the matching ABI runtime.
 RUN case "${JP_VERSION}" in \
-      61)  PY=cp310; LINE=jp61 ;; \
-      511) PY=cp38; LINE=jp511 ;; \
-      *)   PY=; LINE= ;; \
+      61)  REV=9c3cb7ebcf9ed69bd7419e64020175d910bfa35c; PY=cp310; \
+           SIZE=81958372; SHA=3bd081410855f7589bbb2a333cad1dc628c7f858426bedc768604610505d649f ;; \
+      511) REV=09d6c5ab685c8c563b041407bb51f9b7413a4fc2; PY=cp38; \
+           SIZE=62734936; SHA=d9c0336d5095cb1ee856a361140d1d107f50b9a908571d4f6fef4351cb0aacb4 ;; \
+      *)   REV= ;; \
     esac; \
-    if [ -n "${PY}" ]; then \
-    FILE="sherpa_onnx-1.13.6+cuda-${PY}-${PY}-linux_aarch64.whl" && \
-    python3 -c "import sys, urllib.request, urllib.parse; line, filename=sys.argv[1:]; urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/sherpa-onnx/'+line+'/'+urllib.parse.quote(filename), '/tmp/'+filename)" "${LINE}" "${FILE}" && \
-    pip3 install --no-deps --force-reinstall "/tmp/${FILE}" && rm -f "/tmp/${FILE}" && \
-    python3 -c "import sherpa_onnx,pathlib; assert getattr(sherpa_onnx,'XASR_PREFIX_LM_VERSION',0)==0; assert hasattr(sherpa_onnx,'OfflineTtsConfig'); assert (pathlib.Path(sherpa_onnx.__file__).parent/'lib/libonnxruntime_providers_cuda.so').is_file()" && \
+    if [ -n "${REV}" ]; then \
+    python3 /work/utils/install_prefix_runtime.py \
+      --base-url https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-prefix-lm/resolve/${REV} \
+      --filename sherpa_onnx-1.13.6+cuda.prefix1-${PY}-${PY}-linux_aarch64.whl \
+      --size ${SIZE} \
+      --sha256 ${SHA} && \
+    python3 -c "from utils.model_downloader import ensure_model; ensure_model('asr_x_asr_prefix_lm', '/models/sherpa-onnx/x-asr-prefix-lm')" && \
     python3 -c "from utils.model_downloader import ensure_gpu_model; ensure_gpu_model('asr_x_asr_gpu', '/models/sherpa-onnx/x-asr-zh-en-fp32')" && \
-    python3 -c "from utils.model_downloader import ensure_model; ensure_model('asr_x_asr_native_lm', '/models/sherpa-onnx/x-asr-native-lm')" && \
-    python3 -c "import yaml; p='/work/config.yaml'; cfg=yaml.safe_load(open(p)); cfg['plugins']['asr'].update(asr_beam_paths=3, asr_native_lm_scale=0.05, asr_prefix_lm_scale=0.0, device='gpu', asr_entity_boost={}); yaml.safe_dump(cfg, open(p, 'w'), allow_unicode=True, sort_keys=False)"; \
+    python3 -c "import yaml; p='/work/config.yaml'; cfg=yaml.safe_load(open(p)); cfg['plugins']['asr'].update(asr_beam_paths=3, asr_native_lm_scale=0.0, asr_prefix_lm_scale=0.05, device='gpu', asr_entity_boost={'万神殿': 4.0}); yaml.safe_dump(cfg, open(p, 'w'), allow_unicode=True, sort_keys=False)"; \
     fi
+ENV PYTHONPATH="/opt/asr-prefix-runtime:${PYTHONPATH}"
 
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
