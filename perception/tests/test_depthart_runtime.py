@@ -4,7 +4,7 @@ import pytest
 import vision_stubs
 from vision_stubs import _FakeExecutor
 from plugins import visual_depth as vd
-from plugins.depthart_runtime import camera_matrix, prepare_image
+from plugins.depthart_runtime import camera_matrix, prepare_image, fit_to_canvas, canvas_resize
 from plugins.vision_runtime import decode_depth
 
 
@@ -17,7 +17,7 @@ def camera(fx=900.):
 
 def test_preprocess_scales_intrinsics_and_normalizes_rgb():
     frame=np.zeros((900,1600,3),np.uint8); frame[:,:,2]=255
-    blob,k=prepare_image(frame,camera(),(864,480))
+    blob,k,crop=prepare_image(frame,camera(),(864,480))
     expected=np.array(camera()['K'],np.float32).reshape(3,3)
     expected[0]*=864/1600; expected[1]*=480/900
     assert blob.shape==(1,3,480,864)
@@ -31,9 +31,71 @@ def test_invalid_camera_rejected(bad):
     with pytest.raises(ValueError):camera_matrix(bad)
 
 
-def test_unsupported_aspect_rejected():
-    with pytest.raises(ValueError,match='aspect ratio'):
-        prepare_image(np.zeros((480,640,3),np.uint8),camera(),(864,480))
+@pytest.mark.parametrize('size', [(1280, 720), (864, 480), (640, 360), (1920, 1080),
+                                  (960, 540), (848, 480)])
+def test_no_crop_when_the_resize_already_lands_on_the_canvas(size):
+    # The rounding to multiples of 32 admits a band of ratios, not just the
+    # canvas's exact 1.8. 16:9 needs no crop; cropping it to 1.8 regardless
+    # would throw away rows for nothing.
+    assert fit_to_canvas(*size, (864, 480)) == (0, 0, *size)
+    assert canvas_resize(*size, (864, 480)) == (864, 480)
+
+
+@pytest.mark.parametrize('size,expected', [
+    ((640, 480), (0, 62, 640, 356)),      # 4:3 — trim top and bottom
+    ((800, 600), (0, 78, 800, 444)),
+    ((1280, 960), (0, 124, 1280, 711)),
+    ((1280, 800), (0, 44, 1280, 711)),    # 16:10 — a much smaller loss
+    ((1600, 480), (368, 0, 864, 480)),    # too wide — trim the sides
+])
+def test_centre_crop_fits_the_canvas_aspect(size, expected):
+    # A 4:3 source used to be refused outright. It is cropped now, because the
+    # alternative on a fixed engine canvas is a stretch, and a stretch hands
+    # the network a geometry its K does not describe.
+    assert fit_to_canvas(*size, (864, 480)) == expected
+    x0, y0, w, h = expected
+    # The point of the crop: what is left resizes onto the canvas exactly.
+    assert canvas_resize(w, h, (864, 480)) == (864, 480)
+    # Centred: equal margins on the axis that was trimmed.
+    assert (size[0] - w) // 2 == x0 and (size[1] - h) // 2 == y0
+
+
+@pytest.mark.parametrize('size', [(480, 854), (200, 1000), (720, 1280)])
+def test_a_crop_that_would_eat_half_the_frame_is_refused(size):
+    with pytest.raises(ValueError, match='crop away'):
+        fit_to_canvas(*size, (864, 480))
+
+
+def test_crop_moves_the_principal_point_and_leaves_focal_lengths_alone():
+    """The property that makes this cheap: a vertical crop costs no horizontal FOV."""
+    frame = np.zeros((480, 640, 3), np.uint8)
+    cam = {'schema': 'motus.camera/1', 'id': 'c', 'width': 640, 'height': 480,
+           'K': [502.3, 0., 319.5, 0., 502.3, 239.5, 0., 0., 1.]}
+    blob, k, crop = prepare_image(frame, cam, (864, 480))
+    assert blob.shape == (1, 3, 480, 864)
+    assert crop == (0, 62, 640, 356)
+    sx, sy = 864 / 640, 480 / 356
+    # fx scales with the horizontal resize only — the crop did not touch width.
+    assert k[0][0, 0] == pytest.approx(502.3 * sx, rel=1e-5)
+    assert k[0][0, 2] == pytest.approx(319.5 * sx, rel=1e-5)
+    # cy is the principal point in the cropped frame, then scaled.
+    assert k[0][1, 2] == pytest.approx((239.5 - 62) * sy, rel=1e-5)
+    assert k[0][1, 1] == pytest.approx(502.3 * sy, rel=1e-5)
+    # The horizontal half-FOV a consumer derives back is unchanged by the crop.
+    assert np.arctan((864 / 2) / k[0][0, 0]) == pytest.approx(
+        np.arctan((640 / 2) / 502.3), rel=1e-5)
+
+
+def test_declaration_at_a_higher_resolution_than_the_frame():
+    # The declaration may describe the same lens at a larger size; K must be
+    # brought to frame pixels before the crop offsets, not after.
+    frame = np.zeros((480, 640, 3), np.uint8)
+    cam = {'schema': 'motus.camera/1', 'id': 'c', 'width': 1280, 'height': 960,
+           'K': [1004.6, 0., 639., 0., 1004.6, 479., 0., 0., 1.]}
+    blob, k, crop = prepare_image(frame, cam, (864, 480))
+    assert crop == (0, 62, 640, 356)
+    assert k[0][0, 0] == pytest.approx(502.3 * 864 / 640, rel=1e-4)
+    assert k[0][1, 2] == pytest.approx((479. / 2 - 62) * 480 / 356, rel=1e-4)
 
 
 def make_plugin(cfg=None):
@@ -163,15 +225,29 @@ def test_depthart_explicit_paths_bypass_download_and_partial_override_fails(monk
 
 @pytest.mark.parametrize('target', ['yolo', 'depthart'])
 @pytest.mark.parametrize('tag', [None, 'other'])
-def test_restored_calibration_rejects_missing_or_previous_model(target, tag):
-    # Simulate shared model config followed by a persisted instance row.
+def test_restored_calibration_from_another_model_is_dropped_not_refused(target, tag):
+    # Simulate shared model config followed by a persisted instance row. An
+    # absent marker is the legacy case: it means yolo, because that was the
+    # only model when the row was saved. Either way the config must *succeed* —
+    # it is replayed on every project start, and a rejection there surfaces
+    # through Core as the unrelated "missing url/key" and stops the card.
     p = vd.VideoDepthPerceptionPlugin({'backend': target}, 'test', _FakeExecutor())
     assert p.dispatch('visual_depth', dict(action='config', backend=target))['status'] == 'configured'
     cfg = dict(action='config', instance_id='a', calibration_preset=vd.CAL_MANUAL, cal_a=1., cal_b=.5)
     if tag:cfg['calibration_backend'] = 'yolo' if target == 'depthart' else 'depthart'
     result = p.dispatch('visual_depth', cfg)
-    assert result['status'] == 'error' and result['adapter_ok'] is False
-    assert 'a' not in p._instance_configs
+    assert result['status'] == 'configured'
+    stored = p._instance_configs['a']
+    if target == 'yolo' and not tag:
+        # Legacy row on the legacy model: applied unchanged, nothing to say.
+        assert stored['cal_b'] == .5 and 'calibration_note' not in result
+        assert vd.calibration_origin(stored) == 'manual'
+    else:
+        assert 'cal_b' not in stored and 'cal_a' not in stored
+        assert stored['calibration_preset'] == vd.CAL_NONE
+        assert 'cal_b' in result['calibration_note'] or '标定' in result['calibration_note']
+        assert vd.calibration_origin(stored) == 'model-default'
+        assert p.dispatch('visual_depth', dict(action='info', instance_id='a'))['calibration_note']
 
 
 @pytest.mark.parametrize('backend', ['yolo', 'depthart'])
@@ -186,10 +262,13 @@ def test_matching_calibration_replay_and_no_correction(backend):
 
 
 def test_nonidentity_calibration_cannot_bypass_binding_with_auto_preset():
+    # cal_b alone counts as a fit even with the selector on auto, so under
+    # DepthART it is an unmarked YOLO fit: dropped, and said out loud.
     p = make_plugin()
     result = p.dispatch('visual_depth', dict(action='config', instance_id='a',
                                            calibration_preset=vd.CAL_AUTO, cal_b=.5))
-    assert result['adapter_ok'] is False
+    assert result['status'] == 'configured' and result['calibration_note']
+    assert p._instance_configs['a'] == {'calibration_preset': vd.CAL_NONE}
 
 
 def test_calibration_model_is_persistable_but_never_auto_stamped():
@@ -210,9 +289,13 @@ def test_switch_then_restore_old_row_rejected_after_process_restart(tmp_path):
                calibration_backend='yolo', cal_b=.5)
     assert p.dispatch('visual_depth', old)['status'] == 'configured'
     assert p.dispatch('visual_depth', dict(action='config', backend='depthart'))['status'] == 'configured'
-    assert p.dispatch('visual_depth', old)['adapter_ok'] is False
+    # The live switch already stripped the keys from the stored row silently;
+    # a replay of the old row has to reach the same state, not a hard failure.
+    assert p.dispatch('visual_depth', old)['calibration_note']
+    assert 'cal_b' not in p._instance_configs['a']
     restarted = make_plugin()
-    assert restarted.dispatch('visual_depth', old)['adapter_ok'] is False
+    assert restarted.dispatch('visual_depth', old)['calibration_note']
+    assert 'cal_b' not in restarted._instance_configs['a']
 
 
 def test_laziness_missing_camera_and_presets(monkeypatch):
@@ -222,7 +305,9 @@ def test_laziness_missing_camera_and_presets(monkeypatch):
     assert p.dispatch('visual_depth',{'action':'config','instance_id':'a','calibration_preset':vd.CAL_AUTO})['config']['calibration_preset']==vd.CAL_NONE
     assert p.dispatch('visual_depth',{'action':'start','input_topic':'/a'})['state']=='error'
     preset=next(iter(vd.CALIBRATION_PRESETS))
-    assert p.dispatch('visual_depth',{'action':'config','calibration_preset':preset})['status']=='error'
+    rejected=p.dispatch('visual_depth',{'action':'config','calibration_preset':preset})
+    assert rejected['status']=='configured' and rejected['config']['calibration_preset']==vd.CAL_NONE
+    assert preset in rejected['calibration_note']
     assert p.dispatch('visual_depth',{'action':'config','backend':'invalid'})['status']=='error'
     assert p._model is None
 
@@ -338,12 +423,19 @@ def test_manual_calibration_preserved():
 @pytest.mark.parametrize('backend', ['yolo', 'depthart'])
 @pytest.mark.parametrize('tag', [None, 'wrong'])
 @pytest.mark.parametrize('preset', [None, vd.CAL_MANUAL])
-def test_startup_rejects_unbound_or_mismatched_calibration(backend, tag, preset):
+def test_startup_drops_mismatched_calibration_without_failing_construction(backend, tag, preset):
+    # perception/config.yaml has no dropdown, so an unmarked fit there is a
+    # YOLO fit — same legacy rule as a saved row. Raising would not surface as
+    # a config error either: it drops visual_depth out of the plugin list.
     cfg = {'backend': backend, 'cal_b': .5}
     if preset:cfg['calibration_preset'] = preset
     if tag:cfg['calibration_backend'] = 'yolo' if backend == 'depthart' else 'depthart'
-    with pytest.raises(ValueError, match='Calibration model'):
-        vd.VideoDepthPerceptionPlugin(cfg, 'test', _FakeExecutor())
+    p = vd.VideoDepthPerceptionPlugin(cfg, 'test', _FakeExecutor())
+    measured_on = 'depthart' if (tag and backend == 'yolo') else 'yolo'
+    if measured_on == backend:
+        assert (p._cal_a, p._cal_b) == (1., .5) and not p._cal_notes
+    else:
+        assert (p._cal_a, p._cal_b) == (1., 0.) and p._cal_notes['']
 
 
 @pytest.mark.parametrize('backend', ['yolo', 'depthart'])
@@ -506,3 +598,70 @@ def test_bundle_shutdown_calls_opted_in_hooks_and_continues_after_error():
     bundle._plugins=[Broken(),types.SimpleNamespace(PREFIX='no-hook'),Working()]
     bundle.shutdown()
     assert calls==['broken','working']
+
+
+# ── The startup failure this change fixes ────────────────────────────────────
+#
+# Every card calibrated before `calibration_backend` existed holds coefficients
+# with no marker. Reading that as "unknown" rejected the saved row on replay,
+# and Core turns a rejected config into its own generic credential message — so
+# a robot came up with `配置无效（缺少 url/key）` on a card that has neither.
+
+@pytest.mark.parametrize('row', [
+    dict(calibration_preset=vd.CAL_MANUAL, cal_a=1., cal_b=-0.9753),  # measured
+    dict(cal_b=-0.9753),                                              # pre-selector
+    dict(calibration_preset=vd.CAL_NONE, cal_a=1., cal_b=-0.9753),    # left in the dialog
+    dict(depth_scale=0.377),                                          # pre-cal_b
+])
+def test_legacy_unmarked_calibration_replays_on_yolo(row):
+    p = vd.VideoDepthPerceptionPlugin({}, 'test', _FakeExecutor())
+    result = p.dispatch('visual_depth', dict(action='config', instance_id='a', **row))
+    assert result['status'] == 'configured'
+    assert result.get('adapter_ok', True) is True
+    assert 'calibration_note' not in result
+    assert p._instance_configs['a'] == row
+
+
+def test_legacy_unmarked_calibration_in_startup_yaml_does_not_kill_the_plugin():
+    # `__init__` used to raise here, which does not produce a config error —
+    # it removes visual_depth from the service's plugin list entirely.
+    p = vd.VideoDepthPerceptionPlugin({'cal_b': -0.9753}, 'test', _FakeExecutor())
+    assert (p._cal_a, p._cal_b) == (1., -0.9753)
+    assert p.dispatch('visual_depth', {'action': 'info'})['calibration'] == 'site:manual'
+
+
+def test_orin5_saved_rows_replay(monkeypatch):
+    """The two rows literally in Orin 5's agent-core DB on 2026-10-15.
+
+    This is the second, independent way #286 killed the card, and the one that
+    actually fired on a real machine: `cal_a`/`cal_b` are at their defaults so
+    the provenance check never runs, and the raise comes from the YOLO preset
+    being unusable under DepthART. Agent Core sends these as two calls —
+    shared without instance_id, then the card's own row with it — so they are
+    replayed that way here rather than merged.
+    """
+    p = vd.VideoDepthPerceptionPlugin({}, 'test', _FakeExecutor())
+    monkeypatch.setattr(p, '_ensure_model', lambda: pytest.fail('config must not load an engine'))
+    assert p.dispatch('visual_depth', {'action': 'config', 'backend': 'depthart'})['status'] == 'configured'
+    row = {'action': 'config', 'instance_id': 'card-mv8w41sh6a45',
+           'fps': 2, 'cal_a': 1, 'cal_b': 0, 'calibration_preset': 'Unitree R1'}
+    result = p.dispatch('visual_depth', row)
+    assert result['status'] == 'configured' and result.get('adapter_ok', True) is True
+    assert result['config'] == {'fps': 2, 'calibration_preset': vd.CAL_NONE}
+    assert 'Unitree R1' in result['calibration_note']
+
+
+@pytest.mark.parametrize('declaration', [None, {}, {'schema': 'motus.camera/1'}])
+def test_start_without_upstream_intrinsics_says_what_to_do(declaration):
+    # Orin 5's wiring: the depth card is fed by agent-core's `remote_camera`,
+    # whose info() has no camera_info at all, so nothing reaches the start.
+    # The old message named a field that appears nowhere on the canvas.
+    p = make_plugin()
+    args = {'action': 'start', 'instance_id': 'a', 'input_topic': '/remote_control/camera'}
+    if declaration is not None:
+        args['camera_info'] = declaration
+    result = p.dispatch('visual_depth', args)
+    assert result['state'] == 'error'
+    assert '/remote_control/camera' in result['message']
+    assert 'yolo' in result['message']          # the way out
+    assert not p._nodes
