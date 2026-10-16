@@ -4,9 +4,11 @@ import gc
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 import wave
@@ -15,6 +17,8 @@ import weakref
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from plugins import icefall_asr
 from utils import install_icefall_models
+
+RealLanguageIdentifier = icefall_asr._LanguageIdentifier
 
 
 def wav():
@@ -160,6 +164,52 @@ class RoutingTests(unittest.TestCase):
                 result = plugin.dispatch("asr", {"action": "start", "input_topic": "/test/audio"})
             self.assertEqual(result["state"], "running")
             prepare.assert_called_once()
+
+    def test_timed_out_worker_cannot_supply_a_late_language_for_next_audio(self):
+        worker = self.root / "slow-worker"
+        worker.write_text("#!" + sys.executable + "\n" +
+            "import json,struct,sys,time\n"
+            "print(json.dumps({'ready':True}),flush=True)\n"
+            "count=struct.unpack('<I',sys.stdin.buffer.read(4))[0]\n"
+            "sys.stdin.buffer.read(count*2)\n"
+            "time.sleep(.15)\n"
+            "print(json.dumps({'language':'ja','probability':.9}),flush=True)\n"
+            "time.sleep(5)\n")
+        worker.chmod(0o700)
+        with mock.patch.dict(os.environ, {"ASR_LANGUAGE_ID_BINARY": str(worker)}):
+            identifier = RealLanguageIdentifier(self.root / "lid.bin", 2, ("en", "ja"))
+        try:
+            identifier.REQUEST_TIMEOUT_S = 0.05
+            original = identifier._read_result
+            identifier._read_result = lambda *args, **kwargs: original(timeout=0.05)
+            self.adapter._identifier = identifier
+            self.adapter._models = json.loads((self.root / "manifest.json").read_text())["languages"]
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                self.adapter.transcribe(wav(), "auto")
+            self.assertIsNone(self.adapter._identifier)
+            self.assertIsNotNone(identifier._process.poll())
+            self.assertEqual(self.adapter.transcribe(wav(), "auto"), "en")
+        finally:
+            identifier.close()
+
+    def test_worker_that_stops_reading_cannot_block_pcm_write_indefinitely(self):
+        worker = self.root / "blocked-worker"
+        worker.write_text("#!" + sys.executable + "\n" +
+            "import json,time\n"
+            "print(json.dumps({'ready':True}),flush=True)\n"
+            "time.sleep(5)\n")
+        worker.chmod(0o700)
+        with mock.patch.dict(os.environ, {"ASR_LANGUAGE_ID_BINARY": str(worker)}):
+            identifier = RealLanguageIdentifier(self.root / "lid.bin", 2, ("en", "ja"))
+        try:
+            identifier.REQUEST_TIMEOUT_S = 0.05
+            start = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                identifier.identify(b"\0\0" * 16000)
+            self.assertLess(time.monotonic() - start, 1)
+            self.assertIsNotNone(identifier._process.poll())
+        finally:
+            identifier.close()
 
 
 class ModelReleaseTests(unittest.TestCase):

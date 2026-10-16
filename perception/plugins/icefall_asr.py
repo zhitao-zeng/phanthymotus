@@ -19,6 +19,8 @@ log = logging.getLogger(__name__)
 
 
 class _LanguageIdentifier:
+    REQUEST_TIMEOUT_S = 30.0
+
     def __init__(self, model, num_threads, languages):
         binary = os.environ.get("ASR_LANGUAGE_ID_BINARY", "/opt/asr-language-id/bin/whisper-lid")
         self._process = subprocess.Popen(
@@ -27,6 +29,9 @@ class _LanguageIdentifier:
         )
         self._selector = selectors.DefaultSelector()
         self._selector.register(self._process.stdout, selectors.EVENT_READ)
+        os.set_blocking(self._process.stdin.fileno(), False)
+        self._write_selector = selectors.DefaultSelector()
+        self._write_selector.register(self._process.stdin, selectors.EVENT_WRITE)
         try:
             if not self._read_result().get("ready"):
                 raise RuntimeError("Language identifier did not initialize")
@@ -52,13 +57,26 @@ class _LanguageIdentifier:
             line.extend(char)
 
     def identify(self, pcm):
+        deadline = time.monotonic() + self.REQUEST_TIMEOUT_S
         try:
-            self._process.stdin.write(struct.pack("<I", len(pcm) // 2) + pcm)
-            self._process.stdin.flush()
-            result = self._read_result()
+            payload = memoryview(struct.pack("<I", len(pcm) // 2) + pcm)
+            while payload:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._write_selector.select(remaining):
+                    raise RuntimeError("Language identifier timed out while accepting audio")
+                try:
+                    written = os.write(self._process.stdin.fileno(), payload)
+                except BlockingIOError:
+                    continue
+                payload = payload[written:]
+            result = self._read_result(timeout=max(0, deadline - time.monotonic()))
             return result["language"], float(result["probability"])
-        except (BrokenPipeError, OSError) as error:
-            raise RuntimeError("Language identifier is unavailable") from error
+        except Exception as error:
+            # A late response must never become the next utterance's language.
+            self.close()
+            if isinstance(error, OSError):
+                raise RuntimeError("Language identifier is unavailable") from error
+            raise
 
     def close(self):
         process = getattr(self, "_process", None)
@@ -76,6 +94,9 @@ class _LanguageIdentifier:
         selector = getattr(self, "_selector", None)
         if selector is not None:
             selector.close()
+        write_selector = getattr(self, "_write_selector", None)
+        if write_selector is not None:
+            write_selector.close()
 
 
 class IcefallMultilingualASRAdapter:
@@ -144,7 +165,12 @@ class IcefallMultilingualASRAdapter:
             return ""
         with self._lock:
             self.prepare()
-            detected, probability = self._identifier.identify(pcm)
+            try:
+                detected, probability = self._identifier.identify(pcm)
+            except Exception:
+                self._identifier.close()
+                self._identifier = None
+                raise
             if detected not in self._models:
                 raise RuntimeError("Unsupported detected language: " + detected)
             if detected != self._current_language:
