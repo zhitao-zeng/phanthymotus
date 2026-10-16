@@ -84,8 +84,12 @@ def test_cpu_entries_are_never_fp16():
 
 
 def test_download_keys_resolve():
-    """A gpu entry must name a pinned bundle; a cpu entry a legacy archive."""
+    """A model names a download source or an immutable image-owned CPU seed."""
     for model, device, spec in _device_specs():
+        if spec.get("image_owned"):
+            assert device == "cpu"
+            assert spec["dir"].startswith("/opt/")
+            continue
         key = spec["download"]
         if device == "gpu":
             assert key in model_downloader.SHERPA_GPU_BUNDLES, \

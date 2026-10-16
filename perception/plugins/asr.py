@@ -24,6 +24,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from std_msgs.msg import String
 
 from plugins.vad_preroll import PcmHistory
+from plugins.icefall_asr import IcefallMultilingualASRAdapter
 
 log = logging.getLogger(__name__)
 
@@ -359,7 +360,7 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
+                "asr_model":     {"type": "string", "enum": ["icefall-multilingual", "x-asr-zh-en", "paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model. Icefall multilingual selects Chinese, English, Japanese, Russian, Spanish, French, Thai or German automatically from audio.", "default": "sensevoice-small", "scope": "shared"},
                 # Which weights each device loads is in ASR_MODELS; only models
                 # with a verified gpu entry list one, so x-show-when hides this
                 # field for the rest rather than offering a choice that would be
@@ -670,6 +671,14 @@ class SherpaOnnxXASRAdapter(ASRAdapter):
 # counts, and emitted nothing but `</s>`. See utils/onnx_provider.py for the
 # measurements and perception/README.md for the admission checklist.
 ASR_MODELS = {
+    "icefall-multilingual": {
+        "label": "Icefall Multilingual (automatic language selection)",
+        "adapter": IcefallMultilingualASRAdapter,
+        "devices": {
+            "cpu": {"image_owned": True, "dtype": "int8",
+                    "dir": "/opt/asr-models/icefall"},
+        },
+    },
     "x-asr-zh-en": {
         "label": "X-ASR Bilingual (zh+en, offline transducer)",
         "adapter": SherpaOnnxXASRAdapter,
@@ -798,6 +807,10 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
     spec = model_info["devices"][device]
 
     model_dir = _model_dir_for(cfg, spec)
+    if spec.get("image_owned"):
+        # Immutable assets are installed by the matching image profile. Runtime
+        # preparation belongs to start, keeping config/info free of model loads.
+        return model_info["adapter"](model_dir, device, int(cfg.get("num_threads", 2)))
     if device == "gpu":
         # Size/SHA256-pinned: these are the largest downloads in the stack.
         from utils.model_downloader import ensure_gpu_model
@@ -1536,7 +1549,7 @@ class _ASRNode(Node):
                         import urllib.request as _urllib_req
                         import json as _json_hook
                         _hook_req = _urllib_req.Request(
-                            "https://localhost:15678/api/hooks/fire",
+                            os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/") + "/api/hooks/fire",
                             data=_json_hook.dumps({"hook": "on_hearing"}).encode(),
                             headers={"Content-Type": "application/json"},
                             method="POST"
@@ -1806,6 +1819,11 @@ class ASRPlugin:
                 return {"state": "error", "message": f"Model failed to load: {self._load_error}"}
             if not self._adapter:
                 return {"state": "error", "message": "ASR model not loaded"}
+            if self._asr_model == "icefall-multilingual":
+                try:
+                    self._adapter.prepare()
+                except Exception as error:
+                    return {"state": "error", "message": str(error)}
             input_topic = args.get("input_topic")
             # Also accept input_topics list (sent by canvas when multiple connections exist)
             if not input_topic:

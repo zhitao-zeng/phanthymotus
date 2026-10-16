@@ -169,11 +169,20 @@ ENV YOLO_CONFIG_DIR=/work
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} "sherpa-onnx==1.13.6" && \
     python3 -c "import sherpa_onnx; assert sherpa_onnx.__version__ == '1.13.6'; print('sherpa-onnx', sherpa_onnx.__version__, 'CPU-only')"
 
-# Seed the immutable X-ASR bundle at build time so concurrent instances
-# do not compete for a cold runtime download.
+# Seed model files at build time so concurrent instances do not download them.
+# Select x-asr explicitly to retain the previous bilingual image profile.
+ARG ASR_PROFILE=icefall
 COPY perception/utils/model_downloader.py /tmp/model_downloader.py
-RUN python3 -c "import sys; sys.path.insert(0, '/tmp'); from model_downloader import ensure_model; ensure_model('asr_x_asr', '/models/sherpa-onnx/x-asr-zh-en-v2')" && \
-    rm -f /tmp/model_downloader.py
+COPY perception/utils/install_icefall_models.py /tmp/install_icefall_models.py
+RUN if [ "${ASR_PROFILE}" = "icefall" ]; then \
+      python3 /tmp/install_icefall_models.py \
+        --base-url http://172.28.4.81:34567/zengzhitao/embodied-ai/icefall-multilingual-v1 \
+        --manifest-sha256 973768fe9dd3abc0e713c9c52ec23fa0440054fe184fa11abd09356ca4948454 \
+        --destination /opt/asr-models/icefall; \
+    elif [ "${ASR_PROFILE}" = "x-asr" ]; then \
+      python3 -c "import sys; sys.path.insert(0, '/tmp'); from model_downloader import ensure_model; ensure_model('asr_x_asr', '/models/sherpa-onnx/x-asr-zh-en-v2')"; \
+    else echo "Unsupported ASR_PROFILE: ${ASR_PROFILE}"; exit 1; fi && \
+    rm -f /tmp/model_downloader.py /tmp/install_icefall_models.py
 
 # ── OCR runtime deps (PP-OCRv6 TensorRT engines; TensorRT/CUDA come from base) ──
 # libvips42 (apt, above) is the runtime library pyvips dlopens for JPEG decode
@@ -267,6 +276,17 @@ COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
 COPY perception/deploy/    /deploy/
+COPY perception/native/asr_language_id.cc perception/native/build_language_id.sh /work/native/
+
+RUN if [ "${ASR_PROFILE}" = "icefall" ]; then \
+      if ! command -v cmake >/dev/null || ! command -v c++ >/dev/null; then \
+        apt-get update && apt-get install -y --no-install-recommends cmake g++ && \
+        rm -rf /var/lib/apt/lists/*; \
+      fi && \
+      sh /work/native/build_language_id.sh && \
+      python3 -c "import yaml; p='/work/config.yaml'; cfg=yaml.safe_load(open(p)); cfg['plugins']['asr'].update(asr_model='icefall-multilingual', model_dir='/opt/asr-models/icefall', device='cpu', num_threads=2, language='auto', warmup=False, save_vad_segments=False); yaml.safe_dump(cfg, open(p, 'w'), allow_unicode=True, sort_keys=False)"; \
+    fi
+ENV LD_LIBRARY_PATH="/opt/asr-language-id/lib:${LD_LIBRARY_PATH}"
 
 EXPOSE 15720
 EXPOSE 15721
@@ -297,7 +317,8 @@ ENV PYTHONUNBUFFERED=1
 ENV RCUTILS_COLORIZED_OUTPUT=0
 
 # CUDA prefix scoring and early hotword ranking use the matching ABI runtime.
-RUN case "${JP_VERSION}" in \
+RUN if [ "${ASR_PROFILE}" = "x-asr" ]; then \
+    case "${JP_VERSION}" in \
       61)  REV=9c3cb7ebcf9ed69bd7419e64020175d910bfa35c; PY=cp310; \
            SIZE=81958372; SHA=3bd081410855f7589bbb2a333cad1dc628c7f858426bedc768604610505d649f ;; \
       511) REV=09d6c5ab685c8c563b041407bb51f9b7413a4fc2; PY=cp38; \
@@ -313,6 +334,7 @@ RUN case "${JP_VERSION}" in \
     python3 -c "from utils.model_downloader import ensure_model; ensure_model('asr_x_asr_prefix_lm', '/models/sherpa-onnx/x-asr-prefix-lm')" && \
     python3 -c "from utils.model_downloader import ensure_gpu_model; ensure_gpu_model('asr_x_asr_gpu', '/models/sherpa-onnx/x-asr-zh-en-fp32')" && \
     python3 -c "import yaml; p='/work/config.yaml'; cfg=yaml.safe_load(open(p)); cfg['plugins']['asr'].update(asr_beam_paths=3, asr_native_lm_scale=0.0, asr_prefix_lm_scale=0.05, device='gpu', asr_entity_boost={'万神殿': 4.0}); yaml.safe_dump(cfg, open(p, 'w'), allow_unicode=True, sort_keys=False)"; \
+    fi; \
     fi
 ENV PYTHONPATH="/opt/asr-prefix-runtime:${PYTHONPATH}"
 
