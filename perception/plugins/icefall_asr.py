@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import gc
 import io
 import json
@@ -16,6 +17,14 @@ import time
 import wave
 
 log = logging.getLogger(__name__)
+
+
+def _release_unused_heap():
+    # Native model memory freed by another ROS worker can remain in glibc's
+    # thread arenas. Return unused pages before allocating the next model.
+    trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+    if trim is not None:
+        trim(0)
 
 
 class _LanguageIdentifier:
@@ -191,6 +200,7 @@ class IcefallMultilingualASRAdapter:
                 self._recognizer = None
                 self._current_language = None
                 gc.collect()
+                _release_unused_heap()
                 self._recognizer = self._load_recognizer(detected)
                 self._current_language = detected
                 log.info("[asr] active language=%s, provider=cpu", detected)
