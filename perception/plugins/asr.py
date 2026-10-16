@@ -1339,11 +1339,13 @@ class _ASRNode(Node):
         # A fresh event, not .clear(): the previous worker thread and _audio_cb
         # closures still hold a reference to the old one.
         self._stop_event = threading.Event()
-        # Start VAD in a child process
-        self._pcm_queue = multiprocessing.Queue(maxsize=1000)
-        self._utterance_queue = multiprocessing.Queue(maxsize=100)
-        self._vad_stop = multiprocessing.Event()
-        self._vad_proc = multiprocessing.Process(
+        # A restarted VAD must not inherit a resident ASR model or its runtime
+        # allocator. All IPC primitives must use the same spawn context.
+        vad_context = multiprocessing.get_context("spawn")
+        self._pcm_queue = vad_context.Queue(maxsize=1000)
+        self._utterance_queue = vad_context.Queue(maxsize=100)
+        self._vad_stop = vad_context.Event()
+        self._vad_proc = vad_context.Process(
             target=_vad_worker,
             args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
                   self._vad_backend, self._vad_threshold, self._vad_silence_ms,
