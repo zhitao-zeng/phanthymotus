@@ -59,6 +59,10 @@ class InboundMessage:
     text: str               # 消息文本（无文本时为附件占位描述，如 "[图片]"）
     message_id: str = ''    # 平台消息 ID（用于去重）
     attachments: list[Attachment] = field(default_factory=list)
+    sender_type: str = 'user'  # user | bot（部分旧事件使用 app）
+    chat_type: str = ''        # p2p | group
+    mentions: list[dict] = field(default_factory=list)
+    expect_reply: bool | None = None  # 机器人协作消息是否明确要求继续 @
 
 
 @dataclass
@@ -67,6 +71,8 @@ class OutboundMessage:
     chat_id: str            # 目标会话 ID
     text: str = ''          # 文本内容
     files: list[Attachment] = field(default_factory=list)  # 附件（图片/视频/文件）
+    mention_open_id: str = ''  # Feishu 群聊中的目标机器人 open_id
+    expect_reply: bool = False  # @ 消息是否要求目标机器人继续回复
     # 兼容旧调用方：直接给字节的图片
     image_bytes: bytes | None = None
     image_caption: str = ''
@@ -100,6 +106,16 @@ class ChannelAdapter(ABC):
 
     # 该平台支持发送的附件类别；send_message 遇到不支持的类别应抛异常而非静默丢弃
     SUPPORTED_FILE_KINDS: tuple[str, ...] = ()
+
+    # 该平台能不能做 Bot↔Bot（A2A）协作。
+    # 由 adapter 自己声明，而不是在 api/channel.py 里写死平台名 —— 否则每加一个
+    # 支持 A2A 的平台都要回去改校验分支，而漏改的表现是「配置存下来了但静默失效」。
+    SUPPORTS_BOT_TO_BOT: bool = False
+
+    # 对端 Bot 的信任是否来自 channel 配置里的 `trusted_bots`（open_id + chat_id）。
+    # 飞书是；局域网 peer 不是 —— 它的信任来自 `peers` 表里配对时钉住的公钥，
+    # 所以 lan channel 不该出现 trusted_bots 字段。
+    USES_TRUSTED_BOTS: bool = False
 
     def __init__(self, channel_id: str, platform: str, config: dict,
                  on_message: OnMessageCallback):

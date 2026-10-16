@@ -48,9 +48,13 @@ class _BuilderProbe:
         self.delay = delay
         self.calls = 0
         self.built = []
+        self.on_status = None
         self.lock = threading.Lock()
 
-    def __call__(self, cfg):
+    def __call__(self, cfg, on_status=None):
+        # Mirrors _build_ocr_adapter: the plugin passes a status sink so the
+        # bundle download's progress reaches the card.
+        self.on_status = on_status
         with self.lock:
             self.calls += 1
         if self.delay:
@@ -337,7 +341,7 @@ def test_ocr_add_node_failure_leaks_nothing(monkeypatch):
 def test_ocr_load_failure_reports_error_and_retries(monkeypatch):
     calls = {"n": 0}
 
-    def flaky_builder(cfg):
+    def flaky_builder(cfg, on_status=None):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("download failed")
@@ -428,10 +432,78 @@ def test_ocr_config_schema_exposes_only_operator_fields():
     from plugins.ocr import TOOLS
 
     schema = TOOLS[0]["configSchema"]
-    assert set(schema["properties"]) == {"min_interval_ms"}
+    assert set(schema["properties"]) == {"ocr_fps"}
     for name, spec in schema["properties"].items():
         assert spec["type"] != "object", name
     assert "required" not in schema
+
+
+# ── recognition rate (ocr_fps) ──────────────────────────────────────
+
+def test_default_ocr_fps_is_once_per_second():
+    """The shipped default. Text in front of a robot does not change at frame
+    rate, and the old default (every frame) kept a core busy on JPEG decode."""
+    assert ocr_plugin.ocr_interval({}) == pytest.approx(1.0)
+    assert ocr_plugin.DEFAULT_OCR_FPS == 1.0
+
+
+def test_ocr_fps_accepts_fractions():
+    assert ocr_plugin.ocr_interval({"ocr_fps": 0.5}) == pytest.approx(2.0)
+    assert ocr_plugin.ocr_interval({"ocr_fps": 4}) == pytest.approx(0.25)
+
+
+def test_ocr_fps_zero_means_every_frame():
+    assert ocr_plugin.ocr_interval({"ocr_fps": 0}) == 0.0
+    assert ocr_plugin.ocr_interval({"ocr_fps": -3}) == 0.0
+
+
+def test_legacy_min_interval_ms_still_honoured():
+    """A canvas saved by the pre-ocr_fps build must keep working — including
+    the old `min_interval_ms: 0`, which meant "every frame"."""
+    assert ocr_plugin.ocr_interval({"min_interval_ms": 500}) == pytest.approx(0.5)
+    assert ocr_plugin.ocr_interval({"min_interval_ms": 0}) == 0.0
+    # ocr_fps wins when both are present.
+    assert ocr_plugin.ocr_interval(
+        {"ocr_fps": 4, "min_interval_ms": 500}) == pytest.approx(0.25)
+
+
+def test_instance_legacy_rate_beats_plugin_default():
+    """config.yaml now ships ocr_fps, so a plain dict merge would let the
+    plugin default override a card that had only stored min_interval_ms. The
+    instance is the more specific layer and must win."""
+    merged = ocr_plugin.merge_rate_cfg(
+        {"ocr_fps": 1.0}, {"min_interval_ms": 250})
+    assert ocr_plugin.ocr_interval(merged) == pytest.approx(0.25)
+
+
+def test_instance_ocr_fps_beats_plugin_ocr_fps():
+    merged = ocr_plugin.merge_rate_cfg({"ocr_fps": 1.0}, {"ocr_fps": 5})
+    assert ocr_plugin.ocr_interval(merged) == pytest.approx(0.2)
+
+
+def test_merge_rate_cfg_keeps_unrelated_keys():
+    merged = ocr_plugin.merge_rate_cfg(
+        {"ocr_fps": 1.0, "language": "zh"}, {"min_interval_ms": 250})
+    assert merged["language"] == "zh"
+
+
+def test_ocr_fps_is_not_an_adapter_setting():
+    """Changing the rate must not rebuild the TensorRT adapter — the live
+    nodes take it in place. If it leaked into the signature, every rate tweak
+    would reload three engines."""
+    base = {"provider": "rapidocr"}
+    assert (ocr_plugin._adapter_signature({**base, "ocr_fps": 1})
+            == ocr_plugin._adapter_signature({**base, "ocr_fps": 9}))
+
+
+def test_ocr_fps_is_instance_scoped():
+    """Two cards on different cameras may read at different rates, so the
+    rate is per-instance, not a shared inference setting."""
+    from plugins.ocr import TOOLS
+
+    spec = TOOLS[0]["configSchema"]["properties"]["ocr_fps"]
+    assert spec["scope"] == "instance"
+    assert spec["default"] == ocr_plugin.DEFAULT_OCR_FPS
 
 
 # ── node-level start/stop races (bot P1, 2026-08-22) ─────────────────────────
@@ -486,3 +558,105 @@ def test_ocr_start_on_retired_node_is_inert(ocr):
     assert result["state"] == "idle"
     assert len(node.subscriptions) == subscriptions_before
     assert not node.worker_alive
+
+
+# ── one-shot recognition ─────────────────────────────────────────────────────
+
+def _photo_plugin(monkeypatch, tmp_path):
+    """OCR plugin whose image roots are tmp_path and whose adapter is stubbed."""
+    cfg = {"provider": "rapidocr",
+           "image_roots": [str(tmp_path)],
+           "max_image_bytes": 1 << 20}
+    return _make_plugin(monkeypatch, cfg=cfg)
+
+
+def test_recognize_by_photo_loads_the_adapter_on_demand(monkeypatch, tmp_path):
+    """A photo question is useful with no camera running, so it waits for the
+    single-flight load rather than reporting `loading` and making callers poll."""
+    plugin, executor, builder = _photo_plugin(monkeypatch, tmp_path)
+    photo = tmp_path / "doc.jpg"
+    photo.write_bytes(b"hello-world")
+
+    result = plugin.dispatch("ocr", {"action": "recognize_by_photo",
+                                     "image_path": str(photo)})
+    assert result["ok"] is True
+    assert result["source"] == str(photo)
+    # The stubbed adapter echoes the bytes back as the recognised text, so this
+    # also proves the image reached it intact.
+    assert result["items"][0]["text"] == "hello-world"
+    assert executor.nodes == []          # nothing was started
+    assert builder.calls == 1
+
+
+def test_recognize_reuses_the_adapter_a_running_instance_already_built(monkeypatch, tmp_path):
+    """One adapter, not a second set of TensorRT engines on the same GPU."""
+    plugin, executor, builder = _photo_plugin(monkeypatch, tmp_path)
+    _start_and_wait(plugin, executor, "/cam/a")
+    assert builder.calls == 1
+
+    photo = tmp_path / "doc.jpg"
+    photo.write_bytes(b"abc")
+    assert plugin.dispatch("ocr", {"action": "recognize_by_photo",
+                                   "image_path": str(photo)})["ok"] is True
+    assert builder.calls == 1
+    plugin.dispatch("ocr", {"action": "stop"})
+
+
+def test_recognize_by_photo_refuses_a_path_outside_the_roots(monkeypatch, tmp_path):
+    plugin, _, _ = _photo_plugin(monkeypatch, tmp_path)
+    result = plugin.dispatch("ocr", {"action": "recognize_by_photo",
+                                     "image_path": "/etc/passwd"})
+    assert result["ok"] is False
+    assert result["reason"] == "bad_input"
+    assert "recognize_by_url" in result["detail"]
+
+
+def test_recognize_by_url_shares_the_photo_path(monkeypatch, tmp_path):
+    import plugins.image_input as image_input
+    monkeypatch.setattr(image_input, "fetch_url", lambda url, max_bytes: b"from-url")
+    plugin, _, _ = _photo_plugin(monkeypatch, tmp_path)
+    result = plugin.dispatch("ocr", {"action": "recognize_by_url",
+                                     "url": "https://example.com/doc.jpg"})
+    assert result["ok"] is True
+    assert result["source"] == "https://example.com/doc.jpg"
+    assert result["items"][0]["text"] == "from-url"
+
+
+def test_recognize_surfaces_an_adapter_load_failure(monkeypatch, tmp_path):
+    def explode(cfg, on_status=None):
+        raise RuntimeError("no engines")
+
+    cfg = {"provider": "rapidocr", "image_roots": [str(tmp_path)]}
+    plugin, _, _ = _make_plugin(monkeypatch, builder=explode, cfg=cfg)
+    photo = tmp_path / "doc.jpg"
+    photo.write_bytes(b"x")
+    result = plugin.dispatch("ocr", {"action": "recognize_by_photo",
+                                     "image_path": str(photo)})
+    assert result["ok"] is False
+    assert result["reason"] == "adapter_unavailable"
+    assert "no engines" in result["detail"]
+
+
+def test_the_new_ocr_actions_are_advertised(monkeypatch, tmp_path):
+    schema = ocr_plugin.TOOLS[0]["inputSchema"]
+    assert {"recognize_by_photo", "recognize_by_url"} <= set(
+        schema["properties"]["action"]["enum"])
+    assert schema["x-action-params"]["recognize_by_photo"]["params"] == ["image_path"]
+    assert schema["properties"]["image_path"]["uploadTo"] == "mcp"
+
+
+def test_start_without_a_topic_comes_up_on_demand(ocr):
+    """A card with no camera still starts, as tts's does.
+
+    It loads the adapter and owns a publisher; it just has nothing to subscribe
+    to. Before this it raised, so a photo-only card could never show `running`.
+    """
+    plugin, executor, _ = ocr
+    plugin.dispatch("ocr", {"action": "start"})
+    assert _wait_until(lambda: len(executor.nodes) == 1
+                       and executor.nodes[0].state == "running")
+    node = executor.nodes[0]
+    assert node._input_topic == ""
+    assert node._output_topic == ocr_plugin.DEFAULT_OUTPUT_TOPIC
+    assert node.subscriptions == []          # nothing to subscribe to
+    assert set(plugin._nodes) == {"_default"}

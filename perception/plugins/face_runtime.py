@@ -1,0 +1,761 @@
+#!/usr/bin/env python3
+"""
+plugins/face_runtime.py — 人脸检测 + 特征提取推理封装（无 ROS 依赖）。
+
+Mirrors `plugins/ocr_runtime.py`'s role: everything that touches a model lives
+here, so `plugins/face.py` only deals with ROS, MCP and lifecycle.
+
+Two ONNX models, both from the InsightFace **buffalo_sc** pack — the smallest
+pack that still ships keypoints, which the alignment step needs:
+
+    det_500m.onnx    SCRFD-500M-BNKPS   ~2.5 MB   detection + 5 landmarks
+    w600k_mbf.onnx   ArcFace MobileFaceNet ~13 MB  512-d embedding
+
+The `insightface` package is deliberately **not** a dependency: it pulls in
+onnx, scikit-image, scikit-learn, Cython and a build toolchain, none of which
+are in the perception image, to wrap ~200 lines of pre/post-processing. Those
+200 lines are below instead. The decode follows upstream's `scrfd.py` exactly
+(strides 8/16/32, 2 anchors per location, distance-coded boxes and keypoints) —
+this is a wire format, not a design choice, and getting it wrong produces
+plausible-looking boxes in the wrong places.
+
+Both models run on `onnxruntime`, so `device: cpu | gpu` is a provider choice
+(`utils/onnx_provider.ort_providers_for_device`) rather than two code paths.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from plugins import scrfd_decode
+from utils.cv2_compat import load_cv2
+from utils.model_downloader import ensure_face_model
+from utils.onnx_provider import ort_providers_for_device, warn_on_parked_cores
+
+# Imported at module scope, not lazily inside FaceAnalyzer, and that placement is
+# load-bearing.
+#
+# This process ends up with **two builds of ONNX Runtime**: sherpa-onnx bundles its
+# own libonnxruntime.so in its wheel, and this plugin uses the standalone
+# `onnxruntime` package. They export the same symbols, so whichever one is brought
+# in first wins symbol resolution for both. If sherpa gets there first and the
+# standalone library is loaded afterwards, sherpa's later inferences execute
+# against the wrong implementation and fail an internal type check:
+#
+#   Non-zero status code returned while running SequenceInsert node ...
+#   TensorSeq::Add ... IsSameDataType(tensor) was false
+#
+# Measured on Orin 6: Kokoro TTS synthesizes fine, the face card is then started,
+# and every subsequent Kokoro utterance fails — with the real cause visible one
+# line earlier as espeak losing its voice ("Unknown phoneme table: ''"). Importing
+# here instead is enough on its own; no session has to be created. `main.py`
+# imports plugins.face (and so this module) during startup, before any plugin
+# builds a model, so this lands first.
+#
+# Only ASR/TTS graphs that use the sequence ops are affected, which is why the
+# conflict lay dormant until Kokoro — the first model here whose graph has a
+# Loop/SequenceInsert. sherpa's sensevoice ASR was measured unaffected.
+#
+# Guarded because the host test suite imports this module without onnxruntime
+# installed; FaceAnalyzer raises a clear error if it is genuinely missing.
+try:
+    import onnxruntime as ort
+except ImportError:  # pragma: no cover - exercised on dev hosts, not on device
+    ort = None
+
+log = logging.getLogger(__name__)
+
+# The identity store lives beside the models, under the one host-mounted writable
+# path this container has. It sits here rather than in plugins/identity_db.py
+# because that module is modality-agnostic — voiceprints get their own directory.
+# Also the sentinel meaning "the operator did not choose a db_dir" — see
+# face_db_dir_for.
+DEFAULT_DB_DIR = "/models/face_db"
+
+# The sentinel meaning "the operator did not choose a model_dir", which
+# `face_bundle_for` swaps for the selected row's own directory. Its value stays
+# buffalo_sc's path even though buffalo_sc is no longer the default model, and must:
+# it is what `config.yaml` ships and what agent-core has already persisted into
+# every deployed card, so changing it would make all of those look like a
+# deliberate override and point the new default at the old model's weights.
+DEFAULT_FACE_MODEL_DIR = "/models/face/buffalo_sc"
+
+# Which model pair to run. The point of the registry is that adding one is a table row
+# rather than a hunt through the file for hardcoded names, and that the card can offer
+# the choice — `scrfd25g_edgeface_s` below was added that way and needed no code.
+#
+# What a new entry has to supply: the detector must emit **nine** outputs — score, bbox
+# and five keypoints per stride — because ArcFace alignment needs the landmarks and
+# `plugins/scrfd_decode.py` decodes exactly that shape. A detector without keypoints
+# cannot be used here at all, which is asserted at load time rather than discovered as
+# bad embeddings. The recogniser must take 112x112 and return 512 dimensions, since the
+# stored samples and every existing FaceDB row are that. Both are checked at load
+# time. Pre/post-processing is shared and must not be: a candidate recogniser whose
+# normalisation is not RGB `(x-127.5)/127.5` does not belong in this table, it belongs
+# behind a branch in `embed()`.
+#
+# It also has to supply a `match_threshold`, measured rather than guessed — cosine
+# thresholds are a property of the embedding space, and the two rows here differ by
+# 0.2. See each row for the numbers and how they were obtained.
+#
+# Changing the model invalidates the database: embeddings from different networks are
+# not comparable, and matching across them would silently confuse identities. The
+# plugin's engine signature includes the model, so a change reloads — but the samples
+# already stored do **not** get re-embedded, which is why this is a deploy-time choice
+# rather than something to flip on a running robot with a populated roster.
+FACE_MODELS = {
+    # insightface v0.7 buffalo_sc: SCRFD-500M-BNKPS + ArcFace MobileFaceNet
+    # (Glint360K). 2.5 MB + 13 MB, which is what makes cpu at one detection per
+    # second the design point.
+    "buffalo_sc": {
+        "dir": "/models/face/buffalo_sc",
+        "det": "det_500m.onnx",
+        "rec": "w600k_mbf.onnx",
+        "bundle": "face",
+        # `buffalo_sc` is InsightFace's pack name and covers two networks; spelling
+        # them out is what makes the card's dropdown readable.
+        "description": "InsightFace buffalo_sc（SCRFD-500M 检测 + ArcFace MobileFaceNet，512 维）",
+        "match_threshold": 0.35,
+        # Pinned, and pinned *here* rather than derived from being the default —
+        # which it no longer is. Every robot deployed before the default moved has
+        # its roster at exactly this path, so buffalo_sc must keep owning it no
+        # matter what else becomes the default later. See face_db_dir_for.
+        "db_dir": DEFAULT_DB_DIR,
+    },
+    # SCRFD-2.5G-BNKPS detection + EdgeFace-S-GAMMA-0.5 recognition. 3.3 MB +
+    # 14.8 MB. A bigger detector than buffalo_sc's (2.5G vs 500M FLOPs) and a
+    # stronger recogniser, for the same 9-output/112x112/512-d contract — which
+    # is the whole reason this is a row and not a second plugin.
+    #
+    # The detector is insightface's own scrfd_2.5g_bnkps, re-hosted from
+    # `hsuyabc/scrfd_2.5g_bnkps.onnx` on HuggingFace. The recogniser is exported
+    # from `anjith2006/edgeface` (Idiap EdgeFace, CVPR-W 2023) — upstream ships
+    # only PyTorch weights, so the ONNX is ours, exported at fp32 opset 17 and
+    # checked against the reference implementation (worst cosine 0.9999999).
+    #
+    # **Not** the INT8 export: measured on the same graph it was no faster at all
+    # (16.0 ms vs 15.7 ms p50, 2 threads) and moved the embedding by cosine 0.84,
+    # so it bought disk at the cost of an unvalidated recogniser.
+    "scrfd25g_edgeface_s": {
+        "dir": "/models/face/scrfd25g_edgeface_s",
+        "det": "scrfd_2.5g_bnkps.onnx",
+        "rec": "edgeface_s_gamma_05.onnx",
+        "bundle": "scrfd25g_edgeface_s",
+        "description": "SCRFD-2.5G 检测 + EdgeFace-S-GAMMA-0.5 识别（512 维，比 buffalo_sc 更准、模型更大）",
+        # Higher than buffalo_sc's, and that is a measurement, not a guess.
+        # Over the 100-image LFW sample (4849 impostor pairs, 2 genuine):
+        #
+        #   buffalo_sc           impostor p99 0.158  max 0.323   genuine 0.52 / 0.71
+        #   scrfd25g_edgeface_s  impostor p99 0.246  max 0.450   genuine 0.70 / 0.88
+        #
+        # EdgeFace separates identities better (margin +0.252 vs +0.199) but its
+        # whole similarity distribution sits higher, so reusing 0.35 would put
+        # four of those impostor pairs over the line. 0.55 clears the measured
+        # impostor maximum with room to spare and still sits well under the
+        # genuine pairs. Raise it if the robot confuses people, lower it if it
+        # fails to recognise them, and record what you saw.
+        "match_threshold": 0.55,
+    },
+}
+# The shipped default. Moved from `buffalo_sc` to the stronger pair: it separates
+# identities better on the same images (margin +0.252 vs +0.199; see each row).
+#
+# This is a **breaking change for an existing roster**, and deliberately so rather
+# than silently: the default db_dir moves with the model, so a robot upgrading into
+# this comes up with an empty roster and recognises nobody until its people are
+# re-enrolled. Embeddings cannot be migrated — they are in a different space. The
+# previous roster is not destroyed; selecting `buffalo_sc` on the card restores it
+# intact, because that row pins `/models/face_db`.
+DEFAULT_FACE_MODEL = "scrfd25g_edgeface_s"
+# Per-model, because a cosine threshold is a property of the embedding space and
+# not of the plugin: see the measurements on each row above. An explicit
+# `match_threshold` in config still wins, so a robot that was tuned by hand keeps
+# its number.
+DEFAULT_MATCH_THRESHOLD = FACE_MODELS[DEFAULT_FACE_MODEL]["match_threshold"]
+
+
+def default_match_threshold(model: str) -> float:
+    """The recommended cosine threshold for `model`'s embedding space.
+
+    Unknown names fall back to the default model's rather than raising: this is
+    only a default-picker, and the real validation of `model` happens in
+    FaceAnalyzer, which gives a far better message.
+    """
+    spec = FACE_MODELS.get(model) or FACE_MODELS[DEFAULT_FACE_MODEL]
+    return float(spec["match_threshold"])
+
+
+def face_bundle_for(model: str, model_dir: str) -> tuple[str, str]:
+    """Resolve a model name to the ``(directory, bundle)`` its weights live in.
+
+    Shared with the parent process rather than kept inside FaceAnalyzer: the
+    analyzer is built in the ORT worker child, whose protocol is request/reply
+    with no way to push download progress back. So the parent fetches the
+    weights first (a pure HTTP + hashing job — it creates no ORT session) and
+    the child's own ensure_face_model call then finds a verified bundle and
+    returns at once. Both sides must agree on where that is, and this is the
+    one function that decides.
+    """
+    spec = FACE_MODELS.get(model)
+    if spec is None:
+        raise ValueError(
+            f"unknown face model {model!r}; this build has {sorted(FACE_MODELS)}")
+    # An explicitly configured model_dir wins, so an operator can point at a local
+    # copy; otherwise the registry's own directory is used.
+    if model_dir == DEFAULT_FACE_MODEL_DIR:
+        model_dir = spec["dir"]
+    return model_dir, spec.get("bundle", "face")
+
+DET_MODEL_FILE = "det_500m.onnx"
+REC_MODEL_FILE = "w600k_mbf.onnx"
+
+DEFAULT_DET_SIZE = (640, 640)
+DEFAULT_DET_THRESH = 0.5
+DEFAULT_NMS_THRESH = 0.4
+DEFAULT_MIN_FACE_PX = 64
+DEFAULT_BLUR_MIN = 60.0
+# Longest side an incoming photo is downscaled to before detection. 2048 keeps
+# a small distant face well above min_face_px while bounding the decoded array.
+DEFAULT_MAX_IMAGE_SIDE = 2048
+# Decompression-bomb guard, in pixels (~60 MP). A 24 MP phone photo passes.
+DEFAULT_MAX_IMAGE_PIXELS = 60_000_000
+
+EMBEDDING_DIM = 512
+def face_db_dir_for(model: str, db_dir: str) -> str:
+    """Resolve the identity-store directory for `model`.
+
+    Each model gets **its own roster**, because embeddings from different networks
+    are not comparable: `IdentityDB._load` refuses a store written by another model
+    rather than silently confusing identities. That refusal is correct, but with a
+    single shared default it fired on the very act of selecting a second model —
+    the card went to `state: error` and the only way out was for the operator to
+    invent a `db_dir` by hand. So the default moves with the model and the refusal
+    goes back to being a backstop against pointing a model at a foreign store.
+
+    A row may pin its directory with a `db_dir` key, and `buffalo_sc` does: it owns
+    `/models/face_db` permanently. That pin is attached to **buffalo_sc itself, not
+    to whichever model is currently the default** — which matters, because the
+    default has since moved to `scrfd25g_edgeface_s`. Keying this on
+    DEFAULT_FACE_MODEL instead (as the first cut did) would have handed the new
+    default a roster written by buffalo_sc, reproducing the `state: error` this
+    function exists to prevent, and simultaneously orphaned the existing roster
+    behind a `face_db-buffalo_sc` path nothing would look at.
+
+    Mirrors `face_bundle_for`'s treatment of `model_dir`, including why an explicit
+    value is detected by comparing against the default rather than by absence:
+    `config.yaml` ships `db_dir` set, and agent-core persists it into every card's
+    stored config, so "the caller did not choose" cannot be observed as a missing
+    key — only as the default value.
+
+    Switching models therefore starts an empty roster rather than erroring. `info()`
+    reports `database.db_dir` and the person count so that is visible rather than
+    looking like forgotten people.
+    """
+    if db_dir != DEFAULT_DB_DIR:
+        return db_dir
+    spec = FACE_MODELS.get(model)
+    if spec is None:
+        return DEFAULT_DB_DIR
+    return spec.get("db_dir") or f"{DEFAULT_DB_DIR}-{model}"
+
+_REC_INPUT_SIZE = 112
+
+# SCRFD wire format for a 3-level, 2-anchor, keypoint-carrying model. Upstream
+# derives these from the output count; det_500m always has 9 outputs.
+# Single source of truth is plugins/scrfd_decode.py, which the worker child imports
+# too — two copies of "this detector has three strides" is exactly the kind of drift
+# that produces an opaque reshape error.
+_FEAT_STRIDES = scrfd_decode.FEAT_STRIDES
+_NUM_ANCHORS = scrfd_decode.NUM_ANCHORS
+_NUM_KPS = scrfd_decode.NUM_KPS
+
+# ArcFace's canonical 112x112 landmark template. Aligning every face onto these
+# five points is what makes two embeddings comparable at all.
+_ARCFACE_DST = np.array(
+    [
+        [38.2946, 51.6963],
+        [73.5318, 51.5014],
+        [56.0252, 71.7366],
+        [41.5493, 92.3655],
+        [70.7299, 92.2041],
+    ],
+    dtype=np.float32,
+)
+
+
+@dataclass
+class DetectedFace:
+    """One detection, with everything the quality gate and payload need."""
+
+    bbox: tuple[float, float, float, float]      # x1, y1, x2, y2 in source px
+    det_score: float
+    kps: np.ndarray                              # (5, 2) float32, source px
+    blur: float = 0.0                            # variance of Laplacian
+    aligned: np.ndarray | None = field(default=None, repr=False)
+    embedding: np.ndarray | None = field(default=None, repr=False)
+
+    @property
+    def width(self) -> float:
+        return max(0.0, self.bbox[2] - self.bbox[0])
+
+    @property
+    def height(self) -> float:
+        return max(0.0, self.bbox[3] - self.bbox[1])
+
+    @property
+    def min_side(self) -> float:
+        return min(self.width, self.height)
+
+    @property
+    def area(self) -> float:
+        return self.width * self.height
+
+    def bbox_xywh(self) -> list[int]:
+        x1, y1, x2, y2 = self.bbox
+        return [int(round(x1)), int(round(y1)),
+                int(round(x2 - x1)), int(round(y2 - y1))]
+
+
+def _umeyama_similarity(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """Least-squares similarity transform (rotation + uniform scale + shift).
+
+    This is what `skimage.transform.SimilarityTransform` computes, written out
+    so scikit-image is not a dependency. Not `cv2.estimateAffinePartial2D`:
+    that runs RANSAC/LMEDS, and on exactly five correspondences a robust
+    estimator can discard a point and return a different transform run to run —
+    which would make the same photo produce different embeddings.
+    """
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    num, dim = src.shape
+
+    src_mean = src.mean(axis=0)
+    dst_mean = dst.mean(axis=0)
+    src_demean = src - src_mean
+    dst_demean = dst - dst_mean
+
+    covariance = dst_demean.T @ src_demean / num
+    reflect = np.ones((dim,), dtype=np.float64)
+    if np.linalg.det(covariance) < 0:
+        reflect[dim - 1] = -1.0
+
+    u_matrix, singular, vt_matrix = np.linalg.svd(covariance)
+    rank = np.linalg.matrix_rank(covariance)
+    transform = np.eye(dim + 1, dtype=np.float64)
+    if rank == 0:
+        raise ValueError("degenerate landmark set; cannot align")
+    if rank == dim - 1:
+        if np.linalg.det(u_matrix) * np.linalg.det(vt_matrix) > 0:
+            transform[:dim, :dim] = u_matrix @ vt_matrix
+        else:
+            saved = reflect[dim - 1]
+            reflect[dim - 1] = -1.0
+            transform[:dim, :dim] = u_matrix @ np.diag(reflect) @ vt_matrix
+            reflect[dim - 1] = saved
+    else:
+        transform[:dim, :dim] = u_matrix @ np.diag(reflect) @ vt_matrix
+
+    variance = src_demean.var(axis=0).sum()
+    if variance <= 1e-9:
+        raise ValueError("degenerate landmark set; cannot align")
+    scale = float(singular @ reflect) / variance
+    transform[:dim, dim] = dst_mean - scale * (transform[:dim, :dim] @ src_mean)
+    transform[:dim, :dim] *= scale
+    return transform[:dim].astype(np.float32)
+
+
+# The decode moved to plugins/scrfd_decode.py so the worker child can import the same
+# implementation instead of a copy. Re-exported under the old private names: everything
+# below reads them, and a rename would be churn for its own sake.
+_distance2bbox = scrfd_decode.distance2bbox
+_distance2kps = scrfd_decode.distance2kps
+_nms = scrfd_decode.nms
+
+
+class FaceAnalyzer:
+    """SCRFD detection + ArcFace embedding over onnxruntime.
+
+    Stateless per call and safe to share across threads: `InferenceSession.run`
+    is thread-safe, and nothing here mutates instance state after __init__. The
+    plugin holds exactly one analyzer for every instance, the same
+    single-flight arrangement `plugins/ocr.py` uses for its adapter.
+    """
+
+    def __init__(
+        self,
+        model_dir: str = DEFAULT_FACE_MODEL_DIR,
+        device: str = "auto",
+        model: str = DEFAULT_FACE_MODEL,
+        det_size: tuple[int, int] = DEFAULT_DET_SIZE,
+        det_thresh: float = DEFAULT_DET_THRESH,
+        nms_thresh: float = DEFAULT_NMS_THRESH,
+        num_threads: int = 2,
+        warmup: bool = True,
+        providers=None,
+        in_process: bool = False,
+    ):
+        if ort is None:
+            raise RuntimeError(
+                "the face plugin needs the standalone onnxruntime package; it is "
+                "imported at the top of plugins/face_runtime.py, and that import "
+                "must keep happening there — see the comment on it"
+            )
+        self._cv2 = load_cv2()
+        self._requested_device = (device or "auto").strip().lower()
+        self._det_thresh = float(det_thresh)
+        self._nms_thresh = float(nms_thresh)
+        width, height = (int(det_size[0]), int(det_size[1]))
+        # SCRFD's largest stride is 32; a size that is not a multiple of it
+        # would make the anchor grid and the feature map disagree in shape and
+        # the reshape below would fail with an opaque numpy error.
+        self._det_size = (width - width % 32 or 32, height - height % 32 or 32)
+
+        spec = FACE_MODELS.get(model)
+        if spec is None:
+            raise ValueError(
+                f"unknown face model {model!r}; this build has "
+                f"{sorted(FACE_MODELS)}. Adding one is a row in FACE_MODELS, but read "
+                "the note there first: the detector must emit nine outputs and the "
+                "recogniser must be 112x112 -> 512-d, and switching models invalidates "
+                "the stored embeddings."
+            )
+        self._model = model
+        det_name, rec_name = spec["det"], spec["rec"]
+        model_dir, bundle = face_bundle_for(model, model_dir)
+
+        # Normally a no-op: the parent prefetched these so it could report
+        # progress. Still called, because this class must work when it is the
+        # only thing that runs — a test, or a future in-process caller.
+        paths = ensure_face_model(model_dir, bundle=bundle)
+        det_path = paths.get(det_name) or os.path.join(model_dir, det_name)
+        rec_path = paths.get(rec_name) or os.path.join(model_dir, rec_name)
+
+        # Providers are resolved by whoever built this — the parent, before it decides
+        # whether there is room — and passed in. Resolving them here would mean asking
+        # the standalone onnxruntime what it offers, in a process that may be the
+        # perception one, which is a question with a side effect: it maps the provider
+        # bridge. Falls back to resolving locally when nobody passed any, which is the
+        # in-child default path.
+        if providers is None:
+            providers = ort_providers_for_device(self._requested_device)
+        providers = list(providers)
+        # `device` reports what is actually running rather than what was asked for.
+        self._device = "gpu" if providers[0] != "CPUExecutionProvider" else "cpu"
+        # Session creation is where a parked-core Jetson abort()s under a bad
+        # ORT version, and an abort prints no Python traceback. Say the
+        # precondition first, so the last line before a silent death names it.
+        warn_on_parked_cores("face")
+
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = max(1, int(num_threads))
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # The models ship pre-optimised and the container filesystem may be
+        # read-only for /models; let ORT keep its optimised graph in memory.
+        options.log_severity_level = 3
+
+        # Created here, and "here" decides everything: this class runs either inside
+        # plugins/ort_worker.py's child — where it is the only ONNX Runtime and a
+        # session is exactly right — or in the perception process, where sherpa's
+        # runtime is already loaded and a CUDA session corrupts it. Callers in the
+        # perception process must go through plugins/face_proxy.py; `in_process` is the
+        # switch, and it defaults to False so nothing gets it by accident.
+        if not in_process:
+            raise RuntimeError(
+                "FaceAnalyzer creates an ONNX Runtime session, which must not happen "
+                "in the perception process: sherpa-onnx's runtime is already there and "
+                "the two corrupt each other (an exception on jp6.1, a SIGSEGV that "
+                "kills all of perception on jp5.11). Use plugins/face_proxy."
+                "FaceServiceProxy, which runs this in the ORT worker child. "
+                "See plugins/ort_worker.py."
+            )
+
+        self._det = ort.InferenceSession(det_path, options, providers=providers)
+        self._rec = ort.InferenceSession(rec_path, options, providers=providers)
+        self._det_input = self._det.get_inputs()[0].name
+        self._rec_input = self._rec.get_inputs()[0].name
+        self._det_outputs = [output.name for output in self._det.get_outputs()]
+
+        if len(self._det_outputs) != len(_FEAT_STRIDES) * 3:
+            raise RuntimeError(
+                f"{det_name} has {len(self._det_outputs)} outputs; this "
+                f"decoder expects {len(_FEAT_STRIDES) * 3} (3 strides x "
+                "score/bbox/kps). A detector without keypoints cannot be "
+                "aligned for recognition."
+            )
+
+        log.info(
+            "[face] analyzer ready: onnxruntime=%s model=%s device=%s "
+            "(requested %s) providers=%s det=%s rec=%s size=%s",
+            ort.__version__, model, self._device, self._requested_device,
+            self._det.get_providers(),
+            os.path.basename(det_path), os.path.basename(rec_path),
+            self._det_size,
+        )
+
+        if warmup:
+            self._warmup()
+
+    # ── properties ────────────────────────────────────────────────────────
+
+    @property
+    def device(self) -> str:
+        """The device actually in use — `auto` is already resolved."""
+        return self._device
+
+    @property
+    def providers(self) -> list[str]:
+        return list(self._det.get_providers())
+
+    @property
+    def det_thresh(self) -> float:
+        return self._det_thresh
+
+    def _warmup(self) -> None:
+        """Pay the first-inference cost here, not on an operator's first face.
+
+        Same reasoning as `plugins/asr.py`: on CUDA the first run costs ~1.7 s
+        (lazy kernels, cuDNN autotune, memory pool) against a steady state
+        measured in tens of milliseconds.
+        """
+        try:
+            blank = np.zeros(
+                (self._det_size[1], self._det_size[0], 3), dtype=np.uint8
+            )
+            self.detect(blank)
+            self.embed(np.zeros((_REC_INPUT_SIZE, _REC_INPUT_SIZE, 3), dtype=np.uint8))
+            log.info("[face] warmup done")
+        except Exception:  # noqa: BLE001 - warmup must never block startup
+            log.warning("[face] warmup failed; continuing", exc_info=True)
+
+    # ── image helpers ─────────────────────────────────────────────────────
+
+    def decode_image(
+        self,
+        data: bytes,
+        max_side: int = DEFAULT_MAX_IMAGE_SIDE,
+        max_pixels: int = DEFAULT_MAX_IMAGE_PIXELS,
+    ) -> np.ndarray | None:
+        """Decode arbitrary image bytes to a BGR array, downscaled if huge.
+
+        Converting and resizing **here** rather than rejecting at the API is
+        deliberate: an operator registering a face has whatever their phone or
+        camera produced, and "your photo is 24 MB" or "we only take JPEG" is a
+        limitation of ours, not a property of their photo.
+
+        Two decoders, because each covers formats the other does not: OpenCV
+        reads JPEG/PNG/BMP/WEBP/TIFF/PPM, and Pillow (already in the image)
+        adds GIF, ICO and some TIFF variants. Anything neither can read returns
+        None and the caller reports `bad_input`. HEIC/HEIF — what an iPhone
+        shoots by default — needs `pillow-heif`, which is not installed, so it
+        is the one common format still unsupported.
+
+        `max_side` exists for accuracy as much as memory: detection letterboxes
+        to `det_size` (640) anyway, so a 6000 px photo is downscaled by the
+        detector regardless. Doing it once here with INTER_AREA is both cheaper
+        and better than letting the letterbox do it — and it bounds the
+        intermediate array, which for a 60 MP image is 180 MB of uint8.
+
+        `max_pixels` is a decompression-bomb guard: a few hundred KB of PNG can
+        declare a 30000x30000 canvas, which would be 2.7 GB decoded and take the
+        whole perception process down with the OOM killer.
+        """
+        if not data:
+            return None
+        image = self._decode_with_cv2(data)
+        if image is None:
+            image = self._decode_with_pillow(data)
+        if image is None or image.size == 0:
+            return None
+        if max_pixels and image.shape[0] * image.shape[1] > max_pixels:
+            log.warning("[face] refusing a %dx%d image (%.1f MP > %.1f MP cap)",
+                        image.shape[1], image.shape[0],
+                        image.shape[0] * image.shape[1] / 1e6, max_pixels / 1e6)
+            return None
+        return self._downscale(image, max_side)
+
+    def _decode_with_cv2(self, data: bytes) -> np.ndarray | None:
+        try:
+            buffer = np.frombuffer(data, dtype=np.uint8)
+            if buffer.size == 0:
+                return None
+            image = self._cv2.imdecode(buffer, self._cv2.IMREAD_COLOR)
+        except Exception:  # noqa: BLE001 - fall through to Pillow
+            return None
+        return image if image is not None and image.size else None
+
+    def _decode_with_pillow(self, data: bytes) -> np.ndarray | None:
+        """Fallback decoder, converting whatever it reads to 3-channel BGR."""
+        try:
+            import io
+
+            from PIL import Image
+
+            with Image.open(io.BytesIO(data)) as handle:
+                # convert() also flattens palettes, drops alpha and collapses
+                # 16-bit channels, so the result is always plain 8-bit RGB.
+                rgb = handle.convert("RGB")
+                array = np.asarray(rgb)
+        except Exception:  # noqa: BLE001 - genuinely undecodable
+            return None
+        if array.size == 0:
+            return None
+        return np.ascontiguousarray(array[:, :, ::-1])      # RGB -> BGR
+
+    def _downscale(self, image: np.ndarray, max_side: int) -> np.ndarray:
+        if not max_side:
+            return image
+        height, width = image.shape[:2]
+        longest = max(height, width)
+        if longest <= max_side:
+            return image
+        scale = max_side / float(longest)
+        resized = self._cv2.resize(
+            image,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=self._cv2.INTER_AREA,   # the right filter for shrinking
+        )
+        log.debug("[face] downscaled %dx%d -> %dx%d", width, height,
+                  resized.shape[1], resized.shape[0])
+        return resized
+
+    # Kept as an alias: the name predates supporting anything but JPEG.
+    decode_jpeg = decode_image
+
+    # ── detection ─────────────────────────────────────────────────────────
+
+    def detect(self, bgr: np.ndarray, max_faces: int = 0) -> list[DetectedFace]:
+        """Detect faces in a BGR image, largest first."""
+        if bgr is None or bgr.size == 0:
+            return []
+        height, width = bgr.shape[:2]
+        input_w, input_h = self._det_size
+
+        # Letterbox: preserve aspect ratio, paste top-left, remember the scale.
+        # Distorting the aspect ratio moves the landmarks off the face and the
+        # alignment silently degrades every embedding.
+        image_ratio = height / max(1, width)
+        model_ratio = input_h / input_w
+        if image_ratio > model_ratio:
+            new_h = input_h
+            new_w = int(new_h / image_ratio)
+        else:
+            new_w = input_w
+            new_h = int(new_w * image_ratio)
+        scale = new_h / max(1, height)
+        resized = self._cv2.resize(bgr, (max(1, new_w), max(1, new_h)))
+        padded = np.zeros((input_h, input_w, 3), dtype=np.uint8)
+        padded[: resized.shape[0], : resized.shape[1]] = resized
+
+        blob = padded[:, :, ::-1].astype(np.float32)          # BGR → RGB
+        blob = (blob - 127.5) / 128.0
+        blob = np.ascontiguousarray(blob.transpose(2, 0, 1)[None])
+
+        outputs = self._det.run(self._det_outputs, {self._det_input: blob})
+        boxes, keypoints, scores = scrfd_decode.decode(
+            outputs, input_h, input_w, scale, self._det_thresh, self._nms_thresh)
+        if scores.size == 0:
+            return []
+        keep = range(len(scores))
+
+        faces = [
+            DetectedFace(
+                bbox=(
+                    float(max(0.0, boxes[i][0])),
+                    float(max(0.0, boxes[i][1])),
+                    float(min(width, boxes[i][2])),
+                    float(min(height, boxes[i][3])),
+                ),
+                det_score=float(scores[i]),
+                kps=keypoints[i].astype(np.float32),
+            )
+            for i in keep
+        ]
+        faces.sort(key=lambda face: face.area, reverse=True)
+        if max_faces and len(faces) > max_faces:
+            faces = faces[:max_faces]
+        return faces
+
+    # ── alignment, quality, embedding ─────────────────────────────────────
+
+    def align(self, bgr: np.ndarray, kps: np.ndarray) -> np.ndarray:
+        """Warp a face onto the 112x112 ArcFace template."""
+        matrix = _umeyama_similarity(np.asarray(kps, dtype=np.float32), _ARCFACE_DST)
+        return self._cv2.warpAffine(
+            bgr, matrix, (_REC_INPUT_SIZE, _REC_INPUT_SIZE), borderValue=0.0
+        )
+
+    def sharpness(self, aligned: np.ndarray) -> float:
+        """Variance of the Laplacian — the blur metric behind `low_quality`.
+
+        Measured on the *aligned* crop, not the source frame, so the number
+        means the same thing whether the person was 1 m or 4 m away: a distant
+        face is upscaled to 112x112 and its softness shows up here.
+        """
+        gray = self._cv2.cvtColor(aligned, self._cv2.COLOR_BGR2GRAY)
+        return float(self._cv2.Laplacian(gray, self._cv2.CV_64F).var())
+
+    def prepare(self, bgr: np.ndarray, face: DetectedFace) -> DetectedFace:
+        """Fill in `aligned` and `blur` for a detection."""
+        face.aligned = self.align(bgr, face.kps)
+        face.blur = self.sharpness(face.aligned)
+        return face
+
+    def embed(self, aligned: np.ndarray) -> np.ndarray:
+        """512-d L2-normalised embedding of an aligned 112x112 crop."""
+        if aligned.shape[0] != _REC_INPUT_SIZE or aligned.shape[1] != _REC_INPUT_SIZE:
+            aligned = self._cv2.resize(aligned, (_REC_INPUT_SIZE, _REC_INPUT_SIZE))
+        blob = aligned[:, :, ::-1].astype(np.float32)          # BGR → RGB
+        blob = (blob - 127.5) / 127.5
+        blob = np.ascontiguousarray(blob.transpose(2, 0, 1)[None])
+        vector = self._rec.run(None, {self._rec_input: blob})[0].reshape(-1)
+        norm = float(np.linalg.norm(vector))
+        if norm <= 1e-8:
+            raise RuntimeError("recognition model returned a zero embedding")
+        return (vector / norm).astype(np.float32)
+
+    def analyze(
+        self, bgr: np.ndarray, max_faces: int = 0, with_embeddings: bool = True
+    ) -> list[DetectedFace]:
+        """Detect, align and (optionally) embed every face in one frame."""
+        faces = self.detect(bgr, max_faces=max_faces)
+        for face in faces:
+            self.prepare(bgr, face)
+            if with_embeddings:
+                face.embedding = self.embed(face.aligned)
+        return faces
+
+    def close(self) -> None:
+        """Drop the sessions.
+
+        Inside the worker child this is all that is needed: the child's own exit, or
+        `ort_worker`'s `drop`, is what actually returns the CUDA context.
+        """
+        self._det = None
+        self._rec = None
+
+__all__ = [
+    "DEFAULT_BLUR_MIN",
+    "DEFAULT_MAX_IMAGE_PIXELS",
+    "DEFAULT_MAX_IMAGE_SIDE",
+    "DEFAULT_DET_SIZE",
+    "DEFAULT_DET_THRESH",
+    "DEFAULT_FACE_MODEL",
+    "DEFAULT_FACE_MODEL_DIR",
+    "DEFAULT_MATCH_THRESHOLD",
+    "DEFAULT_MIN_FACE_PX",
+    "DEFAULT_NMS_THRESH",
+    "DET_MODEL_FILE",
+    "DEFAULT_DB_DIR",
+    "EMBEDDING_DIM",
+    "REC_MODEL_FILE",
+    "FACE_MODELS",
+    "DetectedFace",
+    "FaceAnalyzer",
+    "default_match_threshold",
+    "face_bundle_for",
+    "face_db_dir_for",
+]

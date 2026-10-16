@@ -10,6 +10,8 @@
  * 表单埋在「设置 → 技能 → 我的技能」里，用户根本找不到。
  */
 
+import { handoffMarkup, mountHandoff, handleHandoffClick, loadHandoffAddresses } from './handoff.js';
+
 const TOKEN_KEY = 'rc_token';
 const ROLE_KEY  = 'rc_role';
 const USER_KEY  = 'rc_user_id';
@@ -119,6 +121,8 @@ export function hideAccount() {
 /** 重新拉身份与两个市场的摘要，然后重绘。 */
 export async function refreshAccount() {
   _render();                       // 先用现有状态画一次，避免闪空白
+  // 和下面的身份请求并发：两件事互不相干，串起来只是让页面多空一会儿
+  const addresses = loadHandoffAddresses();
   if (getRcToken()) {
     try {
       const res = await fetch('/api/account/session', { headers: rcHeaders() });
@@ -141,6 +145,7 @@ export async function refreshAccount() {
   } else {
     _user = null;
   }
+  await addresses;
   _syncBadges();
   _render();
   _loadEntrySummaries();
@@ -159,9 +164,12 @@ function _render() {
   const html = `
     ${_notice ? `<div class="account-notice">${_esc(_notice)}</div>` : ''}
     ${_user ? _renderIdentity() : _renderAuthForm()}
+    ${handoffMarkup()}
+    ${_renderTokenSection()}
     <div class="account-section-label">内容</div>
     <div class="settings-list account-entry-list">
       <button class="settings-item" data-entry="skills">
+        <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.2l1.9 4.9 4.9 1.9-4.9 1.9L12 16.8l-1.9-4.9L5.2 10l4.9-1.9L12 3.2z"/><path d="M18.5 16.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7.7-1.8z"/></svg></span>
         <span class="settings-item-text">
           <span class="settings-item-label">技能广场</span>
           <span class="settings-item-sub" id="account-skills-sub">安装、激活、发布技能</span>
@@ -169,6 +177,7 @@ function _render() {
         <span class="settings-item-arrow">›</span>
       </button>
       <button class="settings-item" data-entry="solutions">
+        <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3.2 7.6 12 12.2l8.8-4.6L12 3z"/><path d="M3.2 12.4 12 17l8.8-4.6M3.2 16.8 12 21.4l8.8-4.6"/></svg></span>
         <span class="settings-item-text">
           <span class="settings-item-label">解决方案市场</span>
           <span class="settings-item-sub" id="account-solutions-sub">整套画布 / 技能 / Prompt / 任务</span>
@@ -182,6 +191,8 @@ function _render() {
     const el = document.getElementById(id);
     if (el) el.innerHTML = html;
   });
+  // 二维码那段的倒计时活在 handoff.js 的模块状态里，DOM 一换就要接回去
+  mountHandoff(_render);
 }
 
 function _renderIdentity() {
@@ -205,6 +216,24 @@ function _renderIdentity() {
     </div>`;
 }
 
+/** 登录后才有 token；单独一个 section，别再挤进 identity 卡片的元信息行里。 */
+function _renderTokenSection() {
+  const token = getRcToken();
+  if (!_user || !token) return '';
+  const shortToken = token.length > 20
+    ? `${token.slice(0, 10)}…${token.slice(-6)}`
+    : token;
+  return `
+    <div class="account-section-label">本机 Token</div>
+    <div class="account-card account-token-card">
+      <code class="account-token-value" title="${_esc(token)}">${_esc(shortToken)}</code>
+      <div class="account-token-actions">
+        <button class="account-copy-btn" data-copy="${_esc(token)}" title="复制完整 Token">复制</button>
+        <button class="account-link account-token-reset" data-action="reset-token" title="清除本机 Token 并重新登录">重置</button>
+      </div>
+    </div>`;
+}
+
 function _renderAuthForm() {
   const isRegister = _mode === 'register';
   return `
@@ -221,7 +250,7 @@ function _renderAuthForm() {
         <input type="password" name="password" placeholder="${isRegister ? '密码（至少 8 位）' : '密码'}"
                autocomplete="${isRegister ? 'new-password' : 'current-password'}" required
                ${isRegister ? 'minlength="8"' : ''}>
-        ${isRegister ? `<input type="text" name="name" placeholder="昵称（可选）" autocomplete="nickname">` : ''}
+        ${isRegister ? `<input type="text" name="name" placeholder="昵称" autocomplete="nickname" required>` : ''}
         ${_formError ? `<p class="account-form-error">${_esc(_formError)}</p>` : ''}
         <button type="submit" class="account-submit-btn" ${_busy ? 'disabled' : ''}>
           ${_busy ? '处理中…' : (isRegister ? '注册并登录' : '登录')}
@@ -275,6 +304,8 @@ function _syncBadges() {
 // ── 交互 ────────────────────────────────────────────────────────────────────
 
 function _onClick(e) {
+  if (handleHandoffClick(e, _render)) return;
+
   const entry = e.target.closest('[data-entry]');
   if (entry) {
     // 两个市场都不需要登录就能浏览，直接点隐藏的原按钮，沿用它们自己的初始化
@@ -297,6 +328,14 @@ function _onClick(e) {
     _notice = '';
     _mode = 'login';
     refreshAccount();
+  } else if (action === 'reset-token') {
+    // Token 是 Resource Center 签发的无状态 JWT，服务端不持有可撤销的会话记录，
+    // 所以"重置"只能清掉本机存的这一份——下次操作会引导重新登录换取新 token。
+    if (!confirm('重置后需要重新登录才能获得新的 Token，确定继续？')) return;
+    clearRcToken();
+    _notice = '';
+    _mode = 'login';
+    refreshAccount();
   } else if (action === 'to-register') {
     _mode = 'register'; _formError = ''; _render();
   } else if (action === 'to-login') {
@@ -315,7 +354,14 @@ async function _onSubmit(e) {
     identifier: form.identifier.value.trim(),
     password:   form.password.value,
   };
-  if (kind === 'register' && form.name) body.name = form.name.value.trim();
+  if (kind === 'register') {
+    body.name = form.name.value.trim();
+    if (!body.name) {
+      _formError = '请输入昵称';
+      _render();
+      return;
+    }
+  }
 
   _busy = true; _formError = ''; _render();
   try {

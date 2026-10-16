@@ -23,6 +23,7 @@ from utils.log_sampling import SampledLogGate, escape_log_text
 from utils.qos import CAMERA_QOS
 from utils.ros_lifecycle import dispose_node
 
+from plugins.image_input import BadInput, load_image_bytes
 from plugins.ocr_runtime import (
     DEFAULT_DET_BOX_THRESH,
     DEFAULT_DET_THRESH,
@@ -36,6 +37,16 @@ from plugins.ocr_runtime import (
 log = logging.getLogger(__name__)
 
 DEFAULT_OCR_MODEL_DIR = "/models/ocr/ppocrv6-small-trt"
+
+# Once a second. Text in front of a robot does not change at frame rate, and
+# the previous default (every frame the camera delivers) meant a 14fps 720p
+# stream kept a whole CPU core busy on JPEG decode and enhancement whether or
+# not anything downstream consumed the result.
+DEFAULT_OCR_FPS = 1.0
+
+# Where a topic-less card publishes, mirroring tts's /perception/tts.
+DEFAULT_OUTPUT_TOPIC = "/perception/ocr"
+_DEFAULT_INSTANCE = "_default"
 _ERROR_LOG_INTERVAL_SECONDS = 10.0
 
 _RESULT_QOS = QoSProfile(
@@ -50,21 +61,44 @@ TOOLS = [
         "name": "ocr",
         "type": "processor",
         "multiInstance": True,
-        "description": "OCR — recognize text in camera feed via image topic subscription",
+        "description": "OCR — recognize text in a camera feed, or in a single photo or image URL",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "stop", "info", "config"],
+                    "enum": [
+                        "start", "stop", "info", "config",
+                        "recognize_by_photo", "recognize_by_url",
+                    ],
                     "description": "Action to perform"
                 },
                 "input_topic": {
                     "type": "string",
-                    "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb, required for action=start)"
+                    "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb). 可选：不填则卡片以按需模式启动，不订阅摄像头，只服务 recognize_by_photo / recognize_by_url"
+                },
+                # `format: file` renders a file picker on the card; `uploadTo:
+                # mcp` posts the bytes to /api/mcp/<id>/file/upload, which
+                # streams them to *this* service and returns the path they
+                # landed on here — no shared mount needed.
+                "image_path": {"type": "string", "format": "file", "accept": "image/*", "uploadTo": "mcp", "description": "图片文件。从卡片上传，或填一个容器可读的路径（如 /uploads/doc.jpg）"},
+                "url": {"type": "string", "description": "图片的 http(s) 地址，如 https://example.com/doc.jpg。下载后本地解码，格式限制同 image_path"},
+            },
+            "required": ["action"],
+            "x-action-params": {
+                "start":  {"params": ["input_topic"], "description": "启动。给 input_topic 则持续识别该摄像头话题；不给则以按需模式启动，只服务单张图片的识别"},
+                "stop":   {"params": [], "description": "Stop recognition"},
+                "info":   {"params": ["input_topic"], "description": "Report state and topics"},
+                "config": {"params": [], "description": "Update configuration"},
+                "recognize_by_photo": {
+                    "params": ["image_path"],
+                    "description": "识别一张图片里的文字 — 一次性识别，不需要摄像头也不需要先 start。返回与实时流同样的结果结构",
+                },
+                "recognize_by_url": {
+                    "params": ["url"],
+                    "description": "识别图片 URL 里的文字 — 与 recognize_by_photo 相同，只是图片来自 http(s) 而非本地文件",
                 },
             },
-            "required": ["action"]
         },
         # Deliberately minimal: only what an operator meaningfully decides.
         # Expert knobs (model_dir, device_id, DB thresholds, crop refinement,
@@ -77,7 +111,7 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "min_interval_ms": {"type": "integer", "minimum": 0, "default": 0, "description": "帧处理最小间隔(ms)，限制 GPU 占用，0=不限", "scope": "instance"},
+                "ocr_fps": {"type": "number", "minimum": 0, "default": DEFAULT_OCR_FPS, "description": "识别频率，每秒 x 次，支持小数（如 0.5 = 每 2 秒一次）；0=每帧都识别", "scope": "instance"},
             },
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
@@ -88,8 +122,52 @@ TOOLS = [
 
 # ── OCR Adapters ──────────────────────────────────────────────────────────────
 
+def ocr_interval(cfg: dict) -> float:
+    """Seconds to leave between recognitions, from `ocr_fps`.
+
+    Expressed as a frequency because that is what an operator reasons about
+    ("read once a second"), and it stays meaningful when the camera's own rate
+    changes — a minimum interval in ms does not. Fractional values are the
+    point: 0.2 means once every five seconds.
+
+    `ocr_fps: 0` means "every frame the camera delivers". `min_interval_ms` is
+    still honoured when `ocr_fps` is absent, so a canvas saved by an earlier
+    build of this plugin keeps working (the same courtesy plugins/face.py
+    extends for its own `detect_fps` migration).
+    """
+    if cfg.get("ocr_fps") is None and cfg.get("min_interval_ms") is not None:
+        legacy = max(0.0, float(cfg["min_interval_ms"])) / 1000.0
+        log.info("[ocr] using legacy min_interval_ms=%s as %.3fs between "
+                 "recognitions; set ocr_fps instead",
+                 cfg["min_interval_ms"], legacy)
+        return legacy
+    fps = float(cfg.get("ocr_fps", DEFAULT_OCR_FPS))
+    if fps <= 0:
+        return 0.0
+    return 1.0 / fps
+
+
+def merge_rate_cfg(plugin_cfg: dict, instance_cfg: dict) -> dict:
+    """Merge plugin- and instance-level config, keeping the rate precedence.
+
+    A plain `{**plugin, **instance}` loses the legacy fallback: config.yaml now
+    ships `ocr_fps`, so a card that stored only `min_interval_ms` would see the
+    plugin's `ocr_fps` and have its own setting ignored. The instance is the
+    more specific layer, so whichever rate key *it* carries wins outright.
+    """
+    merged = {**plugin_cfg, **instance_cfg}
+    if "min_interval_ms" in instance_cfg and "ocr_fps" not in instance_cfg:
+        merged.pop("ocr_fps", None)
+    return merged
+
+
 def _ocr_output_topic(input_topic: str) -> str:
-    return f"{input_topic}/ocr"
+    """The one place the output topic is derived from the input.
+
+    Topic-less cards publish to a fixed topic; deriving it inline forgot that
+    case and reported "None/ocr".
+    """
+    return f"{input_topic}/ocr" if input_topic else DEFAULT_OUTPUT_TOPIC
 
 
 def _adapter_options(cfg: dict) -> dict:
@@ -119,14 +197,20 @@ def _adapter_signature(cfg: dict) -> tuple:
     return provider, _adapter_options(cfg)
 
 
-def _build_ocr_adapter(cfg: dict) -> RapidOCRAdapter:
-    """根据配置创建 OCR 适配器"""
+def _build_ocr_adapter(cfg: dict, on_status=None) -> RapidOCRAdapter:
+    """根据配置创建 OCR 适配器
+
+    `on_status(text)` 接住下载进度，让卡片在取三个 TensorRT engine 期间显示
+    百分比而不是一行不动的 loading。不关心的调用方不传。
+    """
     provider = cfg.get('provider', 'rapidocr')
     if provider != 'rapidocr':
         raise ValueError(f"unsupported OCR provider: {provider}")
     options = _adapter_options(cfg)
     from utils.model_downloader import ensure_ocr_model
-    ensure_ocr_model(options["model_dir"])
+    from utils.model_progress import fetch_status
+    progress_cb, _ = fetch_status(on_status, "ppocrv6")
+    ensure_ocr_model(options["model_dir"], progress_cb=progress_cb)
     return RapidOCRAdapter(**options)
 
 
@@ -140,7 +224,10 @@ class _OCRNode(Node):
         node_name = f"ocr_{node_suffix}" if node_suffix else "ocr"
         super().__init__(node_name)
 
-        self._input_topic = input_topic
+        # Topic-less is a supported mode, as in plugins/tts.py: a card driven
+        # only by recognize_by_photo has no camera to subscribe to but still
+        # needs somewhere to publish, and no input topic to derive it from.
+        self._input_topic = input_topic or ''
         self._output_topic = _ocr_output_topic(input_topic)
         self._adapter = adapter
         self._language = language
@@ -192,7 +279,7 @@ class _OCRNode(Node):
         frames: LatestFrame = LatestFrame()
         self._stop_event = stop_event
         self._frames = frames
-        if self._sub is None:
+        if self._input_topic and self._sub is None:
             self._sub = self.create_subscription(
                 CompressedImage, self._input_topic, self._image_cb, CAMERA_QOS
             )
@@ -369,6 +456,8 @@ class OCRPlugin:
         self._adapter: RapidOCRAdapter | None = None
         self._adapter_state = "idle"                # idle|loading|ready|error
         self._load_error: str | None = None
+        # The downloader's progress line while bytes are moving; None otherwise.
+        self._load_status: str | None = None
         self._load_generation = 0
 
         log.info(
@@ -385,6 +474,7 @@ class OCRPlugin:
         """Start the one background adapter loader. Caller holds the lock."""
         self._adapter_state = "loading"
         self._load_error = None
+        self._load_status = None
         generation = self._load_generation
         cfg = dict(self._plugin_cfg)
         thread = threading.Thread(
@@ -395,13 +485,15 @@ class OCRPlugin:
 
     def _loader(self, generation: int, cfg: dict) -> None:
         try:
-            adapter = _build_ocr_adapter(cfg)
+            adapter = _build_ocr_adapter(
+                cfg, on_status=lambda text: setattr(self, "_load_status", text))
         except Exception as error:  # noqa: BLE001 - surfaced via state/info
             log.exception("[ocr] adapter load failed")
             with self._state_lock:
                 if generation == self._load_generation:
                     self._adapter_state = "error"
                     self._load_error = str(error)
+                    self._load_status = None
             return
 
         with self._state_lock:
@@ -410,6 +502,7 @@ class OCRPlugin:
             else:
                 self._adapter = adapter
                 self._adapter_state = "ready"
+                self._load_status = None
                 stale = None
         if stale is not None:
             # A config change superseded this load; never install the result.
@@ -479,13 +572,15 @@ class OCRPlugin:
                 node.stop()
 
     def _create_node(self, node_key: str, input_topic: str, adapter) -> "_OCRNode":
-        cfg = {**self._plugin_cfg, **self._instance_configs.get(node_key, {})}
+        cfg = merge_rate_cfg(
+            self._plugin_cfg, self._instance_configs.get(node_key, {})
+        )
         return _OCRNode(
             input_topic,
             adapter,
             cfg.get("language", self._language),
             node_suffix=node_key.replace('/', '_').replace('-', '_'),
-            min_interval=float(cfg.get('min_interval_ms', 0)) / 1000.0,
+            min_interval=ocr_interval(cfg),
         )
 
     def _dispose(self, node_key: str, node: "_OCRNode") -> None:
@@ -523,7 +618,62 @@ class OCRPlugin:
             return self._do_stop(instance_id)
         if action == "config":
             return self._do_config(instance_id, args)
+        if action in ("recognize_by_photo", "recognize_by_url"):
+            return self._do_recognize_image(args)
         return None
+
+    # ── one-shot recognition ──────────────────────────────────────────────
+
+    def _require_adapter(self, timeout: float = 600.0):
+        """Return a ready adapter, triggering the single-flight load if needed.
+
+        Reading one photo is useful without any instance running, so this waits
+        for the load rather than reporting `loading` and making the caller
+        poll. It reuses the one background loader instead of building a second
+        adapter — the OCR bundle is three TensorRT engines, and a duplicate set
+        would be both slow and a second claim on GPU memory.
+
+        Each tools/call has its own thread (ThreadingHTTPServer), so waiting
+        here holds up nothing else.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._state_lock:
+                if self._adapter_state == "ready" and self._adapter is not None:
+                    return self._adapter, None
+                if self._adapter_state == "error":
+                    return None, {
+                        "ok": False, "reason": "adapter_unavailable",
+                        "detail": f"OCR model failed to load: {self._load_error}",
+                    }
+                if self._adapter_state == "idle":
+                    self._spawn_loader_locked()
+            if time.monotonic() >= deadline:
+                return None, {
+                    "ok": False, "reason": "adapter_timeout",
+                    "detail": f"OCR model was still loading after {timeout:.0f}s "
+                              "(first load downloads and verifies the engine bundle)",
+                }
+            time.sleep(0.2)
+
+    def _do_recognize_image(self, args: dict) -> dict:
+        cfg = dict(self._plugin_cfg)
+        try:
+            data, source = load_image_bytes(args, cfg, url_action="recognize_by_url")
+        except BadInput as error:
+            return error.as_result()
+
+        adapter, failure = self._require_adapter()
+        if adapter is None:
+            return {**failure, "source": source}
+
+        # The same call the worker thread makes, so a one-shot answer and a
+        # streamed one cannot drift into different shapes.
+        payload = recognize_to_payload(adapter, data, self._language, time.time())
+        if "error" in payload:
+            return {"ok": False, "reason": "recognize_failed",
+                    "detail": payload["error"], "source": source}
+        return {"ok": True, "source": source, **payload}
 
     _DESC = "OCR service — extracts text from images"
 
@@ -531,7 +681,7 @@ class OCRPlugin:
         """Dashboard-facing description, mirroring the ASR plugin (#113): the
         static blurb normally, a reason while loading or after a failure."""
         if state == "loading":
-            return "Loading OCR model and TensorRT engines..."
+            return self._load_status or "Loading OCR model and TensorRT engines..."
         if state == "error" and self._load_error:
             return f"Model load failed: {self._load_error}"
         return self._DESC
@@ -545,7 +695,7 @@ class OCRPlugin:
                     node._input_topic if node is not None
                     else self._pending_starts.get(instance_id, input_topic)
                 )
-                out = f"{topic}/ocr" if topic else ""
+                out = _ocr_output_topic(topic) if topic else ""
                 state = self._instance_state_locked(instance_id)
                 result = {
                     **base,
@@ -567,7 +717,7 @@ class OCRPlugin:
                 node = self._nodes.get(key)
                 topic = node._input_topic if node else self._pending_starts[key]
                 topics_in.append({"topic": topic, "format": "image/jpeg", "desc": ""})
-                topics_out.append({"topic": f"{topic}/ocr", "format": "data/json", "desc": ""})
+                topics_out.append({"topic": _ocr_output_topic(topic), "format": "data/json", "desc": ""})
             states = {entry["state"] for entry in instances.values()}
             if "loading" in states or self._adapter_state == "loading":
                 state = "loading"
@@ -579,7 +729,7 @@ class OCRPlugin:
                 state = "idle"
             if not keys and input_topic:
                 topics_in = [{"topic": input_topic, "format": "image/jpeg", "desc": ""}]
-                topics_out = [{"topic": f"{input_topic}/ocr", "format": "data/json", "desc": ""}]
+                topics_out = [{"topic": _ocr_output_topic(input_topic), "format": "data/json", "desc": ""}]
             result = {
                 **base,
                 "state": state,
@@ -595,9 +745,10 @@ class OCRPlugin:
 
     def _do_start(self, instance_id: str, args: dict) -> dict:
         input_topic = args.get("input_topic")
-        if not input_topic:
-            raise ValueError("input_topic is required for start action")
-        node_key = instance_id or input_topic
+        # No topic is a supported mode, as in plugins/tts.py: the card comes
+        # up on-demand and answers recognize_by_photo / recognize_by_url. It
+        # simply has nothing to subscribe to.
+        node_key = instance_id or input_topic or _DEFAULT_INSTANCE
 
         retired = None
         with self._state_lock:
@@ -626,7 +777,7 @@ class OCRPlugin:
                     self._spawn_loader_locked()
                 return {
                     "state": "loading",
-                    "input": input_topic,
+                    "input": input_topic or "",
                     "output": _ocr_output_topic(input_topic),
                 }
             adapter = self._adapter
@@ -670,9 +821,9 @@ class OCRPlugin:
             if current is not None:
                 return current.start()
             if claimed and not fresh:
-                return {"state": "loading", "input": input_topic,
+                return {"state": "loading", "input": input_topic or "",
                         "output": _ocr_output_topic(input_topic)}
-            return {"state": "idle", "input": input_topic,
+            return {"state": "idle", "input": input_topic or "",
                     "output": _ocr_output_topic(input_topic)}
         try:
             result = node.start()
@@ -688,7 +839,7 @@ class OCRPlugin:
             # A concurrent stop retired the node while start() ran; its
             # dispose handled teardown — stop the worker this start spawned.
             node.stop()
-            return {"state": "idle", "input": input_topic,
+            return {"state": "idle", "input": input_topic or "",
                     "output": _ocr_output_topic(input_topic)}
         return result
 
@@ -715,7 +866,7 @@ class OCRPlugin:
         }
 
         if instance_id:
-            shared = set(cfg) - {"language", "min_interval_ms"}
+            shared = set(cfg) - {"language", "ocr_fps", "min_interval_ms"}
             if shared:
                 raise ValueError(
                     "OCR inference settings are shared: " + ", ".join(sorted(shared))
@@ -743,11 +894,9 @@ class OCRPlugin:
                 # Lightweight fields only — apply to live nodes in place.
                 for node_key, node in self._nodes.items():
                     inst = self._instance_configs.get(node_key, {})
-                    merged = {**updated_cfg, **inst}
+                    merged = merge_rate_cfg(updated_cfg, inst)
                     node._language = merged.get("language", self._language)
-                    node._min_interval = max(
-                        0.0, float(merged.get("min_interval_ms", 0)) / 1000.0
-                    )
+                    node._min_interval = ocr_interval(merged)
                 return {"status": "configured", "adapter_loaded": self._adapter is not None, "reused": self._adapter is not None}
 
             # Model-affecting change: invalidate any in-flight load, drop the

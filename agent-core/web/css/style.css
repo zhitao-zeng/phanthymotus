@@ -63,6 +63,11 @@
   /* ── Layout ── */
   --topbar-h:    52px;
   --activity-h:  220px;
+  /* One ledge height, shared by the activity header and the sidebar header, so
+     the two panels line up and neither changes size when it opens or shuts.
+     Raised for touch in the coarse-pointer block. */
+  --ledge-h: 32px;
+  --sidebar-rail-w: 36px;
 
   /* ── Shadows ── */
   --shadow-sm:   0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.05);
@@ -86,10 +91,20 @@ html, body {
 /* ══════════════════════════════════════════════════════════════════════════
    APP SHELL
 ══════════════════════════════════════════════════════════════════════════ */
+/* `vh` is always the *large* viewport — the height with the browser toolbar
+   retracted. Tablet Chrome keeps its toolbar up permanently, so `100vh`
+   overshot the visible area by the toolbar's ~56dp, and `overflow: hidden`
+   meant you could not scroll down to what had been pushed off. The bottom of
+   the shell was simply unreachable: the collapsed 32px activity bar landed
+   entirely inside that band, and collapsing it once wrote `activity-collapsed`
+   so it stayed that way on every later visit.
+   `dvh` tracks the viewport that is actually on screen; `vh` stays as the
+   fallback for engines without it. */
 #app {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -215,7 +230,11 @@ html, body {
 }
 .topbar-settings-dropdown.hidden { display: none; }
 .settings-dropdown-item {
-  display: block;
+  /* was `display: block` with the label as the only child; flex so the leading
+     icon sits on the text baseline row rather than pushing the label down */
+  display: flex;
+  align-items: center;
+  gap: 10px;
   width: 100%;
   text-align: left;
   padding: 9px 16px;
@@ -226,6 +245,17 @@ html, body {
   cursor: pointer;
 }
 .settings-dropdown-item:hover { background: var(--bg-hover); }
+.settings-dropdown-icon {
+  flex: 0 0 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+}
+.settings-dropdown-icon svg { width: 15px; height: 15px; }
+/* The danger row's text is already red; a neutral icon next to it would read as a
+   different class of item. */
+.settings-dropdown-item--danger .settings-dropdown-icon { color: inherit; }
 
 /* Think mode toggle in settings dropdown */
 .settings-dropdown-toggle {
@@ -323,15 +353,97 @@ html, body {
   border-right: 1px solid var(--border);
   background: var(--bg-card);
   overflow: hidden;
+  transition: width .2s ease;
 }
 
+/* ── Sidebar ledge ──────────────────────────────────────────────────────────
+   Same height as the activity ledge, so the two panels agree, and the same
+   rule: only the content area collapses. Shut, the sidebar keeps a rail of the
+   section status dots — which devices are up is the one thing worth seeing
+   while the list itself is out of the way.
+
+   收起键和搜索框同一行。它原先待在一行只写着「工具」的标题行里，而那四个字
+   搜索框的 placeholder 已经说过一遍，于是整整一个 ledge 的高度只换来一个重复的
+   标签。现在这一行就是 ledge，搜索框吃掉左边，收起键守在右端。 */
+/* ── Ledge icon button ──────────────────────────────────────────────────────
+   收起键这类图标按钮：命中区仍是整个 ledge 的方格，但**画出来**的只是里面一块
+   内缩的圆角面。原来是直接给按钮铺 `background: var(--bg-hover)`，于是 hover
+   时出现一块顶天立地、直角、紧贴着搜索框的灰方块，像表格裂开一条缝。
+   图标本身也从实心三角 ◀ / ▼ 换成描边折角，和顶栏那套 24×24、round cap 的图标
+   同一族。 */
+.ledge-icon-btn {
+  flex-shrink: 0;
+  width: var(--ledge-h);
+  align-self: stretch;
+  position: relative;
+  display: grid;
+  place-items: center;
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text-dim);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.ledge-icon-btn::before {
+  content: '';
+  position: absolute;
+  inset: 4px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  transition: background .15s ease;
+}
+.ledge-icon-btn svg {
+  position: relative;
+  width: 15px;
+  height: 15px;
+  transition: transform .2s ease, color .15s ease;
+}
+.ledge-icon-btn:hover { color: var(--text); }
+.ledge-icon-btn:hover::before { background: var(--bg-hover); }
+.ledge-icon-btn:active::before { background: var(--border-med); }
+.ledge-icon-btn:active svg { transform: scale(0.88); }
+.ledge-icon-btn:focus-visible::before {
+  background: var(--bg-hover);
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ledge-icon-btn svg { transition: color .15s ease; }
+  .ledge-icon-btn:active svg { transform: none; }
+}
+
+.sidebar.collapsed { width: var(--sidebar-rail-w); }
+.sidebar.collapsed .sidebar-collapse-btn svg { transform: rotate(180deg); }
+/* 收起后这一行只剩收起键 —— 它是唯一能再展开的入口，所以搜索框让位，键居中。 */
+.sidebar.collapsed .sidebar-filter { padding: 0; justify-content: center; }
+.sidebar.collapsed #sidebar-search { display: none; }
+.sidebar.collapsed .sidebar-empty,
+.sidebar.collapsed .sidebar-section-name,
+.sidebar.collapsed .sidebar-section-count,
+.sidebar.collapsed .sidebar-subgroup-label,
+.sidebar.collapsed .sidebar-tool-list { display: none; }
+.sidebar.collapsed .sidebar-scroll { padding: 8px 0; gap: 10px; align-items: center; }
+.sidebar.collapsed .sidebar-section-header { padding: 0; justify-content: center; }
+/* 只剩这一列时，13px 的图标偏小，放大到 16px。 */
+.sidebar.collapsed .sidebar-section-icon svg { width: 16px; height: 16px; }
+
+/* 侧栏的 ledge —— 与活动栏同一套：一行、一个高度、右端一个与行等宽的收起键。
+   搜索框占满余下的宽度，因为那才是这行里真正会被用的东西。 */
 .sidebar-filter {
-  padding: 8px;
+  display: flex;
+  align-items: center;
+  height: var(--ledge-h);
+  box-sizing: border-box;
+  padding: 0 0 0 8px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-card);
+  flex-shrink: 0;
 }
 #sidebar-search {
-  width: 100%; height: 28px; padding: 0 8px;
+  flex: 1;
+  min-width: 0;
+  height: 24px; padding: 0 8px;
   border: 1px solid var(--border); border-radius: var(--radius-sm);
   font-size: 11px; background: var(--bg-secondary);
   color: var(--text-primary); outline: none;
@@ -371,28 +483,27 @@ html, body {
   padding: 4px 4px 2px;
 }
 
-.sidebar-section-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  flex-shrink: 0;
-  background: var(--text-dim);
-}
-.sidebar-section-dot.online  { background: var(--green); }
-.sidebar-section-dot.offline { background: var(--red); }
-.sidebar-section-dot.pending { background: var(--yellow); }
-
+/* 分区图标。尺寸按标签的字高来定：标签是 10px/700 的大写，13px 的图标盒子让
+   两者的视觉高度对齐；`display:block` 去掉 inline 元素的基线留白，剩下的垂直
+   居中由 .sidebar-section-header 的 align-items:center 负责。 */
 .sidebar-section-icon {
-  font-size: 12px;
-  color: var(--purple);
+  display: flex;
+  align-items: center;
   flex-shrink: 0;
+  color: var(--purple);
 }
-.sidebar-section-icon.controller {
-  color: var(--emerald);
+.sidebar-section-icon svg {
+  display: block;
+  width: 13px;
+  height: 13px;
 }
-.sidebar-section-icon.actucore {
-  color: var(--blue);
-}
+.sidebar-section-icon.controller { color: var(--emerald); }
+.sidebar-section-icon.actucore   { color: var(--blue); }
+/* driver 的颜色表示在线状态 —— 这件事原来由一个圆点承担。 */
+.sidebar-section-icon.driver          { color: var(--text-dim); }
+.sidebar-section-icon.driver.online   { color: var(--green); }
+.sidebar-section-icon.driver.offline  { color: var(--red); }
+.sidebar-section-icon.driver.pending  { color: var(--yellow); }
 
 .sidebar-section-name {
   font-size: 10px;
@@ -627,6 +738,54 @@ html, body {
 .tool-config-label:first-child {
   margin-top: 0;
 }
+/* Tool-level description above the fields. Kept visually quieter than a label
+   so it reads as context rather than as another setting, and allowed to wrap —
+   a tool that has to state a fixed capability (vop's frozen class list) needs
+   more than one line. */
+.tool-config-desc {
+  margin: 0 0 4px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  background: var(--bg-subtle, rgba(127, 127, 127, 0.08));
+  border-radius: 6px;
+}
+/* The description occupies :first-child, so the first real label would lose
+   its zero top-margin and sit too close to it. */
+.tool-config-desc + .tool-config-label {
+  margin-top: 14px;
+}
+/* Per-field help. Sits under its input, quieter than the label, so the label
+   can stay a short name and the explanation still has somewhere to live. */
+.tool-config-help {
+  margin: 4px 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+/* Expert settings, folded away. A card with two dozen tuning knobs laid out
+   flat cannot be configured by anyone who did not write it. */
+.tool-config-advanced {
+  margin-top: 18px;
+  border-top: 1px solid var(--border, rgba(127, 127, 127, 0.25));
+  padding-top: 10px;
+}
+.tool-config-advanced > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  user-select: none;
+  list-style: revert;
+}
+.tool-config-advanced > summary:hover {
+  color: var(--text-primary, var(--text-secondary));
+}
+.tool-config-advanced > .tool-config-label:first-of-type {
+  margin-top: 12px;
+}
 .tool-config-input {
   width: 100%;
   padding: 10px 12px;
@@ -645,6 +804,173 @@ html, body {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+/* ── 配置表单里的二维码字段（format: "qr"）──────────────────────────────────
+   插件说"拿手机扫一下"的地方：一排选项 + 码面 + 解析后的地址。
+   不复用「我的」里 .handoff-* 那套 —— 那是一张票根卡片，语义和布局都不同，
+   共用只会让两边互相牵制。 */
+
+.qr-field {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  overflow: hidden;
+}
+
+/* 选项切换：分段控件，不是标签页 —— 它切换的是同一件事的不同目标，
+   不是切换视图。 */
+.qr-field-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 6px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-input);
+}
+.qr-field-tab {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  border: none;
+  border-radius: var(--radius-xs);
+  background: none;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qr-field-tab.is-active {
+  background: var(--bg-card);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+.qr-field-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.qr-field-body {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px;
+}
+
+/* 白底是给扫码器的，不是审美选择：暖米色背景会压低对比度。 */
+.qr-field-code {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 124px;
+  height: 124px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  overflow: hidden;
+}
+.qr-field-code svg { display: block; width: 100%; height: 100%; }
+.qr-field-hint {
+  padding: 0 10px;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.qr-field-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+.qr-field-url {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  /* 链接可能很长，给两行，再长就省略 —— 它是给人核对的，不是给人抄的 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-all;
+}
+
+.qr-field-addrs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.qr-field-addr {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: none;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+}
+.qr-field-addr.is-active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.qr-field-copy {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+/* 驱动要了访问码，或者没声明任何可扫的东西 —— 都要说出来，
+   静默留白会被当成功能坏了。 */
+.qr-field-refused,
+.qr-field-empty {
+  margin: 0;
+  padding: 12px 14px;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.qr-field-refused {
+  color: var(--red);
+  background: var(--red-bg);
+}
+.qr-field-empty { color: var(--text-dim); }
+
+@media (max-width: 768px) {
+  /* 窄屏上并排放不下 124px 的码面加一行地址，改成竖排并把码面放大 */
+  .qr-field-body {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .qr-field-code {
+    width: 100%;
+    height: auto;
+    aspect-ratio: 1;
+    max-width: 240px;
+    margin: 0 auto;
+  }
+  .qr-field-url { font-size: 12px; }
+}
+
+@media (pointer: coarse) {
+  .qr-field-tab { padding: 10px 12px; font-size: 13px; }
+  .qr-field-addr { padding: 8px 14px; }
+  .qr-field-copy { min-height: 44px; display: inline-flex; align-items: center; }
 }
 
 .cap-type-badge {
@@ -847,6 +1173,14 @@ html, body {
   position: absolute;
   top: 0;
   left: 0;
+  /* Every child is absolutely positioned, so without an explicit size this
+     element's own border box collapses to 0x0 — and the connector SVG, which
+     is sized off it, collapsed with it. Giving it the canvas area's box means
+     the SVG has a real viewport to paint into. Cards are unaffected (they are
+     positioned, not laid out), and world coordinates are unchanged because
+     the origin stays at top-left. */
+  width: 100%;
+  height: 100%;
   transform-origin: 0 0;
   /* transform set by JS */
 }
@@ -1037,6 +1371,111 @@ html, body {
     inset 0 1px 0 rgba(255,255,255,0.10);
 }
 
+/* ── 设备收尾芯片 ──────────────────────────────────────────────────────────
+   「停止智能控制」的第 2 段。按钮旁边一条可以不理、但有失败时不会自己消失的提示。
+   刻意比主按钮轻一档：agent 已经停了，这里报的是收尾，不是操作者还要等的事。 */
+.teardown-chip {
+  position: relative;
+  margin-left: 10px;
+  font-family: var(--font-ui);
+  /* **必须显式声明。** 手机上 `.canvas-top-control` 是 `pointer-events: none`（让
+     触摸穿过去落在画布上），子元素要自己 opt in —— `.canvas-main-btn` 和
+     `.auto-start-toggle` 都这么做。少了这一行，手机上这个芯片**完全点不动**：
+     展不开、重试点不到，而那时它正是唯一在屏幕上的提示（活动流在手机上是默认关
+     着的抽屉）。390x844 实测 `tap()` 直接超时。 */
+  pointer-events: auto;
+}
+.teardown-chip.hidden,
+.teardown-detail.hidden { display: none; }
+
+.teardown-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  font-size: 12px;
+  border-radius: 100px;
+  cursor: pointer;
+  font-family: inherit;
+  color: var(--text-muted);
+  background: var(--bg-card, #fff);
+  border: 1px solid var(--border, rgba(0,0,0,0.08));
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+  transition: all 0.2s ease;
+}
+.teardown-summary:hover { color: var(--text); box-shadow: 0 2px 6px rgba(0,0,0,0.10); }
+
+/* 三种语气。失败那一档要在工具条上能一眼看见，但不抢主按钮。 */
+.teardown-chip[data-tone="busy"] .teardown-summary { color: var(--text-muted); }
+.teardown-chip[data-tone="ok"]   .teardown-summary { color: var(--green, #0D6B55); }
+.teardown-chip[data-tone="warn"] .teardown-summary {
+  color: var(--red, #B3261E);
+  border-color: rgba(179,38,30,0.35);
+  background: #FFF4F2;
+}
+.teardown-chip[data-tone="busy"] .teardown-icon {
+  display: inline-block;
+  animation: teardown-spin 1.6s linear infinite;
+}
+@keyframes teardown-spin { to { transform: rotate(360deg); } }
+
+.teardown-caret { font-size: 10px; opacity: 0.55; }
+
+.teardown-detail {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: 260px;
+  max-height: 40vh;
+  overflow-y: auto;
+  padding: 6px;
+  border-radius: 10px;
+  background: var(--bg-card, #fff);
+  border: 1px solid var(--border, rgba(0,0,0,0.08));
+  box-shadow: 0 8px 24px rgba(0,0,0,0.14);
+}
+
+.teardown-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  font-size: 12px;
+  border-radius: 6px;
+  color: var(--text-muted);
+}
+.teardown-row.stopped .teardown-row-icon { color: var(--green, #0D6B55); }
+.teardown-row.error   { color: var(--text); background: #FFF4F2; }
+.teardown-row.error .teardown-row-icon { color: var(--red, #B3261E); }
+.teardown-row-tool { font-family: var(--font-mono, monospace); }
+.teardown-note { margin-left: auto; font-size: 11px; opacity: 0.8; }
+
+.teardown-retry {
+  margin-left: 8px;
+  padding: 2px 10px;
+  font-size: 11px;
+  font-family: inherit;
+  border-radius: 100px;
+  cursor: pointer;
+  color: #fff;
+  background: var(--red, #B3261E);
+  border: none;
+}
+.teardown-retry:disabled { opacity: 0.5; cursor: default; }
+
+/* 触摸尺寸。桌面上这条芯片是一个次要提示，可以小；手上就不行 —— 而「重试」是整个
+   流程里唯一需要动手的控件，它原来是 42x19px，不到地板的一半。44px 是这份样式表
+   在别处用的同一个地板（.btn-icon / .btn-ghost / .sidebar-chip 都是）。 */
+@media (pointer: coarse) {
+  .teardown-summary { min-height: 44px; padding: 10px 14px; font-size: 13px; }
+  .teardown-caret { font-size: 12px; }
+  .teardown-row { padding: 8px 10px; font-size: 13px; }
+  .teardown-retry { min-height: 44px; padding: 10px 18px; font-size: 13px; }
+}
+
+/* 停止请求在飞的时候：按钮禁用，但要看得出它在做事而不是坏了。 */
+.canvas-main-btn:disabled { cursor: progress; opacity: 0.75; }
+
 /* Idle pulse animation */
 @keyframes btn-pulse {
   0%, 100% { box-shadow: 0 1px 2px rgba(0,0,0,0.08), 0 4px 12px rgba(44,37,32,0.25), inset 0 1px 0 rgba(255,255,255,0.05); }
@@ -1044,6 +1483,13 @@ html, body {
 }
 .canvas-main-btn:not(.running) {
   animation: btn-pulse 3s ease-in-out infinite;
+}
+
+.canvas-main-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+  animation: none;
+  transform: none;
 }
 
 /* Error flash on start failure */
@@ -1214,31 +1660,34 @@ html, body {
   box-shadow: 0 0 0 3px rgba(5,150,105,.18), 0 2px 8px rgba(0,0,0,.15);
 }
 .canvas-port.executor:hover::after { background: #047857; }
-.canvas-port.executor .canvas-port-label {
-  top: auto;
-  bottom: calc(100% + 7px);
-  left: 50%;
-  right: auto;
-  transform: translateX(-50%);
-}
 
-/* Port label — appears inside card on hover, anchored to inner edge */
-.canvas-port-label {
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  font-size: 9px;
+/* Port tooltip — format + topic, shown instantly on hover. Positioned in JS
+   (_showPortTip) as a fixed-position child of <body>, so it is not scaled by the
+   canvas zoom transform and is never clipped by a card. */
+.canvas-port-tip {
+  position: fixed;
+  z-index: 400;
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 340px;
+  padding: 5px 9px;
+  border-radius: 5px;
+  background: rgba(24,28,36,.94);
+  box-shadow: 0 2px 10px rgba(0,0,0,.28);
   font-family: var(--font-mono);
-  color: var(--text-dim);
-  white-space: nowrap;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.15s;
+  font-size: 11px;
+  line-height: 1.4;
   letter-spacing: 0.02em;
+  pointer-events: none;
 }
-.canvas-port-col.left  .canvas-port-label { left:  calc(100% + 7px); }
-.canvas-port-col.right .canvas-port-label { right: calc(100% + 7px); }
-.canvas-port:hover .canvas-port-label { opacity: 1; }
+.canvas-port-tip.visible { display: flex; }
+.canvas-port-tip-fmt { color: #fff; }
+.canvas-port-tip-topic {
+  color: #9aa4b8;
+  overflow-wrap: anywhere;
+}
+.canvas-port-tip.unresolved .canvas-port-tip-topic { font-style: italic; }
 
 /* ── Canvas connectors SVG ─────────────────────────────────────────────── */
 .canvas-connectors-svg {
@@ -1246,14 +1695,12 @@ html, body {
   inset: 0;
   width: 100%;
   height: 100%;
-  /* Chrome skips overflow painting when the SVG viewport collapses to 0x0. */
-  min-width: 1px;
-  min-height: 1px;
   pointer-events: none;
+  /* Cards may sit at negative world coordinates, so connectors are drawn
+     outside the SVG viewport on purpose. */
   overflow: visible;
   z-index: 5;
 }
-.canvas-connectors-svg line { pointer-events: stroke; }
 
 /* Connector lines */
 .connector-line {
@@ -1607,6 +2054,13 @@ html, body {
   cursor: text;
 }
 .canvas-result-pre.error { color: var(--red); }
+/* The box is focusable so Ctrl/Cmd+A can be scoped to it; without a visible
+   focus ring, which key went where would be guesswork. */
+.canvas-result-pre:focus,
+.canvas-result-pre:focus-visible {
+  outline: 2px solid var(--accent, #c8714b);
+  outline-offset: 1px;
+}
 
 /* ── Flow Area (keep for backward compat if referenced) ───────────────── */
 .flow-area {
@@ -1677,57 +2131,132 @@ html, body {
 
 /* ── Activity Strip ───────────────────────────────────────────────────────── */
 .activity-strip {
+  position: relative;
   height: var(--activity-h);
   min-height: 80px;
   max-height: 60vh;
+  max-height: 60dvh;
   flex-shrink: 0;
   border-top: 1px solid var(--border);
   background: var(--bg-card);
   display: flex;
   flex-direction: column;
-  resize: vertical;
   overflow: hidden;
+  /* `viewport-fit=cover` lets the page run under the home indicator, so the
+     last rows of the log would sit beneath it without this. */
+  padding-bottom: env(safe-area-inset-bottom, 0px);
   transition: height .25s ease, min-height .25s ease;
 }
+/* Dragging sets the height every frame; the ease would fight it. */
+.activity-strip.resizing { transition: none; }
 .activity-strip.collapsed {
-  height: 32px !important;
-  min-height: 32px;
-  resize: none;
-}
-.activity-strip.collapsed .activity-log {
-  display: none;
-}
-.activity-collapse-btn {
-  background: none;
-  border: none;
-  color: var(--text-dim);
-  font-size: 10px;
-  cursor: pointer;
-  padding: 2px 6px;
-  border-radius: 3px;
-  transition: transform .25s ease, background .15s;
-}
-.activity-collapse-btn:hover {
-  background: var(--bg-hover);
-}
-.activity-strip.collapsed .activity-collapse-btn {
-  transform: rotate(-90deg);
+  /* The ledge, plus the strip's own 1px top border — everything is border-box,
+     so without it the header overflows the strip by exactly that pixel and
+     `overflow: hidden` shaves the bottom of the reopen button. The header's
+     bottom border is dropped when shut, so there is nothing else to add. The
+     inset holds these pixels above the home indicator rather than behind it. */
+  height: calc(var(--ledge-h) + 1px + env(safe-area-inset-bottom, 0px)) !important;
+  min-height: calc(var(--ledge-h) + 1px + env(safe-area-inset-bottom, 0px));
 }
 
+/* ── The ledge ──────────────────────────────────────────────────────────────
+   One row, one height, whatever the state. It was 45px of header plus a 16px
+   grab band when open against 46px when shut, so the whole row jumped on every
+   toggle — and 46px carrying a 10px label read as mostly empty box.
+   Open:  [ ACTIVITY ............... grip ... ▼ ]
+   Shut:  [ 14:22:07 mcp_call loco(stand) .... ▲ ]
+   Shut, the label names a panel you can no longer see. The latest line is the
+   thing worth knowing at a glance, so the row carries that instead and earns
+   its height. */
 .activity-strip-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 7px 16px;
+  gap: 12px;
+  height: var(--ledge-h);
+  box-sizing: border-box;
+  padding: 0 0 0 16px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+  /* When the bar is shut this row is the only way back, so it has to look like
+     the control it is rather than like a caption. */
+  cursor: pointer;
 }
+.activity-strip.collapsed .activity-strip-header { border-bottom: none; }
+.activity-strip.collapsed .activity-strip-header:hover { background: var(--bg-hover); }
+
 .activity-title {
   font-size: 10px;
   font-weight: 700;
   color: var(--text-dim);
   letter-spacing: 1px;
+  flex: 1;
+  min-width: 0;
 }
+/* Only stands in for the title once there is a line to show; before the first
+   event the label is still the most useful thing in the row. */
+.activity-latest { display: none; }
+.activity-strip.collapsed.has-latest .activity-title { display: none; }
+.activity-strip.collapsed.has-latest .activity-latest {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+          mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+}
+.activity-latest .log-time { color: var(--text-dim); }
+
+/* Native `resize: vertical` responds to the mouse only, so on a tablet the log
+   was stuck at whichever preset height it was in. Pointer events cover mouse,
+   pen and touch through one path.
+   The grip is a zone of the ledge rather than a band above it: stacking it
+   vertically is what made the two states different heights, and overlaying it
+   on the header made a tap ambiguous in a way that cannot be resolved — a tap
+   that fell through to the toggle shrank the strip, and the click Chrome
+   synthesises after touchend was then hit-tested against the *new* layout,
+   landed on the header, and toggled straight back. Side by side, neither
+   problem exists. */
+.activity-resize-handle {
+  position: relative;
+  flex-shrink: 0;
+  width: 88px;
+  align-self: stretch;
+  cursor: ns-resize;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.activity-resize-handle::before,
+.activity-resize-handle::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  width: 26px;
+  height: 1px;
+  transform: translateX(-50%);
+  background: var(--border);
+  transition: background .15s;
+}
+.activity-resize-handle::before { top: calc(50% - 3px); }
+.activity-resize-handle::after  { top: calc(50% + 2px); }
+.activity-resize-handle:hover::before,
+.activity-resize-handle:hover::after,
+.activity-strip.resizing .activity-resize-handle::before,
+.activity-strip.resizing .activity-resize-handle::after { background: var(--text-dim); }
+.activity-strip.collapsed .activity-resize-handle { display: none; }
+
+.activity-strip.collapsed .activity-log { display: none; }
+
+/* 几何与交互见 .ledge-icon-btn —— 两个面板的收起键共用一套。 */
+/* Points where the bar will go: down to shut it, up to bring it back. It used
+   to rotate a quarter turn and read as a right-pointing arrow on a panel that
+   only ever moves vertically. */
+.activity-strip.collapsed .activity-collapse-btn svg { transform: rotate(180deg); }
 
 .activity-log {
   flex: 1;
@@ -1765,6 +2294,12 @@ html, body {
 .log-type.trigger       { background: var(--green-bg);  color: var(--green); }
 .log-type.executor      { background: var(--emerald-bg); color: var(--emerald); }
 .log-type.asr_result    { background: #D1FAF0; color: #0D6B55; }
+/* 旁人说的话 —— 和 asr_result 同色系但更淡：同一类信息（听到的话），不同的
+   地位（没在跟机器人说）。 */
+.log-type.asr_background { background: #E8F7F3; color: #3F8C79; }
+.log-type.project_stop_begin,
+.log-type.project_stop_item,
+.log-type.project_stop_done { background: var(--bg-hover); color: var(--text-muted); }
 .log-type.ping          { color: var(--text-dim); background: transparent; }
 .log-msg   { color: var(--text-muted); word-break: break-all; flex: 1; white-space: pre-wrap; }
 
@@ -1987,7 +2522,8 @@ html, body {
 .svc-row-version-line {
   display: flex;
   align-items: center;
-  gap: 6px;
+  flex-wrap: wrap;          /* 版本太长时「→ 新版本」整块换行，而不是把当前版本挤没 */
+  gap: 2px 6px;
   min-width: 0;
 }
 .svc-row-version {
@@ -1999,6 +2535,14 @@ html, body {
   white-space: nowrap;
   min-width: 0;
 }
+/* 箭头和新版本号必须同进同退，否则换行会把「→」单独留在上一行 */
+.svc-row-update {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+}
 .svc-row-arrow {
   font-size: 12px;
   color: var(--text-dim);
@@ -2009,7 +2553,10 @@ html, body {
   font-family: var(--font-mono);
   color: var(--accent);
   font-weight: 600;
-  flex-shrink: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .svc-row-actions {
@@ -2714,6 +3261,10 @@ html, body {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
+/* 刷新按钮贴着关闭按钮。`.modal-header` 是 `space-between`，三个子元素会被均分 ——
+   刷新就飘到了标题和 × 中间，看着像个装饰。 */
+.modal-header .btn-icon + .btn-icon { margin-left: 4px; }
+.modal-header #bm-refresh, .modal-header #bm-timeline-refresh { margin-left: auto; }
 .modal-title {
   font-size: 15px;
   font-weight: 700;
@@ -3793,19 +4344,54 @@ html, body {
 .monitor-reset-btn {
   font-size: 11px !important;
 }
+/* 只对触摸设备说这句：鼠标上按住卡片就能直接拖，没有需要解释的隐藏手势。 */
+.monitor-drag-hint { display: none; }
+@media (pointer: coarse) {
+  .monitor-drag-hint {
+    display: inline;
+    margin-left: 10px;
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0;
+  }
+}
 
-/* Dashboard grid — explicit cell-based layout (Apple widget style, 5 cols, rows grow) */
+/* Dashboard grid — explicit cell-based layout (Apple widget style, rows grow).
+   The column count is written inline by _applyGridStyle(); the value here is
+   only what applies for the frame before that runs. */
 .monitor-dashboard-grid {
   flex: 1;
   display: grid;
   grid-template-columns: repeat(5, 1fr);
-  grid-auto-rows: 20%;
   gap: 12px;
   padding: 0 24px 24px;
   overflow-y: auto;
   align-content: start;
   position: relative;
 }
+
+/* Row height: absolute px, banded by viewport height — deliberately NOT a
+   percentage.
+   `grid-auto-rows: 20%` resolved against the grid's own content box, which is
+   flex leftovers: viewport minus topbar, header and the activity strip. Three
+   things followed from that. A 620px-tall viewport (1366×768 with browser
+   chrome) got 56px rows — shorter than a card's own header. Dragging the
+   activity log taller shrank every card on the board, which is not what the
+   user was asking for. And the one floor that existed keyed on *viewport*
+   height (`max-height: 600px`, added for landscape phones), so it could not see
+   the activity strip at all and left 601–800px unprotected — 599px tall got
+   160px rows while 601px got 56px.
+   The values track what `20%` produced on a 1080p screen (150px), which is the
+   density the board was tuned at — a card is 2 rows tall by default, so every
+   10px here costs 20px of card and the count visible per screen moves fast.
+   Tall screens get a smaller share than 20% would have given them (175 rather
+   than 222 at 1440p): the point of a taller screen is more cards, not bigger
+   ones.
+   Bands are ordered so the narrower one wins: equal specificity, later rule. */
+.monitor-dashboard-grid { grid-auto-rows: 150px; }
+@media (min-height: 1201px) { .monitor-dashboard-grid { grid-auto-rows: 175px; } }
+@media (max-height: 900px)  { .monitor-dashboard-grid { grid-auto-rows: 140px; } }
+@media (max-height: 700px)  { .monitor-dashboard-grid { grid-auto-rows: 130px; } }
 
 /* Dashboard card */
 .monitor-card {
@@ -3816,8 +4402,28 @@ html, body {
   flex-direction: column;
   overflow: hidden;
   position: relative;
-  transition: border-color 0.2s, box-shadow 0.2s;
+  transition: border-color 0.2s, box-shadow 0.2s, transform 0.15s;
+  cursor: grab;
+  /* The card chrome is a drag handle, so it must not be selectable text.
+     Suppression used to rest entirely on a preventDefault() inside the drag
+     handler, which has two early returns before it and covers nothing outside
+     the header — so an attempt to grab the card anywhere else selected the
+     title instead of moving it. The body opts back in below: log output is
+     worth copying. `touch-action: none` lets a touch drag rearrange the card
+     instead of scrolling the grid away underneath it. */
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
 }
+.monitor-card:active { cursor: grabbing; }
+.monitor-card-body {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: auto;
+}
+/* Interactive bits keep a pointer and their own gestures. */
+.monitor-card-modes,
+.monitor-card-mode-btn { cursor: pointer; touch-action: auto; }
 .monitor-card:hover {
   border-color: var(--accent);
   box-shadow: 0 2px 12px var(--accent-dim);
@@ -3827,6 +4433,18 @@ html, body {
   opacity: 0.6;
   z-index: 10;
   box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+}
+/* 触摸上"按住拿起来了"必须看得见 —— 除了这个变化，用户没有别的方式知道下一次
+   移动是搬卡片而不是滚页面。 */
+.monitor-card.lifted {
+  opacity: 0.92;
+  transform: scale(1.03);
+  border-color: var(--accent);
+  box-shadow: 0 12px 28px rgba(0,0,0,0.18);
+}
+@media (prefers-reduced-motion: reduce) {
+  .monitor-card { transition: border-color 0.2s, box-shadow 0.2s; }
+  .monitor-card.lifted { transform: none; }   /* 边框和阴影仍然变，状态照样看得见 */
 }
 .monitor-card.drag-invalid {
   border-color: var(--red) !important;
@@ -3845,6 +4463,13 @@ html, body {
   z-index: 10;
   border-color: var(--accent);
 }
+/* Landing on a same-sized neighbour trades places rather than being refused,
+   so it needs to read as a valid outcome and not as the red rejection. */
+.monitor-card.drag-swap {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 12px var(--accent-dim) !important;
+}
+.monitor-card.drag-swap::after { content: none !important; }
 
 .monitor-card-header {
   display: flex;
@@ -3854,6 +4479,13 @@ html, body {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   cursor: grab;
+  /* 表头要画在空状态遮罩之上。遮罩是 inset:0 的不透明层，只靠它自己的 49px
+     padding 把文字让开，背景照样盖住整条表头 —— 于是还没来数据的卡片是一块
+     没有标题、没有话题、没有格式标签的空白，光看它认不出是哪一路数据。
+     给表头自己的层级，遮罩多高都盖不住它。 */
+  position: relative;
+  z-index: 1;
+  background: var(--bg-card);
 }
 .monitor-card-header:active { cursor: grabbing; }
 
@@ -3889,6 +4521,13 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* Truncation stays left-to-right. `direction: rtl` is the usual trick for
+     clipping a path's head instead of its tail, and it does move the ellipsis —
+     but a path begins with `/`, a bidi-neutral character, which at the start of
+     an RTL paragraph gets reordered to the far end: `/decision_core` rendered as
+     `decision_core/`. Shortening the string in JS instead (_displayPath keeps
+     the last two segments) gets the same disambiguation with no reordering, and
+     the title attribute still carries the full path. */
 }
 .monitor-card-format {
   font-size: 9px;
@@ -3942,6 +4581,40 @@ html, body {
   color: var(--text);
 }
 
+/* Shown until the first frame arrives on this topic. Sits over the body rather
+   than inside it so no renderer has to know about it. */
+.monitor-card-empty {
+  position: absolute;
+  /* 表头高度写成 padding 而不是 inset 的偏移，再加 overflow:hidden：卡片矮到放不下
+     这两行时，文字被裁在卡片里，而不是溢出到卡片外面去。 */
+  inset: 0;
+  padding: 49px 16px 8px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  text-align: center;
+  pointer-events: none;
+  /* Opaque, not a translucent overlay: the image and video renderers paint a
+     black canvas before their first frame, and dim grey text on that was barely
+     legible. Nothing is being hidden — this is only up while the card has no
+     data, and `.has-data` removes it on the first real frame. */
+  background: var(--bg-card);
+  z-index: 0;
+}
+.monitor-card.has-data .monitor-card-empty { display: none; }
+.monitor-card-empty-title {
+  font-size: 12px;
+  color: var(--text-muted, var(--text-dim));
+}
+.monitor-card-empty-hint {
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.75;
+}
+
 /* Resize handle */
 .monitor-card-resize {
   position: absolute;
@@ -3965,16 +4638,19 @@ html, body {
 .monitor-card:hover .monitor-card-resize { opacity: 1; }
 
 /* Grid overlay (visual guides during drag/resize) */
+/* Rows and height are set inline from the same measurement the drag snaps to —
+   see _showGridOverlay. `inset: 0` would pin the guides to the visible box while
+   the cards they describe live in the scrolled content, so only `top` is fixed. */
 .monitor-grid-overlay {
   position: absolute;
-  inset: 0;
+  top: 0;
+  left: 0;
+  right: 0;
   display: grid;
   gap: 12px;
   padding: 0;
   pointer-events: none;
   z-index: 1;
-  grid-template-columns: inherit;
-  grid-auto-rows: 20%;
 }
 .monitor-grid-cell {
   border: 1px dashed var(--border);
@@ -4748,6 +5424,8 @@ html, body {
   height: 75vh;
   display: flex;
   flex-direction: column;
+  /* 手机上 .history-toolbar 绝对定位到底部，锚点是这里。 */
+  position: relative;
 }
 
 .history-modal .modal-header {
@@ -4761,6 +5439,20 @@ html, body {
   align-items: center;
   gap: 8px;
 }
+.history-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* 手机上工具栏在底部、✕ 在顶部，「清空全部」放最后没问题。桌面端两者同一行相邻，
+   把它挪回中间，别让「清空全部」紧挨着关闭键。 */
+@media (min-width: 769px) {
+  .history-toolbar .history-clear { order: 1; }
+  .history-toolbar #history-delete-selected { order: 2; }
+}
+/* 返回键和详情标题只属于手机上的两级导航，桌面端两个 pane 并排，不需要它们。 */
+.history-back,
+.history-detail-title { display: none; }
 
 /* ── Tabs ── */
 .history-tabs { display: flex; gap: 0; }
@@ -4792,6 +5484,8 @@ html, body {
 .task-badge.paused { background: rgba(234,179,8,0.15); color: #eab308; }
 .task-badge.pending { background: rgba(107,114,128,0.15); color: #6b7280; }
 .task-meta { font-size: 0.75rem; color: var(--text-dim); margin-top: 6px; line-height: 1.6; }
+.task-meta-foot { display: flex; gap: 8px; }
+.task-id { margin-left: auto; font-family: 'JetBrains Mono', monospace; }
 .task-actions { display: flex; gap: 6px; margin-top: 10px; }
 .task-actions button {
   font-size: 0.72rem; padding: 4px 12px;
@@ -4877,6 +5571,42 @@ html, body {
   color: var(--text-dim);
   margin-top: 2px;
 }
+.history-session-meta span:first-child {
+  font-family: 'JetBrains Mono', monospace;
+}
+.history-session-agent {
+  font-family: 'JetBrains Mono', monospace;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 分区：主代理 / 子代理 / 后台子代理。谁发起的这段对话，是读它之前要先知道的事，
+   所以分区标题常驻在滚动顶部，条目左侧留一条同色的窄边区分来源。 */
+.history-group-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 14px 5px;
+  background: var(--bg-input);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.history-group-count {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 400;
+  color: var(--text-dim);
+}
+
+.history-session-item { border-left: 3px solid transparent; }
+.history-session-item.kind-main        { border-left-color: var(--accent); }
+.history-session-item.kind-subagent    { border-left-color: var(--blue); }
+.history-session-item.kind-bg_subagent { border-left-color: var(--border-med); }
 
 /* ── Chat Content (right pane) ── */
 
@@ -4892,8 +5622,12 @@ html, body {
   align-items: center;
   justify-content: center;
   height: 100%;
+  padding: 24px;
   color: var(--text-dim);
   font-size: 0.9rem;
+  line-height: 1.6;
+  text-align: center;
+  text-wrap: balance;
 }
 
 .history-messages {
@@ -4975,7 +5709,14 @@ html, body {
   margin: 12px 0;
   padding-top: 4px;
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+.history-turn-time {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
 }
 .history-usage {
   font-size: 0.7rem;
@@ -5289,6 +6030,52 @@ html, body {
   align-items: baseline;
   gap: 8px;
   padding: 3px 0;
+}
+.network-iface-uplink {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  /* Tinted, because "which interface is actually carrying traffic" is the one
+     row on this card that people scan for when nothing can reach the machine. */
+  background: color-mix(in srgb, var(--warn, #c98a2b) 12%, transparent);
+}
+.network-iface-uplink.is-active {
+  background: color-mix(in srgb, var(--ok, #3fa45b) 12%, transparent);
+}
+.network-iface-uplink .network-iface-label {
+  min-width: 0;
+  text-transform: none;
+  letter-spacing: normal;
+}
+.network-prefer-uplink {
+  margin-left: auto;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated, transparent);
+  color: var(--text);
+  cursor: pointer;
+}
+.network-prefer-uplink:hover:not(:disabled) { border-color: var(--accent); }
+.network-prefer-uplink:disabled { opacity: 0.6; cursor: default; }
+
+.network-iface-policy-route {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 6px;
+  padding: 6px 10px;
+}
+.network-iface-policy-route .network-iface-label {
+  min-width: 0;
+  text-transform: none;
+  letter-spacing: normal;
 }
 .network-iface-label {
   font-size: 0.7rem;
@@ -5664,6 +6451,24 @@ html, body {
   font-size: 18px;
   font-weight: 300;
 }
+/* Leading icon on each settings / 我的 row.
+   The row is a space-between flex pair (label, arrow); adding a third child
+   would spread all three evenly, so the label takes the free space instead and
+   the icon and arrow stay hard against the edges. */
+.settings-item-icon {
+  flex: 0 0 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 12px;
+  color: var(--text-muted);
+}
+.settings-item-icon svg { width: 18px; height: 18px; }
+.settings-item-label,
+.settings-item-text { flex: 1; min-width: 0; text-align: left; }
+/* The danger row's label is already red; a neutral icon beside it reads as a
+   different kind of item, so it follows the label. */
+.settings-item--danger .settings-item-icon { color: #c0392b; }
 
 /* ── Mobile update banner (in settings panel) ── */
 .mobile-update-banner {
@@ -5788,6 +6593,24 @@ html, body {
   .sidebar.mobile-open {
     transform: translateX(0);
   }
+  /* The drawer opens and closes with the fab; a second, differently-shaped
+     collapse control in the same panel would just be two answers to one
+     question. The rail width must be overridden too — `.sidebar.collapsed`
+     outranks `.sidebar`, media query or not, so a stale flag from a desktop
+     session would otherwise leave the drawer 40px wide. */
+  .sidebar-collapse-btn { display: none; }
+  .sidebar.collapsed { width: 85vw; }
+  .sidebar.collapsed .sidebar-filter { padding: 0 0 0 8px; justify-content: flex-start; }
+  .sidebar.collapsed #sidebar-search,
+  .sidebar.collapsed .sidebar-section-name,
+  .sidebar.collapsed .sidebar-section-count,
+  .sidebar.collapsed .sidebar-tool-list { display: revert; }
+  .sidebar.collapsed .sidebar-scroll { padding: 8px; align-items: stretch; }
+  .sidebar.collapsed .sidebar-section-header { padding: 4px 4px 2px; justify-content: flex-start; }
+  /* 收起键在这里是隐藏的，这行就只剩搜索框 —— 高度交还给它，按触摸尺寸来。
+     16px 是硬要求：低于 16px 时 iOS 会在聚焦输入框时缩放整个页面。 */
+  .sidebar-filter { height: auto; padding: 8px; }
+  #sidebar-search { height: 40px; font-size: 16px; }
 
   /* ── Detail panel → right drawer ── */
   .detail-panel {
@@ -5837,6 +6660,20 @@ html, body {
     border-radius: var(--radius-sm);
     box-shadow: var(--shadow-sm);
   }
+  /* 工具条在这个断点是 `left:60px; right:60px` 且会换行，所以芯片的下拉不能按自己
+     的左边缘定位 —— 它会跟着芯片换到哪一行、偏到哪一列。拉满容器宽度之后，它在
+     任何换行结果下都不会越过屏幕边缘。 */
+  .teardown-chip { margin-left: 0; width: 100%; }
+  .teardown-summary { width: 100%; justify-content: center; }
+  .teardown-detail {
+    left: 0;
+    right: 0;
+    min-width: 0;
+    max-height: 50vh;
+  }
+  .teardown-row { flex-wrap: wrap; }
+  .teardown-note { margin-left: 26px; width: 100%; }
+  .teardown-retry { margin-left: auto; }
   .canvas-card-body { padding: 8px 10px; }
   .canvas-card-footer { padding: 6px 10px; }
   .canvas-controls {
@@ -5844,6 +6681,28 @@ html, body {
     bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 10px);
     right: 12px;
     z-index: 50;
+  }
+
+  /* Bottom-left, opposite the zoom controls — not top-left, which is the
+     sidebar fab's slot. Pinned to exactly 12,12 with `z-index: 100`, it covered
+     the 40x40 fab completely and outranked it, so on a phone there was no way
+     to open the tool list at all; it also grazed the 开启智能控制 button by 5px.
+     The top band is navigate | primary action | navigate and already measures
+     343px of the 390 available, so there is no room for a fourth item — and
+     this is not one. It reports who holds the editor, which belongs with the
+     rest of the canvas state along the bottom.
+     z-index joins the canvas-chrome tier (controls 50, top control 57) below
+     the fabs at 58, so chrome cannot outrank navigation again. */
+  .canvas-editor-bar {
+    position: fixed;
+    top: auto;
+    right: auto;
+    bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 10px);
+    left: 12px;
+    padding: 4px 8px;
+    font-size: 11px;
+    gap: 5px;
+    z-index: 57;
   }
 
   /* ── Activity strip → right drawer ── */
@@ -5862,13 +6721,16 @@ html, body {
     border-top: none;
     border-left: 1px solid var(--border);
     box-shadow: var(--shadow-lg);
-    resize: none;
     transform: translateX(100%);
     transition: transform 0.3s ease;
+    /* Drawer mode stops above the tabbar, which carries the inset itself. */
+    padding-bottom: 0;
   }
+  /* Full-height drawer — there is no height to drag. */
+  .activity-resize-handle { display: none; }
   .activity-strip.collapsed { height: auto !important; min-height: 0; }
   .activity-strip.collapsed .activity-log { display: block; }
-  .activity-strip.collapsed .activity-collapse-btn { transform: none; }
+  .activity-strip.collapsed .activity-collapse-btn svg { transform: none; }
   .activity-strip.mobile-log-open {
     transform: translateX(0);
   }
@@ -5878,10 +6740,12 @@ html, body {
     overflow-y: auto;
   }
 
-  /* ── Monitor dashboard grid ── */
+  /* ── Monitor dashboard grid ──
+     Row height comes from the viewport-height bands near the base rule, not
+     from this width breakpoint: a phone held landscape is short, not tall, and
+     keying rows off width gave it the same 180px as a portrait tablet. */
   .monitor-dashboard-grid {
     grid-template-columns: repeat(2, 1fr);
-    grid-auto-rows: 180px;
     padding: 0 12px 12px;
     gap: 8px;
   }
@@ -5955,10 +6819,130 @@ html, body {
     box-shadow: none;
   }
 
-  /* History modal: stacked layout */
-  .history-body { flex-direction: column; }
-  .history-list { width: 100%; min-width: unset; max-height: 35vh; border-right: none; border-bottom: 1px solid var(--border); }
-  .history-chat { flex: 1; }
+  /* ── 会话记录 / 任务：手机上改成「推进式」两级导航 ──────────────────────
+     之前这里写的是 `.history-body { flex-direction: column }`，但真正并排的那层是
+     `.history-sessions-pane` —— 规则落空，手机上得到的是 318px 列表 + 40px 对话，
+     对话窄成一条竖缝。改布局之前先把选择器修对。
+
+     不改成上下 35/65 分屏的原因：两半都太矮，列表只剩三行、对话只剩两条消息，
+     而手机上也没有「一边看列表一边看对话」的场景 —— 先选一条，再读它。所以
+     列表和对话各占满一屏，点开是推进，返回是回退，跟手机系统自己的做法一致。 */
+  .history-modal .modal-body { padding: 0; }
+  .history-sessions-pane { flex-direction: column; min-height: 0; }
+  .history-list {
+    width: 100%;
+    min-width: 0;
+    flex: 1;
+    max-height: none;
+    border-right: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  .history-chat { display: none; }
+  #history-overlay.showing-detail .history-list { display: none; }
+  #history-overlay.showing-detail .history-chat {
+    display: block;
+    flex: 1;
+    min-height: 0;
+    padding: 12px 14px calc(12px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* 标题栏在详情里换成「返回 + 正在读的是哪一条」，tabs 让位 */
+  #history-overlay.showing-detail .history-tabs,
+  #history-overlay.showing-detail .history-toolbar { display: none; }
+  #history-overlay.showing-detail .history-back { display: inline-flex; }
+  #history-overlay.showing-detail .history-detail-title { display: block; }
+  .history-back {
+    align-items: center;
+    gap: 4px;
+    min-height: 44px;
+    padding: 0 10px 0 0;
+    border: none;
+    background: none;
+    color: var(--accent);
+    font-size: 15px;
+    font-family: inherit;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  /* 用 SVG 画折角而不是 `‹` 字形：字形的高度和基线由字体自己决定，放大到能看清的
+     尺寸时就和「返回」两个字对不齐了。SVG 的盒子高度是自己说了算的。 */
+  .history-back svg {
+    width: 17px;
+    height: 17px;
+    flex-shrink: 0;
+  }
+  .history-detail-title {
+    flex: 1;
+    min-width: 0;
+    font-size: 14px;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* 列表：整宽、更大的行、可点的复选框 */
+  .history-modal .modal-header { padding: 8px 12px; }
+  .history-tab { padding: 10px 12px; font-size: 15px; min-height: 44px; }
+  .history-group-head { padding: 7px 14px 6px; font-size: 13px; }
+  .history-session-item { padding: 12px 14px; gap: 4px; }
+  .history-session-check {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    min-height: 44px;
+    margin: -12px 0 -12px -6px;
+  }
+  .history-session-check input { width: 20px; height: 20px; }
+  .history-session-info { padding: 2px 0; }
+  /* 两行封顶：一条 trigger 可以有 100 字，任它换行会一条占掉半屏，列表就没法扫了。 */
+  .history-session-summary {
+    font-size: 15px;
+    line-height: 1.35;
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+  }
+  .history-session-meta { font-size: 12px; margin-top: 4px; }
+
+  /* 工具栏挪到拇指够得着的底部；清空全部单独一格，别和刷新长得一样 */
+  .history-toolbar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 5;
+    display: flex;
+    gap: 8px;
+    padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0px));
+    border-top: 1px solid var(--border);
+    background: var(--bg);
+  }
+  .history-toolbar button { flex: 1; min-height: 44px; font-size: 14px; }
+  .history-toolbar .history-clear { color: var(--red); }
+  .history-list,
+  .history-tasks-pane { padding-bottom: 64px; }
+
+  /* 对话：气泡放宽，工具卡片整宽（80% 会把 JSON 挤成一列） */
+  #history-overlay .history-msg { max-width: 92%; font-size: 14px; }
+  #history-overlay .history-tool-card { max-width: 100%; }
+  #history-overlay .history-tool-body { font-size: 12px; max-height: 240px; }
+  #history-overlay .history-usage,
+  #history-overlay .history-turn-time { font-size: 11px; }
+  #history-overlay .history-turn-divider { flex-wrap: wrap; gap: 2px 10px; }
+
+  /* 任务卡片：动作各占一行宽度，输入框 16px（低于 16px 时 iOS 会缩放页面） */
+  .history-tasks-pane { padding: 10px 12px 64px; }
+  .task-card { padding: 14px; }
+  .task-goal { font-size: 15px; line-height: 1.35; }
+  .task-meta { font-size: 12px; }
+  .task-actions { gap: 8px; }
+  .task-actions button { flex: 1; min-height: 44px; font-size: 14px; }
+  .task-input { font-size: 16px; padding: 10px; min-height: 44px; }
+  .task-edit-form label { font-size: 12px; margin-top: 10px; }
 
   /* Deploy confirm: responsive versions */
   .deploy-confirm-item-versions { flex-wrap: wrap; }
@@ -6118,6 +7102,55 @@ html, body {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+   TOUCH INPUT (any width) — finger-sized targets and gesture ownership
+══════════════════════════════════════════════════════════════════════════ */
+/* These used to live inside `max-width: 768px` alongside the layout rules, which
+   conflated two different questions: *how wide* is the screen, and *what is
+   pointing at it*. A tablet answers "wide" and "finger", so it got the desktop
+   layout — correct — but with desktop hit targets, which is not: the activity
+   bar's collapse arrow measured 22x16px, and canvas ports 36px.
+   Layout stays keyed on width (tabbar, drawers, full-page panels); only the
+   things that depend on the pointer live here. Phones match both blocks and the
+   values agree, so nothing changes there. */
+@media (pointer: coarse) {
+  .btn-icon { min-width: 44px; min-height: 44px; }
+  .btn-ghost { min-height: 44px; padding: 10px 14px; }
+  .sidebar-chip { padding: 10px 12px; min-height: 44px; }
+  .deploy-tab { padding: 10px 14px; font-size: 14px; min-height: 44px; }
+
+  /* 40px, not 44px. The whole ledge is the toggle — on a tablet that is an
+     820x40 target, and the 44px floor is there for isolated controls, not for
+     a full-width row. The arrow button fills the row height, so the discrete
+     control keeps a real target too. 46px was measurably out of proportion:
+     a 10px label and a 10px glyph in a box more than four times their height. */
+  :root { --ledge-h: 40px; --sidebar-rail-w: 40px; }
+  /* Wider grip and a permanent grip mark — there is no hover to reveal it on. */
+  .activity-resize-handle { width: 104px; }
+  .activity-resize-handle::before,
+  .activity-resize-handle::after { background: var(--text-dim); }
+
+  /* Transparent hit-area expansion, on top of the 36px `::before`. */
+  .canvas-port::after {
+    content: '';
+    position: absolute;
+    width: 44px;
+    height: 44px;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: transparent !important;
+    border-radius: 50%;
+    inset: auto;
+  }
+
+  /* Pan and card-drag are driven by pointer events with setPointerCapture. With
+     the default `touch-action` the browser can claim the same gesture and fire
+     pointercancel mid-drag, and it adds the double-tap-zoom delay on top. */
+  .canvas-area { touch-action: none; }
+  .canvas-card-header { touch-action: none; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
    BREAKPOINT: ≤480px (Small Phone)
 ══════════════════════════════════════════════════════════════════════════ */
 @media (max-width: 480px) {
@@ -6129,7 +7162,6 @@ html, body {
 
   .monitor-dashboard-grid {
     grid-template-columns: 1fr;
-    grid-auto-rows: 200px;
   }
 
   .sidebar { max-width: 85vw; }
@@ -6137,17 +7169,8 @@ html, body {
   .canvas-controls { bottom: 66px; right: 12px; }
   .canvas-top-control { top: 12px; }
 
-  .canvas-editor-bar {
-    position: fixed;
-    top: 12px;
-    left: 12px;
-    bottom: auto;
-    right: auto;
-    padding: 4px 8px;
-    font-size: 11px;
-    gap: 5px;
-    z-index: 100;
-  }
+  /* Stays paired with .canvas-controls, which drops the inset at this size. */
+  .canvas-editor-bar { bottom: 66px; }
   #canvas-toast {
     bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 16px) !important;
   }
@@ -6156,7 +7179,7 @@ html, body {
 /* ── Channel Settings Modal ─────────────────────────────────────────────────── */
 
 .channel-modal {
-  width: 520px;
+  width: 640px;
 }
 @media (max-width: 768px) {
   .channel-modal {
@@ -6176,6 +7199,7 @@ html, body {
 .channel-toolbar {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
   margin-bottom: 12px;
 }
 .channel-list {
@@ -6247,6 +7271,12 @@ html, body {
   padding: 16px;
   margin-bottom: 12px;
 }
+/* Appended straight after .channel-item-actions with insertAdjacentHTML —
+   .channel-add-form's own margin is margin-bottom only, so without this the
+   button row above sits flush against this box's border. */
+.channel-trusted-form {
+  margin-top: 12px;
+}
 .channel-form-row {
   margin-bottom: 10px;
 }
@@ -6259,6 +7289,7 @@ html, body {
 }
 .channel-form-row input[type="text"],
 .channel-form-row input[type="password"],
+.channel-form-row textarea,
 .channel-form-row select {
   width: 100%;
   padding: 6px 10px;
@@ -6273,6 +7304,217 @@ html, body {
   gap: 8px;
   margin-top: 12px;
 }
+/* Trusted Bots — one card per Bot instead of a table row, since a group
+   chat_id + open_id pair is long enough that a 4-column grid forces every
+   field below a usable width in a 640px modal. Name/ID share a row (short,
+   human-facing); chat_id/open_id share the row below (long, monospace,
+   looked up from Feishu rather than typed from memory). */
+.trusted-bot-card {
+  position: relative;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 40px 10px 12px;
+  margin-bottom: 8px;
+}
+.trusted-bot-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 10px;
+}
+.tb-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.tb-field span {
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.tb-field input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-family: var(--font-ui);
+}
+.tb-field input.mono {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+.trusted-bot-remove {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.trusted-bot-remove:hover {
+  background: var(--red-bg);
+  color: var(--red);
+}
+
+/* ── Users panel ──────────────────────────────────────────────────────────── */
+
+.channel-users-panel {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.channel-users-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.channel-users-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+.channel-users-hint {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+.channel-users-list {
+  margin-bottom: 4px;
+}
+/* Flex, not a grid: identity is the only column that should truncate —
+   role/platform/dot stay fixed-width and always fully readable, since role
+   is the one field this whole panel exists to let someone scan at a glance. */
+.user-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 4px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.82rem;
+}
+.user-role-dot {
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+.user-role-dot[data-role="owner"]    { background: var(--accent); }
+.user-role-dot[data-role="operator"] { background: var(--green); }
+.user-role-dot[data-role="viewer"]   { background: var(--text-dim); }
+.user-role-dot[data-role="blocked"]  { background: var(--red); }
+
+/* Paired-peer status. Deliberately a *different* class from .user-role-dot: that
+   one encodes the role and sits beside a dropdown that already names it, so it
+   was being read as a status light — an operator peer looked green whether it was
+   running or switched off. Three states, because "reachable" and "willing to take
+   work" are separate facts: 智能控制 off still answers tool calls and shares
+   state, but /delegate returns 503. */
+.peer-status-dot {
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+.peer-status-dot[data-state="online"]  { background: var(--green); }
+.peer-status-dot[data-state="idle"]    { background: var(--yellow); }
+.peer-status-dot[data-state="offline"] { background: var(--text-dim); }
+.user-platform-badge {
+  flex: 0 0 auto;
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  background: var(--bg-input);
+  border-radius: var(--radius-xs);
+  padding: 2px 6px;
+}
+.user-identity {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  overflow: hidden;
+}
+.user-name {
+  color: var(--text);
+  white-space: nowrap;
+}
+.user-name.mono {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.user-id {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-role-select {
+  flex: 0 0 100px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 0.78rem;
+  font-family: var(--font-ui);
+}
+.user-remove {
+  flex: 0 0 22px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.user-remove:hover {
+  background: var(--red-bg);
+  color: var(--red);
+}
+/* Quiet inline row, not the accent-bordered .channel-add-form treatment —
+   that border means "you're mid-edit" elsewhere in this modal (Add Channel,
+   Trusted Bots); this row is always present, so wrapping it the same way
+   would falsely read as an open edit state. */
+.channel-users-add {
+  display: flex;
+  gap: 8px;
+  padding-top: 10px;
+}
+.channel-users-add select,
+.channel-users-add input {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 0.8rem;
+  font-family: var(--font-ui);
+}
+.channel-users-add select:first-child { flex: 0 0 92px; }
+#channel-user-form-id   { flex: 1 1 120px; min-width: 0; }
+#channel-user-form-name { flex: 1 1 100px; min-width: 0; }
+.channel-users-add select:last-of-type { flex: 0 0 88px; }
 
 /* ── Login Screen ───────────────────────────────────────────────────────────── */
 
@@ -7289,6 +8531,29 @@ html, body {
   font-size: 11px;
   cursor: pointer;
 }
+.account-token-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.account-token-value {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-token-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.account-token-reset { color: var(--red); }
 
 .account-form {
   display: flex;
@@ -7397,3 +8662,1001 @@ html, body {
 
 /* 「我的」tab 上的圆点表示"已登录"，不是未读/告警，所以不用 .tabbar-badge 的红色 */
 #account-tab-badge { background: var(--accent); }
+
+/* ── 手机接入（扫码把控制台交到手上）──────────────────────────────────────
+   卡片做成一张可撕的票根：左边是二维码，中间一条打孔线，右边是地址。
+   那条打孔线不是装饰 —— 它说的正是这个功能在做的事：左半边跟着人走。
+   除此之外一概从简，没有渐变、没有额外投影、没有 hover 动效。 */
+
+.handoff-card {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+/* 票根的左半：二维码所在的白底方块。白底是给扫码器的，不是审美选择 ——
+   暖米色背景会压低对比度，边缘的机器扫起来会吃力。 */
+.handoff-stub {
+  position: relative;
+  flex: 0 0 auto;
+  padding: 14px;
+  display: flex;
+  align-items: center;
+}
+
+/* 撕口：一条虚线就够了。先前还在两端各开了一个半圆缺口，位置要靠
+   百分比去凑，换个尺寸就错位 —— 而那条虚线本身已经把意思说完了。 */
+.handoff-stub::after {
+  content: '';
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  right: 0;
+  border-right: 1px dashed var(--border-med);
+}
+
+/* 顶上留 4px 给倒计时条自己一条带 —— 压在码面上会吃掉静区，而静区不够
+   扫码器就找不到定位图案。码本身的静区由 qrSvg 的 margin 给足 4 格。 */
+.handoff-qr {
+  position: relative;
+  box-sizing: border-box;
+  width: 152px;
+  height: 156px;
+  padding-top: 4px;
+  border-radius: var(--radius-sm);
+  background: #fff;
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.handoff-qr svg { display: block; width: 100%; height: 100%; }
+
+/* 盖住时把二维码糊掉而不是移除：保持同样的尺寸，点开不会让整页跳一下 */
+.handoff-qr.is-covered svg { filter: blur(7px); opacity: .5; }
+
+.handoff-reveal {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: none;
+  /* 盖板要压得住底下那层糊掉的二维码，不然按钮文字读不清 */
+  background: rgba(253, 250, 245, .90);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.handoff-reveal svg { width: 20px; height: 20px; color: var(--accent); }
+.handoff-reveal:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* 自动收起的倒计时。唯一一处非交互触发的动效，它在回答一个用户会问的问题：
+   还剩多久。 */
+.handoff-countdown {
+  position: absolute;
+  left: 0;
+  /* 压在方块顶边而不是底边：底边挨着卡片描边，2px 的线在那儿读起来
+     就是描边的一部分，等于没画 */
+  top: 0;
+  height: 3px;
+  width: 100%;
+  background: var(--accent);
+  transform-origin: left center;
+  animation: handoff-countdown linear forwards;
+}
+@keyframes handoff-countdown {
+  from { transform: scaleX(1); }
+  to   { transform: scaleX(0); }
+}
+
+.handoff-qr-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 0 12px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* 票根的右半 */
+.handoff-detail {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+  padding: 14px 16px 14px 18px;
+}
+.handoff-url {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.handoff-where {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.handoff-addrs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+.handoff-addr {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: none;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+}
+.handoff-addr.is-active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.handoff-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 4px;
+}
+.handoff-hide { color: var(--text-muted); }
+
+.handoff-card-empty { padding: 16px; }
+.handoff-empty-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+@media (max-width: 768px) {
+  /* 手机扫不了自己的屏幕，所以这一页在手机上换个主次：先给地址和「复制链接」，
+     二维码转到下面，用来把控制台递给旁边的另一台手机。 */
+  .handoff-card { flex-direction: column-reverse; }
+  .handoff-detail { padding: 16px 16px 14px; }
+  .handoff-stub {
+    padding: 14px 16px 16px;
+    justify-content: center;
+  }
+  /* 竖排之后打孔线要转 90 度 */
+  .handoff-stub::after {
+    top: 0;
+    bottom: auto;
+    left: 12px;
+    right: 12px;
+    border-right: none;
+    border-top: 1px dashed var(--border-med);
+  }
+  /* 高度要比宽度多出顶上那条倒计时带，否则它又压回静区里去了 */
+  .handoff-qr { width: 208px; height: 212px; }
+  .handoff-url { font-size: 15px; }
+  .handoff-where { font-size: 12px; }
+}
+
+/* 触摸目标按指针精度分，不按宽度 —— 平板匹配这一块但不匹配上面那个 768px
+   的布局块，而手指在平板上和在手机上一样粗。 */
+@media (pointer: coarse) {
+  .handoff-addr { padding: 8px 14px; font-size: 12px; }
+  .handoff-actions { gap: 22px; min-height: 44px; }
+  .handoff-actions .account-copy-btn,
+  .handoff-actions .account-link {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
+  /* 盖板本身就是按钮，整块 152x156 都能点，不必再加下限 */
+  .handoff-reveal { font-size: 13px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* 时间到了照样收起 —— 计时器在 JS 里；这里只是不再扫那条线 */
+  .handoff-countdown { animation: none; }
+}
+
+/* ── Peer collaboration panel ───────────────────────────────────────────────
+   Reuses .user-row / .user-role-select / .user-role-dot from the channel user
+   list; only peer-specific pieces live here. */
+
+.peer-section { margin-bottom: 22px; }
+.peer-section--alert {
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 12px;
+  background: rgba(255, 255, 255, .03);
+}
+
+.peer-settings-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 10px 0;
+  flex-wrap: wrap;
+}
+.peer-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+/* Matches .channel-form-row inputs. Only flex/padding/radius were set before, so
+   border, background, colour and font fell back to the browser default — a heavy
+   dark box that read as a different design language from every other field. */
+.peer-input {
+  flex: 1;
+  min-width: 180px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input, var(--bg-body));
+  color: var(--text);
+  font-size: 0.85rem;
+}
+.peer-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.peer-input:disabled { opacity: .55; cursor: not-allowed; }
+.peer-empty-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  opacity: .8;
+  text-align: left;
+}
+.peer-empty-hint code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  background: var(--bg-input, var(--bg-body));
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+.peer-identity { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.peer-identity-label { font-size: 12px; opacity: .7; }
+.peer-fingerprint, .peer-fingerprint-sm {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  opacity: .85;
+  word-break: break-all;
+}
+.peer-fingerprint-sm { font-size: 11px; opacity: .6; }
+
+.peer-providers { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+.peer-prov { font-size: 11.5px; padding: 2px 8px; border-radius: 10px; }
+.peer-prov--ok  { background: rgba(80, 200, 120, .15); }
+.peer-prov--err { background: rgba(220, 90, 70, .15); }
+
+.peer-pending {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 0;
+  flex-wrap: wrap;
+}
+.peer-pending-who { display: flex; flex-direction: column; gap: 2px; min-width: 120px; }
+.peer-pending-actions { display: flex; gap: 8px; margin-left: auto; }
+
+/* The short code exists to be compared by eye across two screens. Rendering it
+   as ordinary text would make that comparison unreliable, which is the whole
+   security property. Large, monospaced, widely tracked. */
+.peer-sas {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: .22em;
+  padding: 4px 12px;
+}
+
+@media (max-width: 640px) {
+  .peer-pending-actions { margin-left: 0; width: 100%; }
+  .peer-sas { font-size: 26px; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   DEPLOY PROGRESS MODAL
+   ──────────────────────────────────────────────────────────────────────────
+   These rules used to live inside deploy-progress.js as a hardcoded dark
+   palette (#1e1e1e card, #0a0a0a log, #4caf50 bar) injected at runtime — the
+   only component in the dashboard that did not use the tokens above, so it
+   rendered as a black terminal window in the middle of a warm parchment UI.
+   Keep it here: a colour literal in this block is a bug, not a shortcut.
+══════════════════════════════════════════════════════════════════════════ */
+.deploy-progress-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.6);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+}
+/* 卡片本身不滚动：它是一列（标题固定 + 主体自适应），超出的部分由主体里的日志区
+   自己滚。之前卡片 overflow:auto，日志一多就在卡片最右边贴一条通栏滚动条，和里面
+   日志区自己的那条并排出现。 */
+.deploy-progress-content {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  padding: 18px 22px 20px;
+  min-width: 500px;
+  max-width: 700px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--font-ui);
+}
+.deploy-progress-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;          /* 没有它，flex 子项不肯收缩到内容高度以下 */
+  overflow: hidden;
+}
+.deploy-progress-header,
+.deploy-progress-checks,
+.deploy-progress-main { flex-shrink: 0; }
+.deploy-progress-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 18px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.deploy-progress-header h3 {
+  margin: 0;
+  flex: 1;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 24px;
+  letter-spacing: -.01em;
+}
+.deploy-progress-header-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.deploy-progress-minimize,
+.deploy-progress-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 20px;
+  line-height: 24px;
+  cursor: pointer;
+  padding: 0 4px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.deploy-progress-minimize:hover,
+.deploy-progress-close:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+  border-radius: var(--radius-xs);
+}
+.deploy-progress-close { font-size: 24px; }
+
+.deploy-progress-checks { margin-bottom: 15px; }
+.deploy-progress-check {
+  padding: 8px;
+  margin: 4px 0;
+  border-radius: var(--radius-xs);
+  font-size: 13px;
+}
+.deploy-progress-check.pass    { background: var(--green-bg);  color: var(--green); }
+.deploy-progress-check.warning { background: var(--yellow-bg); color: var(--yellow); }
+.deploy-progress-check.fail    { background: var(--red-bg);    color: var(--red); }
+
+.deploy-progress-stage {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+  margin-bottom: 10px;
+}
+.deploy-progress-stage:empty { display: none; }
+.deploy-progress-stage.success { color: var(--green); }
+.deploy-progress-stage.error   { color: var(--red); }
+
+.deploy-progress-bar {
+  height: 10px;
+  background: var(--bg-input);
+  border-radius: 5px;
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+.deploy-progress-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width .3s ease;
+  width: 0%;
+  min-width: 2px;
+}
+.deploy-progress-details {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 15px;
+}
+.deploy-progress-log {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+  /* 吃掉卡片剩下的高度：日志少时卡片就矮，日志多时在这里面滚，不会把滚动条挤到
+     卡片边缘。min-height 保证挤到 80vh 时日志区还剩几行可读。 */
+  flex: 1;
+  min-height: 96px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.deploy-progress-log-entry {
+  margin: 2px 0;
+  color: var(--text-muted);
+}
+.deploy-progress-log-entry.success { color: var(--green); }
+.deploy-progress-log-entry.error   { color: var(--red); }
+
+/* Minimized indicator stack — one indicator per active deployment, so several
+   concurrent deploys don't render on top of each other */
+.deploy-progress-minimized-stack {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 12px;
+  z-index: 9999;
+}
+.deploy-progress-minimized {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  padding: 12px 16px;
+  min-width: 280px;
+  cursor: pointer;
+  transition: transform .2s, box-shadow .2s;
+}
+.deploy-progress-minimized:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lg);
+}
+.deploy-progress-minimized.hidden { display: none; }
+.deploy-progress-minimized-content { color: var(--text); }
+.deploy-progress-minimized-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.deploy-progress-minimized-spinner {
+  animation: spin 1s linear infinite;
+  font-size: 16px;
+  color: var(--accent);
+}
+.deploy-progress-minimized-progress {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.deploy-progress-minimized-progress.error { color: var(--red); }
+
+/* ── 基准测试面板 ─────────────────────────────────────────────────────────── */
+/*
+   这个面板只回答一个问题：**分数动没动，为什么。**
+   它继承房子的配色与字体 —— 它是嵌在仪表盘里的一块，不是另一个 app。设计判断花在
+   结构上：
+   - 左右分栏。「挑要跑什么」是一次性动作，收进窄栏；「读跑出了什么」是反复做的事，
+     占主区。三个一样大的方块堆叠会让两者显得一样重要。
+   - 历史里分数画在**共享的 0-100 轴**上，标准差是须线，样本量印在刻度旁，模型与
+     镜像 tag 作为这一行的身份。一个不带样本量、不带被测配置的分数是噪音；把它们拆成
+     四个能各读各的列，等于邀请人只看那个数字。
+   - 每个 case 一条五段维度条。失败时「断在哪一维」是下一步动作的依据，不该再点一层。
+*/
+
+.benchmark-modal { width: min(1040px, 94vw); height: min(760px, 88vh); }
+.benchmark-modal .modal-body { flex: 1; min-height: 0; }
+
+.benchmark-modal .modal-header { gap: 12px; }
+.bm-header-meta {
+  margin-left: auto; display: flex; gap: 14px; align-items: baseline;
+  font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.bm-header-meta b { font-weight: 500; color: var(--text-muted); }
+
+/* 左栏装的是主体内容（用例卡），不是一列勾选框 —— 236px 是给勾选框留的宽度，
+   用例名在那个宽度里要断成两行，站数和「已在画布上」会断得更碎。 */
+.benchmark-body { display: grid; grid-template-columns: 330px 1fr; padding: 0; overflow: hidden; }
+
+.bm-h {
+  margin: 0; font-size: 12px; font-weight: 600; color: var(--text-muted);
+  letter-spacing: 0.01em;
+}
+
+/* ── 左栏：挑 ─────────────────────────────────────────────────────────────── */
+
+.bm-pick {
+  border-right: 1px solid var(--border); display: flex; flex-direction: column;
+  min-height: 0; background: var(--bg);
+}
+.bm-pick-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  padding: 14px 16px 8px;
+}
+.bm-scenarios { flex: 1; min-height: 0; overflow-y: auto; padding: 0 10px 10px; }
+
+.bm-scenario {
+  display: block; padding: 9px 10px; border-radius: var(--radius-sm); cursor: pointer;
+}
+.bm-scenario:hover { background: var(--bg-hover); }
+.bm-scenario input { float: left; margin: 3px 9px 0 0; accent-color: var(--accent); }
+.bm-scenario-name { display: block; font-size: 13px; line-height: 1.35; }
+.bm-scenario-meta {
+  display: block; margin-left: 22px; font-size: 11px; color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+
+.bm-launch { border-top: 1px solid var(--border); padding: 12px 16px 14px; }
+.bm-repeats-row {
+  display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text-muted);
+}
+.bm-repeats-row input {
+  width: 54px; padding: 4px 7px; border: 1px solid var(--border-med);
+  border-radius: var(--radius-xs); background: var(--bg-card); color: var(--text);
+  font-family: var(--font-mono); font-size: 13px; text-align: center;
+}
+/* n=1 是一次抛硬币，不是结论。这行字在重复次数是 1 的时候才出现。 */
+.bm-note { margin: 7px 0 0; font-size: 11px; line-height: 1.45; color: var(--yellow); }
+.bm-run { width: 100%; margin-top: 12px; }
+.bm-abort { display: block; width: 100%; margin-top: 8px; text-align: center; }
+
+.bm-linkbtn {
+  background: none; border: none; padding: 0; cursor: pointer;
+  font: inherit; font-size: 11px; color: var(--text-dim);
+  text-decoration: underline; text-underline-offset: 2px;
+}
+.bm-linkbtn:hover { color: var(--accent); }
+
+/* ── 用例库 ───────────────────────────────────────────────────────────────── */
+
+.bm-lib-tabs {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px 8px; border-bottom: 1px solid var(--border);
+}
+.bm-lib-spacer { flex: 1; }
+.bm-lib-tab {
+  background: none; border: none; padding: 0; cursor: pointer;
+  font: inherit; font-size: 13px; color: var(--text-dim);
+}
+.bm-lib-tab.active { color: var(--text); font-weight: 500; }
+.bm-lib-panel { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 16px 4px; }
+
+/* 一张用例卡就是一次「跑什么」的完整决定：叫什么、上次多少分、说的哪句话、
+   还差什么。分开摆的话，要人自己在两处之间对起来。 */
+.bm-card {
+  padding: 10px 0 11px; border-bottom: 1px solid var(--border);
+}
+.bm-card--loaded { border-left: 2px solid var(--accent); padding-left: 9px; }
+.bm-card-head { display: flex; align-items: baseline; gap: 10px; }
+.bm-card-name {
+  flex: 1; min-width: 0; font-size: 13px; line-height: 1.35; color: var(--text);
+}
+.bm-card-score {
+  font-family: var(--font-mono); font-size: 12.5px; color: var(--text);
+  white-space: nowrap;
+}
+.bm-card-score--none { font-size: 11px; color: var(--text-dim); }
+/* 初始指令是用户会说的那句话 —— 让它读起来像一句话，不像一个字段。 */
+.bm-card-prompt {
+  margin: 3px 0 6px; font-size: 12px; line-height: 1.5; color: var(--text-muted);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.bm-card-foot { display: flex; align-items: center; gap: 10px; }
+.bm-card-meta {
+  flex: 1; min-width: 0; font-size: 11px; color: var(--text-dim);
+  font-family: var(--font-mono); white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 「已在画布上」排在 meta 最前面，不排在最后：这一行会省略号截断，排在后面的那条
+   信息会被吃掉，而「这张就是画布上那张」正是扫列表时最需要看见的一条。 */
+.bm-card-flag {
+  margin-right: 7px; color: var(--accent); font-style: normal; white-space: nowrap;
+}
+.bm-card-flag::after { content: ' ·'; color: var(--text-dim); }
+.bm-card-actions { display: flex; align-items: center; gap: 10px; }
+.bm-cardrun {
+  padding: 2px 11px; border: 1px solid var(--border-med); border-radius: var(--radius-xs);
+  background: var(--bg-card); color: var(--text); font: inherit; font-size: 12px;
+  cursor: pointer;
+}
+.bm-cardrun:hover { border-color: var(--accent); color: var(--accent); }
+
+.bm-blocked, .bm-overwrite { padding: 4px 2px 8px; }
+.bm-blocked b { color: var(--text); }
+
+/* ── 用例：载入前的那一次覆盖 ─────────────────────────────────────────────── */
+
+.bm-case-block { padding: 0 16px 12px; border-bottom: 1px solid var(--border); }
+.bm-case-block .bm-empty { padding: 10px 0 4px; }
+.bm-case-loaded { padding: 4px 0 2px; }
+.bm-case-title { font-size: 13px; line-height: 1.35; color: var(--text); }
+/* 用例的初始指令就是用户会说的那句话，所以让它读起来像一句话，不像一个字段。 */
+.bm-case-prompt {
+  margin: 4px 0 8px; font-size: 12px; line-height: 1.5; color: var(--text-muted);
+}
+.bm-case-ok { font-size: 11.5px; color: var(--green); }
+/* 缺什么按层列出来：每一条的下一步动作都不一样。 */
+.bm-blockers { margin: 2px 0 8px; padding: 0; list-style: none; }
+.bm-blockers li {
+  font-size: 11.5px; line-height: 1.6; color: var(--yellow);
+  padding-left: 12px; text-indent: -12px;
+}
+.bm-blockers li::before { content: "· "; }
+.bm-blockers b { color: var(--text); font-family: var(--font-mono); font-weight: 500; }
+/* 覆盖是默认不做的事，所以勾选框是显式的一步，不是一句脚注。 */
+.bm-confirm {
+  display: flex; align-items: center; gap: 7px; margin: 9px 0 0;
+  font-size: 12px; color: var(--text-muted); cursor: pointer;
+}
+.bm-confirm input { accent-color: var(--accent); }
+/* 常驻提示条：这张画布上有会动的真设备。挑用例之前就说，不等按了运行才拦。 */
+/* 「判不了」和「没过」要看得出区别 —— 一个是 agent 做错了，一个是这次测不到。 */
+.bm-dim-none { color: var(--text-muted); font-style: italic; }
+/* 打分细节 / 运行日志：两种查法，分两个 tab。叠成一条纵向流的话，日志动辄几十行，
+   打分细节就被推到看不见的地方。 */
+.bm-tl-tabs { display: flex; gap: 2px; margin: 10px 0 0; border-bottom: 1px solid var(--border); }
+.bm-tl-tab {
+  padding: 6px 13px; border: none; background: none; cursor: pointer;
+  font-size: 12px; color: var(--text-muted); border-bottom: 2px solid transparent;
+}
+.bm-tl-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.bm-tl-pane { padding-top: 10px; }
+
+/* 「分数为什么是这个」。每条原则一张表 —— 这一屏是用来**扫**的：七条原则十几项，
+   混在一行行散文里，眼睛找不到「哪一条没过、差多少」。列固定之后上下对齐。 */
+.bm-sc { margin: 4px 0 14px; }
+.bm-sc-dim { margin-bottom: 14px; }
+.bm-sc-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 5px; }
+.bm-sc-head b { font-size: 12px; }
+.bm-sc-num { font-family: var(--font-mono); font-size: 13px; font-weight: 600; }
+/* 「判不了」不着色也不加粗 —— 一个醒目的「判不了」会被当成一个分数。 */
+.bm-sc-num--none { font-size: 11px; font-weight: 400; color: var(--text-muted); }
+
+/* 指标：横排小格，名字在上、数在下。原先是一行原始键名，给代码看的。 */
+.bm-sc-ms { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.bm-sc-m {
+  padding: 3px 8px; border-radius: 3px; background: var(--bg-subtle, rgba(127,127,127,.08));
+  font-family: var(--font-mono); font-size: 11px; color: var(--text);
+}
+.bm-sc-m i { margin-right: 5px; font-style: normal; color: var(--text-muted); }
+.bm-sc-m u { margin-left: 1px; text-decoration: none; color: var(--text-muted); }
+
+.bm-sc-t { width: 100%; border-collapse: collapse; font-size: 11px; }
+.bm-sc-t td { padding: 4px 6px; border-top: 1px solid var(--border-subtle, rgba(127,127,127,.15)); }
+.bm-sc-mark { width: 26px; text-align: center; font-weight: 600; }
+.bm-sc-item--ok .bm-sc-mark { color: var(--green, #2E7D32); }
+.bm-sc-item--bad .bm-sc-mark { color: var(--red); }
+.bm-sc-item--none .bm-sc-mark { color: var(--text-muted); }
+/* 比例型显示的是分数本身，不是对勾 —— 88% 不是「通过」，它就是 88 分。 */
+.bm-sc-item--ratio .bm-sc-mark { font-family: var(--font-mono); color: var(--text); }
+.bm-sc-text { width: auto; }
+/* 「算出来的」和「裁判判的」要分得清：一个不会抖，一个会。 */
+.bm-sc-from { width: 76px; white-space: nowrap; color: var(--text-muted); }
+.bm-sc-w { width: 38px; text-align: right; font-family: var(--font-mono); color: var(--text-muted); }
+.bm-sc-extra td { border-top: none; padding-top: 0; }
+.bm-sc-why { color: var(--text-muted); line-height: 1.55; }
+.bm-sc-steps { margin-top: 3px; }
+.bm-sc-step { display: flex; gap: 8px; margin-top: 2px; line-height: 1.5; }
+.bm-sc-step > span:first-child { flex: none; width: 24px; color: var(--green, #2E7D32); }
+.bm-sc-step--off > span:first-child { color: var(--red); }
+/* 停止按钮:同一个位置换语义，颜色得跟着换，否则手会按惯性点下去。 */
+.bm-cardrun--stop { background: var(--red); border-color: var(--red); color: #fff; }
+.bm-cardrun:disabled { opacity: .4; cursor: not-allowed; }
+/* 刷新转一圈：数据没变时页面不会有任何动静，而「点了没反应」和「点了但数据就是
+   没变」在屏幕上长得一样。 */
+@keyframes bm-spin { to { transform: rotate(360deg); } }
+.bm-spin { animation: bm-spin .4s linear; }
+.bm-compare { margin-bottom: 9px; font-size: 11px; line-height: 1.6; }
+.bm-compare b { font-weight: 600; }
+/* 不显著就不着色 —— 一个绿色的「测不出显著差异」仍然会被读成「变好了」。 */
+.bm-cmp-none { color: var(--text-muted); }
+.bm-cmp--up { color: var(--green, #2E7D32); }
+.bm-cmp--down { color: var(--red); }
+.bm-hw-notice {
+  margin: 0 18px; padding: 7px 11px;
+  border-left: 2px solid var(--red); background: var(--red-bg);
+  font-size: 11px; line-height: 1.5; color: var(--red);
+}
+/* 真机确认。比覆盖画布重一档：那个只是丢掉几张卡，这个会让一台真机器人动起来，
+   所以整块有红色左边框，两组信息（会动什么、会说什么）分开列。 */
+.bm-hardware { border-left: 2px solid var(--red, #e5484d); padding-left: 10px; }
+.bm-hardware .bm-note { color: var(--red, #e5484d); }
+.bm-hw-group { margin-top: 9px; }
+.bm-hw-title {
+  display: block; margin-bottom: 3px;
+  font-size: 11px; color: var(--text-muted);
+}
+.bm-hw-group .bm-blockers { margin: 0; }
+.bm-dim { color: var(--text-muted); font-style: italic; }
+.bm-case-actions { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+.bm-case-actions .btn-primary { flex: 1; }
+.bm-case-actions .btn-primary:disabled { opacity: .45; cursor: not-allowed; }
+/* 跑完只提示还原，不自动做 —— 自动会在用户正看着结果的时候把画布抽走。 */
+.bm-restore {
+  margin-top: 10px; padding: 9px 11px; border: 1px dashed var(--border-med);
+  border-radius: var(--radius-xs); font-size: 11.5px; color: var(--text-muted);
+}
+.bm-restore .bm-linkbtn { margin-left: 6px; }
+
+/* ── 右栏：读 ─────────────────────────────────────────────────────────────── */
+
+.bm-read { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.bm-block { padding: 14px 18px; border-bottom: 1px solid var(--border); min-height: 0; }
+.bm-block--grow { flex: 1; display: flex; flex-direction: column; border-bottom: none; }
+.bm-block > .bm-h { margin-bottom: 10px; }
+/* **只让列表增长。** 原先是 `> div`，对所有直接子元素生效 —— 加了「最近两次比较」
+   那一行之后，它和列表平分了高度，于是列表被压到底部，上面空出一大片。 */
+.bm-block--grow > div:not(.bm-compare) { flex: 1; min-height: 0; overflow-y: auto; }
+.bm-block--grow > .bm-compare { flex: none; }
+
+.bm-empty {
+  padding: 18px 2px; font-size: 12.5px; line-height: 1.6; color: var(--text-muted);
+}
+.bm-empty code {
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--text);
+  background: var(--bg-input); padding: 1px 5px; border-radius: var(--radius-xs);
+}
+
+/* ── 分数刻度：共享 0-100 轴 ───────────────────────────────────────────────── */
+
+.bm-run-row {
+  /* 身份列不吃满：中间留一条大空沟会让「哪一次」和「多少分」读成两件事，
+     而这个设计的全部意图正是让它们分不开。 */
+  display: grid; grid-template-columns: minmax(0, 320px) minmax(220px, 1fr); gap: 20px;
+  align-items: center; padding: 9px 2px; border-bottom: 1px solid var(--border);
+}
+.bm-run-row:last-child { border-bottom: none; }
+.bm-run-id { min-width: 0; }
+.bm-run-when { font-size: 12.5px; }
+.bm-run-config {
+  display: block; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 轴线在下、数字在上：先前两者同高，刻度正好从数字中间穿过去。 */
+.bm-axis { position: relative; height: 30px; margin: 0 24px 0 8px; }
+/* 轴本身很轻。要被看见的是刻度的位置，不是轴。 */
+.bm-axis::before {
+  content: ''; position: absolute; left: 0; right: 0; top: 21px; height: 1px;
+  background: var(--border-med);
+}
+.bm-axis-mark {
+  position: absolute; top: 17px; width: 1px; height: 6px; background: var(--border-med);
+}
+/* 不确定度是背景信息，刻度才是主角：须线做成一条细线，不做成色块。 */
+.bm-whisker {
+  position: absolute; top: 21px; height: 1px;
+  background: var(--accent); opacity: 0.35;
+}
+.bm-tick {
+  position: absolute; top: 15px; width: 3px; height: 13px; border-radius: 2px;
+  background: var(--accent); transform: translateX(-1.5px);
+}
+.bm-tick--none { background: var(--text-dim); }
+.bm-score {
+  position: absolute; top: 0; transform: translateX(-50%);
+  font-family: var(--font-mono); font-size: 12.5px; font-weight: 600;
+  font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap;
+}
+/* 右半边的分数向左展开、左半边向右展开 —— 数字永远朝轴心里侧，不会被切掉。 */
+.bm-score--start { transform: translateX(-2px); }
+.bm-score--end   { transform: translateX(calc(-100% + 2px)); }
+/* 样本量永远贴着分数走，不另起一列。 */
+.bm-n { font-weight: 400; font-size: 10.5px; color: var(--text-muted); margin-left: 3px; }
+
+/* ── 进行中 ───────────────────────────────────────────────────────────────── */
+
+.bm-progress-head {
+  display: flex; align-items: baseline; gap: 12px; font-size: 12.5px;
+  color: var(--text-muted); margin-bottom: 9px;
+}
+.bm-progress-head b {
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  font-weight: 600; color: var(--text);
+}
+.bm-state { color: var(--text-dim); }
+.bm-state--running { color: var(--accent); }
+.bm-state--done { color: var(--green); }
+
+.bm-case {
+  display: grid; grid-template-columns: 1fr 74px 56px; gap: 12px;
+  align-items: center; padding: 6px 2px; font-size: 12.5px;
+  border-bottom: 1px solid var(--border);
+}
+.bm-case:last-child { border-bottom: none; }
+.bm-case-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bm-case-name i { font-style: normal; color: var(--text-dim); font-family: var(--font-mono); }
+.bm-case-score {
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right;
+}
+.bm-case-outcome { font-size: 11.5px; }
+.bm-case-outcome--ok { color: var(--green); }
+.bm-case-outcome--pending { color: var(--text-dim); }
+.bm-case-outcome--stalled,
+.bm-case-outcome--timeout,
+.bm-case-outcome--error { color: var(--red); }
+
+/* 五段维度条：失败时「断在哪一维」是下一步动作的依据。 */
+.bm-dims { display: flex; gap: 2px; margin-top: 3px; }
+.bm-dim { height: 3px; flex: 1; border-radius: 1px; background: var(--border); }
+.bm-dim--ok { background: var(--green); }
+.bm-dim--bad { background: var(--red); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .bm-tick, .bm-whisker { transition: left 160ms ease, width 160ms ease; }
+}
+
+@media (max-width: 860px) {
+  .benchmark-body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+  .bm-pick { border-right: none; border-bottom: 1px solid var(--border); max-height: 40%; }
+  .bm-run-row { grid-template-columns: 1fr; gap: 4px; }
+}
+
+
+/* ── 用例编辑器 ───────────────────────────────────────────────────────────── */
+/* 改的几乎全是自然语言，所以这里像一张写字的表单，不像一个配置面板。 */
+
+.bm-editor-modal { width: min(680px, 92vw); max-height: 86vh; display: flex;
+                   flex-direction: column; }
+.bm-editor-body { padding: 16px 20px; overflow-y: auto; }
+.bm-ed-row { margin-bottom: 16px; }
+.bm-ed-label {
+  display: flex; align-items: baseline; gap: 10px; margin-bottom: 5px;
+  font-size: 12px; color: var(--text-muted);
+}
+.bm-ed-input {
+  width: 100%; padding: 6px 9px; border: 1px solid var(--border-med);
+  border-radius: var(--radius-xs); background: var(--bg-input); color: var(--text);
+  font: inherit; font-size: 13px;
+}
+.bm-ed-input:focus { outline: none; border-color: var(--accent); }
+/* 初始指令与插话是人说的话，给它们正文的行距，不是输入框的行距。 */
+.bm-ed-prose { line-height: 1.6; resize: vertical; }
+.bm-ed-inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.bm-ed-inline + .bm-ed-inline { margin-top: 7px; }
+.bm-ed-sm { width: 138px; }
+.bm-ed-xs { width: 84px; text-align: center; font-family: var(--font-mono); }
+.bm-ed-hint {
+  margin: 4px 0 0; font-size: 11px; line-height: 1.5; color: var(--text-dim);
+}
+.bm-ed-checks { display: flex; gap: 20px; font-size: 12.5px; color: var(--text-muted); }
+.bm-ed-checks input, .bm-ed-injection input[type="radio"] { accent-color: var(--accent); }
+/* 标签写在框外，不靠 placeholder —— placeholder 在填了值之后就消失了，
+   填完的表单会变成一排没有名字的数字。 */
+.bm-ed-weight { display: flex; align-items: center; gap: 6px;
+                font-size: 11.5px; color: var(--text-dim); white-space: nowrap; }
+.bm-ed-unit { font-size: 11.5px; color: var(--text-dim); }
+.bm-ed-injection, .bm-ed-req {
+  padding: 9px 11px; margin-bottom: 8px; border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+}
+.bm-ed-injection label, .bm-ed-req label { font-size: 12px; color: var(--text-muted); }
+.bm-ed-injection textarea, .bm-ed-req textarea { margin-top: 7px; }
+/* 「可选」贴在标签后面，小一号、淡一点 —— 参考流程不填也能跑，得让人一眼看出来。 */
+.bm-ed-opt {
+  margin-left: 6px; padding: 1px 5px; border-radius: 3px;
+  background: var(--bg-subtle, rgba(127,127,127,.12));
+  font-size: 10px; font-weight: 400; color: var(--text-muted);
+}
+/* 校验结果常驻在保存按钮旁边：编辑分几次做完，存一半不该被拒，
+   但「还差什么」要随时看得见，而不是等点「跑」才说。 */
+.bm-editor-foot {
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 20px; border-top: 1px solid var(--border);
+}
+.bm-editor-problems { flex: 1; min-width: 0; max-height: 64px; overflow-y: auto; }
+.bm-editor-problems .bm-blockers { margin: 0; }
+
+
+/* ── 运行详情 ───────────────────────────────────────────────────────────── */
+/* 一条共享时间轴，两条泳道。先前是左右两栏各自排版 —— 时刻本来就是对的，但同一秒
+   在两边的高度不同，读的人得拿眼睛找数字，等于没对齐。 */
+
+.bm-timeline-modal { width: min(1120px, 95vw); max-height: 88vh;
+                     display: flex; flex-direction: column; }
+.bm-timeline-body { padding: 14px 20px 18px; overflow-y: auto; }
+.bm-tl-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
+.bm-tl-score { font-family: var(--font-mono); font-size: 22px; color: var(--text); }
+.bm-tl-meta { font-size: 11.5px; color: var(--text-dim); font-family: var(--font-mono); }
+.bm-tl-fail { margin-bottom: 8px; font-size: 12px; color: var(--yellow); }
+
+/* 时间列在正中间：两侧都贴着它，同一秒必然同一行。 */
+/* `minmax(0, 1fr)`，不是 `1fr`。后者等于 `minmax(auto, 1fr)`，而 `auto` 的最小尺寸
+   是内容尺寸 —— 一段长播报会把轨道整个撑开，文字跑出单元格压到邻行上。展开一条
+   长对话就能看到两行字叠在一起。 */
+.bm-tl-r {
+  display: grid; grid-template-columns: minmax(0, 1fr) 64px minmax(0, 1fr); gap: 10px;
+  align-items: baseline; padding: 2px 0;
+}
+/* 网格子项默认 `min-width: auto`，同一个道理：不让它缩，就只能溢出。 */
+.bm-tl-left, .bm-tl-right { min-width: 0; }
+.bm-tl-r--headrow {
+  padding: 8px 0 6px; border-bottom: 1px solid var(--border); margin-bottom: 4px;
+  font-size: 11px; font-weight: 600; color: var(--text-muted);
+}
+.bm-tl-t {
+  text-align: center; font-family: var(--font-mono); font-size: 10.5px;
+  color: var(--text-dim); white-space: nowrap;
+}
+/* agent 一侧靠右、世界一侧靠左，两边都朝中间那条时间轴收 —— 视线不用横跨整屏。 */
+.bm-tl-left { text-align: right; min-width: 0; }
+.bm-tl-right { min-width: 0; }
+
+.bm-tl-turnhead { font-size: 12px; color: var(--text); }
+.bm-tl-session { margin-left: 8px; color: var(--text-dim); font-style: normal; opacity: .75; }
+/* 触发这一轮的那句话是人（或系统）说的 —— 排成一句话，不排成一个字段。 */
+.bm-tl-trigger { display: block; font-size: 12px; line-height: 1.5; color: var(--text); }
+.bm-tl-says { display: block; font-size: 12px; line-height: 1.55; color: var(--text-muted); }
+.bm-tl-callname {
+  font-family: var(--font-mono); font-size: 11px; color: var(--accent);
+  font-weight: 500; margin-right: 6px;
+}
+.bm-tl-args { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); }
+.bm-tl-kind { font-size: 11.5px; color: var(--text); margin-right: 8px; }
+.bm-tl-kind--minor { color: var(--text-dim); opacity: .55; }
+.bm-tl-detail { font-size: 11.5px; color: var(--text-muted); }
+.bm-tl-detail i { color: var(--text-dim); font-style: normal; }
+
+/* 省略号里常常正是要看的东西（完整讲解词、整串参数）。默认一行，点开看全文 ——
+   不用跳去翻 docker logs。 */
+.bm-clip {
+  display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; vertical-align: bottom; cursor: pointer;
+}
+/* 展开之后是**块级**并且照常裁剪。原先是 `overflow: visible` 的 inline-block ——
+   内容溢出盒子，而盒子的高度还是收起时的一行，于是它盖在下一行上。块级 + 换行让
+   盒子自己长高，`hidden` 就不会裁到任何东西。 */
+.bm-clip--open {
+  display: block; white-space: pre-wrap; word-break: break-word;
+  overflow: hidden; max-width: 100%;
+}
+.bm-clip:hover { text-decoration: underline dotted var(--border-med); }
+
+/* 每一段静默都画出来：排查时要看的就是时间去哪儿了。短停顿是节奏，安静地记一笔；
+   长静默是事故，得看得见。 */
+.bm-tl-r--quiet .bm-tl-t { color: var(--text-dim); font-size: 10px; }
+.bm-tl-r--loud .bm-tl-t { color: var(--yellow); font-size: 11px; }
+
+.bm-run-row { cursor: pointer; }
+.bm-run-row:hover { background: var(--bg-hover, rgba(0,0,0,.03)); }
+
+@media (max-width: 760px) {
+  .bm-tl-r { grid-template-columns: 1fr 52px 1fr; gap: 6px; }
+}

@@ -4,7 +4,12 @@ Manifest stored in SQLite config DB (key: 'drivers'). Populated via registry syn
 """
 
 import asyncio
+import contextlib
+import fcntl
 import os
+import shutil
+import threading
+import time
 from typing import Optional
 
 import fastapi
@@ -79,6 +84,157 @@ def _clear_deploy_log(driver_id: str):
     _deploy_logs.pop(driver_id, None)
 
 
+# ── Host compose file mutation ─────────────────────────────────────────────
+#
+# The host compose file has two independent writers: this module (merging each
+# image's deploy/service.yml fragment) and deploy/restart/entrypoint.sh (swapping
+# agent-core's image tag during a self-update). Neither used to lock, and both
+# wrote with a plain open(...,'w') — which truncates at open and flushes at
+# close, with no truncate in between. Two overlapping writers therefore left the
+# shorter document at offset 0 followed by the tail of the longer one, i.e. a
+# file that no YAML parser accepts and that nothing could repair afterwards
+# (every retry died in safe_load before it could write).
+#
+# Two deploys landing in the same second is not hypothetical: it is what a
+# double-clicked or retried deploy in the console does, since the
+# already-running-same-image guard only short-circuits a container that is
+# already up.
+
+_COMPOSE_LOCK_NAME = '.compose.lock'
+
+
+@contextlib.contextmanager
+def _compose_lock(compose_dir: str, timeout: float = 120.0):
+    """Hold an exclusive lock over the host compose file for the whole RMW cycle.
+
+    The lock file lives in COMPOSE_DIR, which is bind-mounted into both this
+    container and the restart helper, so both contend on one host inode.
+    deploy/restart/entrypoint.sh takes the same lock by name — keep them in sync.
+    """
+    lock_path = os.path.join(compose_dir, _COMPOSE_LOCK_NAME)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f'timed out after {timeout:.0f}s waiting for {lock_path}; '
+                        'another deploy or an agent-core self-update is in progress'
+                    )
+                time.sleep(0.2)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _merge_service_into_compose(compose_file: str, service_def: dict) -> tuple[bool, str]:
+    """Merge a service fragment into the host compose file under lock.
+
+    Returns (ok, error). On any doubt about the existing file this refuses to
+    write rather than guessing: a compose we cannot read is a compose whose other
+    services we cannot preserve, and silently dropping them is how agent-core
+    disappeared from the file on orin6.
+    """
+    import yaml
+
+    compose_dir = os.path.dirname(compose_file) or '.'
+    with _compose_lock(compose_dir):
+        try:
+            with open(compose_file) as f:
+                raw = f.read()
+        except FileNotFoundError:
+            # Genuine fresh install — install.sh has not run yet.
+            raw = ''
+            existing: dict = {}
+        else:
+            # An existing-but-empty file is NOT a fresh install; it is a
+            # truncated read or a damaged file. `safe_load(...) or {}` used to
+            # turn this into "no other services exist" and write a compose
+            # containing only the service being deployed.
+            if not raw.strip():
+                return False, f'{compose_file} exists but is empty — refusing to overwrite'
+            try:
+                loaded = yaml.safe_load(raw)
+            except yaml.YAMLError as e:
+                return False, f'{compose_file} is not valid YAML, refusing to overwrite: {e}'
+            if not isinstance(loaded, dict):
+                return False, f'{compose_file} is not a mapping, refusing to overwrite'
+            existing = loaded
+
+        services = existing.setdefault('services', {})
+        if not isinstance(services, dict):
+            return False, f'{compose_file}: services is not a mapping, refusing to overwrite'
+
+        preserved = set(services)
+        services.update(service_def)
+
+        text = yaml.dump(existing, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+        # Re-parse what we are about to write and confirm every service we
+        # started with survived. Cheap insurance: corruption here is otherwise
+        # invisible until the next `docker compose` call, by which point the
+        # last good copy is gone.
+        try:
+            check = yaml.safe_load(text) or {}
+        except yaml.YAMLError as e:
+            return False, f'refusing to write unparseable compose: {e}'
+        written = set((check.get('services') or {}))
+        missing = preserved - written
+        if missing:
+            return False, f'refusing to write: would drop service(s) {sorted(missing)}'
+
+        # Keep the last good copy before replacing.
+        if raw:
+            try:
+                with open(compose_file + '.bak', 'w') as f:
+                    f.write(raw)
+            except OSError as e:
+                return False, f'could not write backup {compose_file}.bak: {e}'
+
+        # Atomic replace: a concurrent reader sees either the old or the new
+        # file, never a half-written one.
+        tmp = compose_file + '.tmp'
+        with open(tmp, 'w') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, compose_file)
+
+    return True, ''
+
+
+# ── Per-driver in-flight guard ─────────────────────────────────────────────
+
+_deploy_inflight: set[str] = set()
+_deploy_inflight_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _deploy_slot(driver_id: str):
+    """Reject a second concurrent deploy of the same driver.
+
+    Yields True if this call owns the slot, False if a deploy is already running.
+    """
+    with _deploy_inflight_lock:
+        owned = driver_id not in _deploy_inflight
+        if owned:
+            _deploy_inflight.add(driver_id)
+    try:
+        yield owned
+    finally:
+        if owned:
+            with _deploy_inflight_lock:
+                _deploy_inflight.discard(driver_id)
+
+
 def _get_status_sync(driver_id: str, container_name_override: str = '') -> dict:
     try:
         client = _docker()
@@ -103,6 +259,52 @@ def _get_status_sync(driver_id: str, container_name_override: str = '') -> dict:
 
 
 def _deploy_sync(driver: dict) -> dict:
+    """Deploy a driver, rejecting a second concurrent deploy of the same driver.
+
+    The console retries and double-clicks; two deploys of one driver racing each
+    other is what corrupted the host compose file on orin6.
+    """
+    with _deploy_slot(driver['id']) as owned:
+        if not owned:
+            return {
+                'status':  'deploying',
+                'message': 'a deploy for this driver is already in progress',
+                'skipped': True,
+            }
+        return _deploy_sync_inner(driver)
+
+
+def _explain_pull_error(message: str) -> str:
+    """Turn a docker error into something an operator can act on.
+
+    Disk exhaustion is the case worth naming: it is common on a 57 GB Jetson
+    holding several ~18 GB perception images, and both the streamed pull error
+    and the misleading `No such image` that follows it are unactionable on
+    their own. The free-space figure comes from the host filesystem, which is
+    bind-mounted, so the number shown is the one that actually ran out.
+    """
+    text = str(message)
+    lowered = text.lower()
+    if 'no space left on device' in lowered or 'disk quota exceeded' in lowered:
+        hint = '磁盘空间不足'
+        try:
+            usage = shutil.disk_usage('/')
+            hint += (
+                f'（{usage.free // (1 << 20)} MiB 可用 / '
+                f'{usage.total // (1 << 30)} GiB 总计）'
+            )
+        except Exception:  # noqa: BLE001 - the hint is best-effort
+            pass
+        return (
+            f'{hint}。请清理旧镜像后重试：'
+            'docker image prune -a && docker builder prune -a'
+        )
+    if 'no such image' in lowered:
+        return f'{text}（本地没有该镜像，通常意味着上一步拉取实际失败）'
+    return text
+
+
+def _deploy_sync_inner(driver: dict) -> dict:
     """Deploy a driver/perception container via docker compose.
 
     Extracts service.yml from the target image and merges it into the host
@@ -131,7 +333,23 @@ def _deploy_sync(driver: dict) -> dict:
     _clear_deploy_log(driver['id'])
     _log_deploy(driver['id'], f'[pull] {target_image}')
     try:
+        pull_error = ''
         for line in client.api.pull(target_image, stream=True, decode=True):
+            # A streamed pull reports failure as a JSON line carrying `error`,
+            # and then ends *normally* — it does not raise. Without this check
+            # a failed pull looks like a successful one, execution falls
+            # through to containers.create() below, and the operator is shown
+            # `404 No such image` instead of the actual cause. That is exactly
+            # what a full disk produced: the real message was
+            # "mkdir /var/lib/containerd/...: no space left on device".
+            if line.get('error') or line.get('errorDetail'):
+                pull_error = (
+                    (line.get('errorDetail') or {}).get('message')
+                    or line.get('error')
+                    or 'unknown pull error'
+                )
+                _log_deploy(driver['id'], f'[pull] error: {pull_error}')
+                continue
             status = line.get('status', '')
             progress = line.get('progress', '')
             layer_id = line.get('id', '')
@@ -144,6 +362,11 @@ def _deploy_sync(driver: dict) -> dict:
         _log_deploy(driver['id'], f'[pull] failed: {e}')
         return {'status': 'error', 'error': f'pull failed: {e}'}
 
+    if pull_error:
+        detail = _explain_pull_error(pull_error)
+        _log_deploy(driver['id'], f'[pull] failed: {detail}')
+        return {'status': 'error', 'error': f'镜像拉取失败: {detail}'}
+
     # Extract service.yml from image
     compose_dir = os.environ.get('COMPOSE_DIR', '/opt/phanthy-motus')
     compose_file = os.path.join(compose_dir, 'docker-compose.yml')
@@ -151,7 +374,18 @@ def _deploy_sync(driver: dict) -> dict:
     # Ensure compose dir exists (may be a host-mounted volume)
     os.makedirs(compose_dir, exist_ok=True)
 
-    container = client.containers.create(target_image)
+    try:
+        container = client.containers.create(target_image)
+    except Exception as e:
+        # Reached only if the image is absent despite the pull reporting
+        # success. Say so plainly rather than surfacing docker-py's raw
+        # "404 ... No such image", which reads like the registry lacks the tag.
+        detail = _explain_pull_error(str(e))
+        _log_deploy(driver['id'], f'[deploy] image unusable after pull: {detail}')
+        return {
+            'status': 'error',
+            'error': f'镜像拉取后仍不可用: {detail}',
+        }
     try:
         bits, _ = container.get_archive('/deploy/service.yml')
         tar_bytes = b''.join(bits)
@@ -184,17 +418,18 @@ def _deploy_sync(driver: dict) -> dict:
         'options': {'max-size': LOG_MAX_SIZE, 'max-file': LOG_MAX_FILE},
     })
 
-    # Read existing compose (or create minimal)
+    # Merge into the host compose under lock, atomically. Bail out before
+    # touching any container if the existing file cannot be read safely — a
+    # failed merge that still removed the old container would leave the driver
+    # both stopped and undeployable.
+    ok, err = False, ''
     try:
-        with open(compose_file) as f:
-            compose = yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        compose = {'services': {}}
-
-    compose.setdefault('services', {}).update(service_def)
-
-    with open(compose_file, 'w') as f:
-        yaml.dump(compose, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        ok, err = _merge_service_into_compose(compose_file, service_def)
+    except TimeoutError as e:
+        err = str(e)
+    if not ok:
+        _log_deploy(driver['id'], f'[compose] {err}')
+        return {'status': 'error', 'error': err}
 
     # Remove old container if it exists (may be from legacy docker run)
     try:
@@ -253,7 +488,22 @@ def _deploy_sync_legacy(driver: dict) -> dict:
         name=name,
         hostname=ros_hostname,
         remove=False,
-        restart_policy={'Name': 'unless-stopped'},
+        # `always`, not `unless-stopped`. This is the path most containers on a
+        # robot are actually created by — the console deploys them here, not
+        # from a compose file — so it decides whether the robot comes back after
+        # a reboot.
+        #
+        # G1 came up from one with every container still exited. Somebody had to
+        # SSH in and start them, and until they did the robot was simply gone,
+        # with nothing to distinguish that from a broken deployment.
+        # `unless-stopped` will not start a container that was already stopped
+        # when the daemon went down, which is exactly the state a reboot leaves
+        # them in.
+        #
+        # The cost is that a container stopped by hand also returns after a
+        # reboot. On these machines that is the lesser surprise: "should be
+        # running and isn't" is both more likely and more expensive.
+        restart_policy={'Name': 'always'},
     )
 
     # Second consumer of the `-jetson` tag suffix, alongside hostarch.py /
@@ -351,9 +601,32 @@ async def _run_in_executor(fn, *args):
 
 # ── Registry sync helper ───────────────────────────────────────────────────
 
-def _upsert_from_catalog(manifest: list, catalog: dict) -> tuple[int, int]:
+# Which tag channels each update channel may resolve to. Must stay in sync with
+# _CHANNEL_TAGS in web/js/deploy-panel.js — the version list the user picks from
+# is built with the frontend's copy, and if this one disagrees the manifest ends
+# up pointing at a tag the panel never offers. Each channel includes its own
+# tags plus every more-stable channel's tags (preview -> +release -> +ga), so
+# switching to a less-stable channel never hides a build already visible on a
+# more-stable one.
+_CHANNEL_TAGS = {
+    'ga':      ('ga',),
+    'release': ('release', 'ga'),
+    'preview': ('preview', 'release', 'ga'),
+}
+
+
+def _channel_tags(tags: list, channel: str) -> list:
+    """Filter catalog tags down to those visible on `channel`, order preserved."""
+    allowed = _CHANNEL_TAGS.get(channel, _CHANNEL_TAGS['ga'])
+    return [t for t in tags if t.get('channel') in allowed]
+
+
+def _upsert_from_catalog(manifest: list, catalog: dict, channel: str = '') -> tuple[int, int]:
     """Upsert drivers from registry catalog into manifest list (in-place).
     Returns (added, updated) counts.
+
+    `channel` is the active update channel; tags outside it are ignored when
+    resolving which image a driver should point at.
     """
     added = 0
     updated = 0
@@ -362,7 +635,7 @@ def _upsert_from_catalog(manifest: list, catalog: dict) -> tuple[int, int]:
     all_items = [item for c in CATEGORIES for item in catalog.get(c, [])]
 
     for item in all_items:
-        tags = item.get('tags', [])
+        tags = _channel_tags(item.get('tags', []), channel)
         if not tags:
             continue
 
@@ -495,7 +768,7 @@ async def drivers_sync():
     _registry_cache[cache_key(channel)] = {'data': catalog, 'ts': __import__('time').time()}
 
     manifest = _load_manifest()
-    added, updated = _upsert_from_catalog(manifest, catalog)
+    added, updated = _upsert_from_catalog(manifest, catalog, channel)
     _save_manifest(manifest)
     return {'code': 200, 'data': {'added': added, 'updated': updated}}
 

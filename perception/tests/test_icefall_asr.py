@@ -114,6 +114,10 @@ class RoutingTests(unittest.TestCase):
         self.adapter.transcribe(wav(), "auto")
         self.assertEqual(self.loaded, ["en"])
 
+    def test_main_rich_transcription_contract_returns_text_without_tags(self):
+        FakeIdentifier.selected = "ja"
+        self.assertEqual(self.adapter.transcribe_rich(wav(), "zh-CN", True), ("ja", {}))
+
     def test_prepare_checks_assets_before_input(self):
         (self.root / "ja/encoder.onnx").unlink()
         with self.assertRaisesRegex(FileNotFoundError, "ja/encoder.onnx"):

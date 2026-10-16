@@ -2,14 +2,26 @@
 """
 perception/main.py — Perception Stack bundle 统一入口。
 
-读取 config.yaml，按插件配置加载 ASRPlugin / TTSPlugin（以及未来的 VLM、SLAM 等），
-聚合成一个 MCP HTTP server 对外暴露。
+读取 config.yaml，按插件配置加载各感知插件，聚合成一个 MCP HTTP server 对外暴露：
+
+  asr              语音识别（VAD + 唤醒词 + 多后端 ASR）
+  tts              语音合成（VITS2 / Matcha / Kokoro，本地 TensorRT 或 ONNX）
+  phanthy_music    曲库检索、HTTPS 音乐播放与语音优先混音
+  vop              物体检测（YOLOE-26 + TensorRT）
+  visual_depth     单目深度（YOLO26-depth + TensorRT）
+  ocr              文字识别（RapidOCR + TensorRT）
+  barcode          扫码（zxing-cpp，二维码/条形码，零模型，按需识别）
+  pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）
+  face_recognition 人脸识别与建库（InsightFace buffalo_sc）
+
+每个插件自带一个 `enabled` 开关，加载失败的插件不会拖垮其余插件 —— 它的卡片
+不出现在 dashboard 上，这一点是看得见的。
 
 MCP 工具命名规则：{plugin_prefix}_{tool_name}
   例：asr_info, asr_start, asr_stop, tts_info, tts_start, tts_speak
 
-MCP server 端口: env MCP_PORT > config.mcp_port（默认 15720）
-WebSocket ASR 端口: env WS_PORT > config.ws_port（默认 15721）
+MCP server 端口: config.mcp_port（默认 15720）
+WebSocket ASR 端口: config.ws_port（默认 15721）
 """
 
 from __future__ import annotations
@@ -26,6 +38,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -42,9 +55,33 @@ import rclpy.executors
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
-# suppress noisy third-party loggers
-for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx'):
+# suppress noisy third-party loggers.
+# pyvips logs six INFO lines per decoded image ("thumbnailing N bytes",
+# "selected loader is ...", "converting to processing space srgb", ...). At a
+# camera's frame rate that is the only thing in the log: measured on Tianyi,
+# ~4 lines/second with every other perception message buried under it.
+for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx', 'pyvips'):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
+
+# Cap on how much of an MCP argument dict reaches the log. A tool call can carry
+# an image, a base64 payload or a long utterance, so an unbounded repr here is how
+# a single log line grows past the point where Docker can frame it — the result
+# side was already capped, the argument side was not.
+_LOG_ARG_CHARS = 500
+
+# How often the register thread says it is still alive when nothing has changed.
+# The heartbeat itself stays at 30s; this only governs how often that fact
+# reaches the log, so "quiet" cannot mean both "healthy" and "thread died".
+REGISTER_ALIVE_INTERVAL_S = 1800.0
+
+
+def _brief(obj) -> str:
+    """One-line, length-capped repr for logging an MCP payload."""
+    text = repr(obj)
+    if len(text) <= _LOG_ARG_CHARS:
+        return text
+    return f"{text[:_LOG_ARG_CHARS]}…[+{len(text) - _LOG_ARG_CHARS} chars]"
+
 
 # ── ACP: SSE event bus (thread-safe) ─────────────────────────────────────────
 
@@ -83,11 +120,31 @@ class PerceptionBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
+        # Built before ASR, and that order is load-bearing: ASR takes a handle
+        # to this plugin so the voiceprint can be computed on the VAD segment it
+        # already cut, concurrently with transcription. The handle is optional —
+        # ASR publishes an identity-free payload when it is absent, which is
+        # what happens when speaker_recognition is disabled or still loading.
+        #
+        # Deliberately *not* guarded the way TTSPlugin is: the constructor here
+        # does no model work (the engine loads single-flight in a background
+        # thread on first use), so there is nothing for it to fail on.
+        speaker_plugin = None
+        if plugins_cfg.get("speaker_recognition", {}).get("enabled", False):
+            from plugins.speaker import SpeakerRecognitionPlugin
+            speaker_plugin = SpeakerRecognitionPlugin(
+                plugins_cfg["speaker_recognition"], executor)
+            self._plugins.append(speaker_plugin)
+            log.info("SpeakerRecognitionPlugin loaded")
+
         if plugins_cfg.get("asr", {}).get("enabled", False):
             from plugins.asr import ASRPlugin
-            self._plugins.append(ASRPlugin(plugins_cfg["asr"], executor))
-            log.info("ASRPlugin loaded")
+            self._plugins.append(
+                ASRPlugin(plugins_cfg["asr"], executor, speaker=speaker_plugin))
+            log.info("ASRPlugin loaded (speaker=%s)",
+                     "yes" if speaker_plugin else "no")
 
+        tts_plugin = None
         if plugins_cfg.get("tts", {}).get("enabled", False):
             from plugins.tts import TTSPlugin
             # Guarded: TTSPlugin validates its engine configuration in the
@@ -95,10 +152,47 @@ class PerceptionBundle:
             # config must not take ASR/VOP/OCR down with it — the tool simply
             # does not appear, which is visible in the dashboard.
             try:
-                self._plugins.append(TTSPlugin(plugins_cfg["tts"], executor))
+                tts_plugin = TTSPlugin(plugins_cfg["tts"], executor)
+                self._plugins.append(tts_plugin)
                 log.info("TTSPlugin loaded")
             except Exception:
                 log.error("TTSPlugin failed to load; continuing without TTS",
+                          exc_info=True)
+
+        # Built after TTS and holding a handle to it, for the same reason ASR
+        # holds one to speaker_recognition: the echo cancellation's reference
+        # signal *is* the TTS card's audio output, and asking the plugin in this
+        # process is what lets `robot_voice_topic: auto` need no configuration
+        # at all. The handle is optional — without it `auto` resolves to
+        # nothing and the card says so on its face rather than muting at random.
+        if plugins_cfg.get("echo_cancellation", {}).get("enabled", True):
+            from plugins.echo_cancellation import EchoCancellationPlugin
+            self._plugins.append(EchoCancellationPlugin(
+                plugins_cfg.get("echo_cancellation", {}), executor, tts=tts_plugin))
+            log.info("EchoCancellationPlugin loaded (tts=%s)",
+                     "yes" if tts_plugin else "no")
+
+        # After TTS and holding its handle, for the same reason echo_cancellation
+        # does: `speech_topics: auto` means "ask the local TTS card what it
+        # publishes", and in-process is the only place that answer is free.
+        if plugins_cfg.get("audio_mixer", {}).get("enabled", True):
+            try:
+                from plugins.audio_mixer import AudioMixerPlugin
+                self._plugins.append(AudioMixerPlugin(
+                    plugins_cfg.get("audio_mixer", {}), executor, tts=tts_plugin))
+                log.info("AudioMixerPlugin loaded (tts=%s)",
+                         "yes" if tts_plugin else "no")
+            except Exception:
+                log.error("AudioMixerPlugin failed to load; continuing without it",
+                          exc_info=True)
+
+        if plugins_cfg.get("phanthy_music", {}).get("enabled", False):
+            try:
+                from plugins.phanthy_music import PhanthyMusicPlugin
+                self._plugins.append(PhanthyMusicPlugin(plugins_cfg["phanthy_music"], executor))
+                log.info("PhanthyMusicPlugin loaded")
+            except Exception:
+                log.error("PhanthyMusicPlugin failed to load; continuing without phanthy_music",
                           exc_info=True)
 
         if plugins_cfg.get("vop", {}).get("enabled", False):
@@ -111,10 +205,105 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
+        # `vdp:` is the pre-rename spelling of this section; a config.yaml a
+        # machine already has on disk still uses it.
+        depth_cfg = plugins_cfg.get("visual_depth") or plugins_cfg.get("vdp") or {}
+        if depth_cfg.get("enabled", False):
+            import re, socket
+            namespace = depth_cfg.get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.visual_depth import VideoDepthPerceptionPlugin
+            # Guarded like TTSPlugin and FaceRecognitionPlugin: this one needs a
+            # TensorRT engine bundle for the running JetPack line, and a machine
+            # that cannot fetch it must still get ASR/TTS/VOP/OCR. The card
+            # simply does not appear, which is visible in the dashboard.
+            try:
+                self._plugins.append(
+                    VideoDepthPerceptionPlugin(depth_cfg, namespace, executor)
+                )
+                log.info("VideoDepthPerceptionPlugin loaded (namespace=%s)", namespace)
+            except Exception:
+                log.error("VideoDepthPerceptionPlugin failed to load; continuing without depth",
+                          exc_info=True)
+
+        if plugins_cfg.get("pose", {}).get("enabled", False):
+            import re, socket
+            namespace = plugins_cfg["pose"].get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.pose import PosePerceptionPlugin
+            # Guarded like TTSPlugin / VideoDepthPerceptionPlugin: this one needs
+            # a TensorRT engine bundle for the running JetPack line, and a
+            # machine that cannot fetch it must still get ASR/TTS/VOP/OCR. The
+            # card simply does not appear, which is visible in the dashboard.
+            try:
+                self._plugins.append(
+                    PosePerceptionPlugin(plugins_cfg["pose"], namespace, executor)
+                )
+                log.info("PosePerceptionPlugin loaded (namespace=%s)", namespace)
+            except Exception:
+                log.error("PosePerceptionPlugin failed to load; continuing without pose",
+                          exc_info=True)
+
         if plugins_cfg.get("ocr", {}).get("enabled", False):
             from plugins.ocr import OCRPlugin
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
             log.info("OCRPlugin loaded")
+
+        if plugins_cfg.get("barcode", {}).get("enabled", False):
+            from plugins.barcode import BarcodeScanPlugin
+            # No try/except and no model: zxing-cpp is imported lazily by
+            # plugins.barcode_runtime on the first scan, so a build missing it
+            # yields a card that reports the reason in `info` rather than a
+            # plugin that fails to load and silently disappears.
+            self._plugins.append(BarcodeScanPlugin(plugins_cfg["barcode"], executor))
+            log.info("BarcodeScanPlugin loaded")
+
+        if plugins_cfg.get("soundevent", {}).get("enabled", False):
+            from plugins.soundevent import SoundEventPlugin
+            self._plugins.append(SoundEventPlugin(plugins_cfg["soundevent"], executor))
+            log.info("SoundEventPlugin loaded")
+        if plugins_cfg.get("face_recognition", {}).get("enabled", False):
+            from plugins.face import FaceRecognitionPlugin
+            # Guarded like TTSPlugin: this plugin needs the standalone
+            # onnxruntime and a readable identity database, and neither belongs
+            # on the critical path of ASR/TTS/VOP/OCR. A failure here means the
+            # card does not appear, which is visible in the dashboard.
+            try:
+                self._plugins.append(
+                    FaceRecognitionPlugin(plugins_cfg["face_recognition"], executor)
+                )
+                log.info("FaceRecognitionPlugin loaded")
+            except Exception:
+                log.error("FaceRecognitionPlugin failed to load; continuing without it",
+                          exc_info=True)
+
+    def _plugin_for(self, full_name: str):
+        """Resolve a tool name to (plugin, action) by longest matching prefix.
+
+        Matching the *longest* prefix, not the first underscore-separated
+        segment: a prefix may itself contain an underscore (`face_recognition`),
+        and splitting on the first `_` would look for a plugin called `face`,
+        find none, and report the tool as unknown.
+
+        A plugin may also declare `ALIASES` — prefixes it answers to but does
+        not advertise. That is what keeps a card saved under an old tool name
+        working after a rename: `get_all_tools` publishes only PREFIX, so the
+        dashboard shows the new name, while an existing canvas card still
+        dispatches instead of going `state: error` on the next restart.
+        """
+        candidates = [(plugin.PREFIX, 0, plugin) for plugin in self._plugins]
+        candidates += [(alias, 1, plugin) for plugin in self._plugins
+                       for alias in getattr(plugin, "ALIASES", ())]
+        # Longest prefix first, and a real prefix ahead of an alias of the same
+        # length: whoever actually owns a name outranks whoever used to.
+        for prefix, _is_alias, plugin in sorted(candidates, key=lambda c: (-len(c[0]), c[1])):
+            if full_name == prefix:
+                return plugin, plugin.PREFIX
+            if full_name.startswith(prefix + "_"):
+                return plugin, full_name[len(prefix) + 1:]
+        return None, ""
 
     def get_all_tools(self) -> list:
         tools = []
@@ -125,12 +314,20 @@ class PerceptionBundle:
         return tools
 
     def dispatch(self, full_name: str, args: dict) -> dict | None:
-        prefix, sep, tool_name = full_name.partition("_")
-        name = tool_name if sep else prefix
-        for p in self._plugins:
-            if p.PREFIX == prefix:
-                return p.dispatch(name, args)
-        return None
+        plugin, name = self._plugin_for(full_name)
+        if plugin is None:
+            return None
+        return plugin.dispatch(name, args)
+
+    def owns(self, full_name: str) -> bool:
+        """True when some loaded plugin claims this tool name.
+
+        Lets the caller tell a genuinely unknown tool apart from a loaded
+        plugin returning None for an action it does not handle. Goes through
+        the same resolver as `dispatch`, so the two cannot disagree.
+        """
+        plugin, _ = self._plugin_for(full_name)
+        return plugin is not None
 
     def tts_synthesize_raw(self, text: str) -> bytes:
         for p in self._plugins:
@@ -207,6 +404,32 @@ def make_handler():
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
+
+            # File intake, before the body is read: an upload can be tens of
+            # megabytes and the JSON paths below slurp Content-Length into
+            # memory. utils/file_intake streams it to disk instead.
+            #
+            # This is how a photo reaches this container at all — see that
+            # module's docstring. agent-core proxies the browser's (or the LLM's)
+            # upload here and hands the returned path straight to a tool call;
+            # neither side needs a shared mount, because the path in the reply is
+            # this container's own.
+            if self.path == "/file/upload":
+                from utils.file_intake import access_token, handle_upload
+                cfg = _load_config()
+                intake = (cfg.get("file_intake") or {})
+                base_dir = str(intake.get("dir", "/models/uploads"))
+                body = self.rfile.read(length)
+                status, payload = handle_upload(
+                    self.headers, body, base_dir,
+                    token=access_token(),
+                    provided_token=self.headers.get("X-Access-Token"),
+                    max_bytes=int(intake.get("max_bytes", 64 * 1024 * 1024)),
+                    retention_days=int(intake.get("retention_days", 7)),
+                )
+                self._send(status, json.dumps(payload, ensure_ascii=False))
+                return
+
             raw = self.rfile.read(length)
 
             if self.path == "/vad/test":
@@ -295,14 +518,35 @@ def make_handler():
                     args   = params.get("arguments") or {}
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
+                    music_call = (name == 'phanthy_music' or name.startswith('phanthy_music_')
+                  or name == 'audio_mixer' or name.startswith('audio_mixer_'))
                     if not is_info:
-                        log.info(f"[mcp] tools/call: {name}({args})")
+                        if music_call:
+                            log.info("[mcp] tools/call: phanthy_music (payload omitted)")
+                        else:
+                            log.info(f"[mcp] tools/call: {name}({_brief(args)})")
                     result = _bundle.dispatch(name, args)
                     if result is None:
-                        err(-32601, f"Unknown tool: {name}")
+                        # `dispatch` returns None for two very different things:
+                        # no plugin owns the name, or a plugin owns it and
+                        # declined the action. Reporting both as "Unknown tool"
+                        # is actively misleading — it sent a debugging session
+                        # hunting a tool-registration race that did not exist,
+                        # when the tool was registered the whole time.
+                        if _bundle.owns(name):
+                            log.warning(
+                                "[mcp] %s declined action %r", name, args.get("action")
+                            )
+                            err(-32603, f"Tool {name} does not handle action "
+                                        f"{args.get('action')!r}")
+                        else:
+                            err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
-                            log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
+                            if music_call:
+                                log.info("[mcp] phanthy_music result received (payload omitted)")
+                            else:
+                                log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")
@@ -420,6 +664,16 @@ def _start_registration(mcp_port: int, name: str, category: str):
     }).encode()
     def _run():
         import time as _t
+        # Log transitions plus a slow keepalive — same reasoning as actucore's
+        # copy. Here it is 92 lines out of 242, on the container whose log is the
+        # first place anyone looks when ASR or TTS misbehaves.
+        #
+        # The slow line exists because edges alone made "healthy" and "the
+        # register thread died" look identical: every "ok" used to double as
+        # proof of life, and dropping it entirely traded one blind spot for
+        # another.
+        healthy = None
+        last_alive = 0.0
         while True:
             try:
                 req = _urllib.Request(
@@ -427,10 +681,20 @@ def _start_registration(mcp_port: int, name: str, category: str):
                     headers={"Content-Type": "application/json"}, method="POST",
                 )
                 with _urllib.urlopen(req, timeout=3, context=_ctx):
-                    log.info(f"[register] heartbeat ok → {agent_core_url}")
+                    now = _t.monotonic()
+                    if healthy is not True:
+                        log.info(f"[register] heartbeat ok → {agent_core_url}"
+                                 + ("" if healthy is None else " (recovered)"))
+                        healthy = True
+                        last_alive = now
+                    elif now - last_alive >= REGISTER_ALIVE_INTERVAL_S:
+                        last_alive = now
+                        log.info(f"[register] still registered → {agent_core_url}")
                 _t.sleep(30)
             except Exception as e:
+                # Every failure is logged: a flapping link is a real symptom.
                 log.warning(f"[register] failed: {e}, retrying in 5s")
+                healthy = False
                 _t.sleep(5)
     threading.Thread(target=_run, daemon=True, name="register").start()
 
@@ -439,8 +703,8 @@ def main():
     global _bundle
 
     cfg      = _load_config()
-    mcp_port = int(os.environ.get("MCP_PORT") or cfg.get("mcp_port", 15720))
-    ws_port  = int(os.environ.get("WS_PORT") or cfg.get("ws_port",  15721))
+    mcp_port = int(cfg.get("mcp_port", 15720))
+    ws_port  = int(cfg.get("ws_port",  15721))
 
     log.info(f"perception bundle starting, mcp_port={mcp_port}, ws_port={ws_port}")
     log.info(f"config: plugins.asr.enabled={cfg.get('plugins',{}).get('asr',{}).get('enabled')}, "
@@ -460,7 +724,36 @@ def main():
     _bundle  = PerceptionBundle(cfg, executor)
 
     def _spin():
-        executor.spin()
+        """Spin the executor, surviving a single entity's teardown race.
+
+        `executor.spin()` used to run bare. Anything it raised killed this
+        daemon thread outright, and with it every subscription in the process —
+        ASR, OCR, vop, the lot — while the MCP HTTP server kept answering, so
+        the service looked healthy and simply stopped perceiving. The one
+        observed trigger was rclpy's
+
+            InvalidHandle: cannot use Destroyable because destruction was
+            requested
+
+        raised from `_take_subscription` when a node's handle is destroyed
+        while the executor still holds it in its wait list. That is a bug in
+        whoever tore the node down (fixed in vop/visual_depth: leave the executor
+        before destroying anything), but one plugin's teardown must not be
+        able to silence the whole stack.
+
+        So: log it and resume. The offending entity is already gone, so the
+        next spin proceeds without it. The delay is a brake against a tight
+        loop if some error turns out to be permanent — better a slow log than
+        a pegged core.
+        """
+        while True:
+            try:
+                executor.spin()
+                return                      # clean shutdown
+            except Exception:
+                log.exception("[spin] executor raised; resuming in 1s — "
+                              "ROS callbacks were interrupted")
+                time.sleep(1.0)
 
     threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
 

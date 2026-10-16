@@ -207,6 +207,9 @@ class IcefallMultilingualASRAdapter:
             self._recognizer.decode_stream(stream)
             return stream.result.text.strip()
 
+    def transcribe_rich(self, wav_bytes, language="auto", include_emotion=False):
+        return self.transcribe(wav_bytes, language), {}
+
     def close(self):
         with self._lock:
             if self._identifier is not None:

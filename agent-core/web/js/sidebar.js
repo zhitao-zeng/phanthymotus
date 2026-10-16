@@ -6,6 +6,36 @@
 
 import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
+import { makeQrField, isDisplayOnly } from './qr-field.js';
+
+/**
+ * 分区图标。
+ *
+ * 原来这四层用的是 ◆ ◈ ❋ 这类几何字符 —— 它们的形状、粗细、基线全由字体决定，
+ * 和顶栏那套 24×24、stroke 1.8、round cap 的图标不是一回事，挤在 10px 标签旁边
+ * 尤其显得廉价。这里改成同一族的描边图标，各自画的是这一层真正在做的事：
+ *
+ *   agentcore  芯片 —— 做决定的那颗核
+ *   perception 眼睛 —— 这一层负责"接收"
+ *   actucore   闪电 —— 这一层负责"动"
+ *   driver     插头 —— 通往某台具体硬件的那根线
+ *
+ * driver 的颜色继续表示在线状态（原来由圆点承担），所以侧栏收起成窄条时，一眼
+ * 既看得出这是台设备，也看得出它活着没有。
+ */
+const _ICON_ATTRS = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+
+const ICONS = {
+  agentcore: `<svg ${_ICON_ATTRS}><rect x="7.5" y="7.5" width="9" height="9" rx="1.8"/>` +
+    `<path d="M9.8 3.2v4.3M14.2 3.2v4.3M9.8 16.5v4.3M14.2 16.5v4.3` +
+    `M3.2 9.8h4.3M3.2 14.2h4.3M16.5 9.8h4.3M16.5 14.2h4.3"/></svg>`,
+  perception: `<svg ${_ICON_ATTRS}><path d="M2.5 12S6 5.8 12 5.8 21.5 12 21.5 12 18 18.2 12 18.2 2.5 12 2.5 12z"/>` +
+    `<circle cx="12" cy="12" r="2.6"/></svg>`,
+  actucore: `<svg ${_ICON_ATTRS}><path d="M13.2 2.5 5 13.8h5.6L9.8 21.5 18 10.2h-5.6l.8-7.7z"/></svg>`,
+  driver: `<svg ${_ICON_ATTRS}><path d="M9 2.8v5.4M15 2.8v5.4"/>` +
+    `<path d="M5.6 8.2h12.8v3.2a6.4 6.4 0 0 1-12.8 0V8.2z"/><path d="M12 17.8v3.4"/></svg>`,
+};
 
 let _scroll = null;
 let _empty  = null;
@@ -30,8 +60,43 @@ export function initSidebar() {
     searchInput.addEventListener('input', () => _onSearchInput(searchInput.value));
   }
 
+  _initCollapse();
+
   // Load saved tool configs
   _loadToolConfigs();
+}
+
+/**
+ * Collapse the sidebar to a rail.
+ *
+ * 280px is a third of a tablet in portrait, and most of the time the canvas is
+ * what you are looking at. Shut, the panel keeps a rail of the section status
+ * dots rather than disappearing: the toggle stays in the same place whichever
+ * state it is in, and which devices are up is still readable.
+ *
+ * Below 768px the sidebar is a drawer that the fab already opens and closes, so
+ * this control is hidden there and the flag is left alone — it belongs to the
+ * wide layout and should survive a trip through a narrow one.
+ */
+function _initCollapse() {
+  const sidebar = document.getElementById('sidebar');
+  const btn = document.getElementById('sidebar-collapse-btn');
+  if (!sidebar || !btn) return;
+
+  const apply = (on) => {
+    sidebar.classList.toggle('collapsed', on);
+    btn.setAttribute('aria-expanded', on ? 'false' : 'true');
+    btn.title = on ? '展开侧栏' : '收起侧栏';
+    btn.setAttribute('aria-label', btn.title);
+  };
+
+  apply(localStorage.getItem('sidebar-collapsed') === '1');
+
+  btn.addEventListener('click', () => {
+    const on = !sidebar.classList.contains('collapsed');
+    apply(on);
+    localStorage.setItem('sidebar-collapsed', on ? '1' : '0');
+  });
 }
 
 async function _loadToolConfigs() {
@@ -83,14 +148,14 @@ export function renderSidebar(mcps, topicStatuses = {}) {
   // Perception section
   if (perceptions.length) {
     _scroll.appendChild(_buildMergedSection(perceptions, {
-      cls: 'sidebar-section-perception', icon: '◈', label: '感知',
+      cls: 'sidebar-section-perception', icon: ICONS.perception, label: '感知',
     }));
   }
 
   // ActuCore section
   if (actucores.length) {
     _scroll.appendChild(_buildMergedSection(actucores, {
-      cls: 'sidebar-section-actucore', icon: '❋', iconCls: 'actucore', label: '执行',
+      cls: 'sidebar-section-actucore', icon: ICONS.actucore, iconCls: 'actucore', label: '执行',
     }));
   }
 
@@ -116,7 +181,7 @@ function _buildSection(mcp) {
   const header = document.createElement('div');
   header.className = 'sidebar-section-header';
   header.innerHTML = `
-    <span class="sidebar-section-dot ${_esc(statusCls)}"></span>
+    <span class="sidebar-section-icon driver ${_esc(statusCls)}">${ICONS.driver}</span>
     <span class="sidebar-section-name">${_esc(name)}</span>
     <span class="sidebar-section-count">${(mcp.tools || []).length}</span>
   `;
@@ -157,7 +222,7 @@ function _buildMergedSection(mcps, { cls, icon, iconCls = '', label }) {
     }
   }
   header.innerHTML = `
-    <span class="sidebar-section-icon ${_esc(iconCls)}">${_esc(icon)}</span>
+    <span class="sidebar-section-icon ${_esc(iconCls)}">${icon}</span>
     <span class="sidebar-section-name">${_esc(label)}</span>
     <span class="sidebar-section-count">${allTools.length}</span>
   `;
@@ -194,7 +259,7 @@ function _buildControllerSection(controllers) {
   header.className = 'sidebar-section-header';
   const totalTools = controllers.reduce((s, m) => s + (m.tools || []).length, 0);
   header.innerHTML = `
-    <span class="sidebar-section-icon controller">◆</span>
+    <span class="sidebar-section-icon controller">${ICONS.agentcore}</span>
     <span class="sidebar-section-name">AgentCore</span>
     <span class="sidebar-section-count">${totalTools}</span>
   `;
@@ -259,7 +324,12 @@ function _buildChip(mcp, tool) {
   const configSchema = typeof tool === 'object' ? tool.configSchema : null;
   const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
   const configKey = `${mcp.id}:${tool.name}`;
-  const configured = hasSharedFields ? !!_toolConfigs[configKey] : true;
+  // 「已配置」只看会产生输入的字段。纯展示字段（二维码）永远不保存任何值，
+  // 把它算进来的话，一个只声明了二维码的工具会永久挂着未配置的警告三角。
+  // 齿轮按钮照旧按 hasSharedFields 出现 —— 正因为要点开它才看得到二维码。
+  const needsInput = hasSharedFields && Object.values(configSchema.properties || {})
+    .some(def => def.scope !== 'instance' && !isDisplayOnly(def));
+  const configured = needsInput ? !!_toolConfigs[configKey] : true;
 
   const configBtnHtml = hasSharedFields
     ? `<button class="chip-config-btn" title="配置"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>`
@@ -364,7 +434,10 @@ function _buildToolCard(mcp, tool) {
   const configKey = `${mcp.id}:${tool.name}`;
   // Only tools with shared (non-instance-scope) fields need sidebar-level configuration
   const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
-  const configured = hasSharedFields ? !!_toolConfigs[configKey] : true;
+  // 见 _buildChip 里同名变量的注释：纯展示字段不算「要配置的东西」
+  const needsInput = hasSharedFields && Object.values(configSchema.properties || {})
+    .some(def => def.scope !== 'instance' && !isDisplayOnly(def));
+  const configured = needsInput ? !!_toolConfigs[configKey] : true;
 
   // Badge
   const badgeHtml = toolType
@@ -508,6 +581,69 @@ function _readConfigValue(input, def) {
 }
 
 /** Check if a configSchema has any instance-scope fields. */
+/**
+ * A <select> listing the browser's media input devices of one kind.
+ *
+ * Shared by the `audio-input-device` and `video-input-device` config formats,
+ * and by both places that build a config form. It was already duplicated
+ * verbatim once before video needed it; a third and fourth copy is how the two
+ * drift apart.
+ *
+ * Labels are only exposed after permission is granted, so a stream is requested
+ * and released immediately just to read them — otherwise every device shows up
+ * as an opaque id.
+ */
+function _mediaDeviceInput(kind, key, saved) {
+  const constraint = kind === 'videoinput' ? { video: true } : { audio: true };
+  const noun = kind === 'videoinput' ? 'Camera' : 'Microphone';
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+    // Non-secure context (plain HTTP) — the API is unavailable, so offer a
+    // text field rather than an empty select the user cannot act on.
+    const input = document.createElement('input');
+    input.className = 'tool-config-input';
+    input.dataset.key = key;
+    input.type = 'text';
+    input.placeholder = 'Requires HTTPS or localhost';
+    input.value = saved;
+    return input;
+  }
+
+  const input = document.createElement('select');
+  input.className = 'tool-config-input';
+  input.dataset.key = key;
+  const loadingOpt = document.createElement('option');
+  loadingOpt.value = '';
+  loadingOpt.textContent = 'Loading devices...';
+  input.appendChild(loadingOpt);
+
+  navigator.mediaDevices.getUserMedia(constraint).then(stream => {
+    stream.getTracks().forEach(t => t.stop());   // release immediately
+    return navigator.mediaDevices.enumerateDevices();
+  }).then(devices => {
+    input.innerHTML = '';
+    const defaultOpt = document.createElement('option');
+    defaultOpt.value = '';
+    defaultOpt.textContent = '-- Default --';
+    input.appendChild(defaultOpt);
+    for (const d of devices.filter(d => d.kind === kind)) {
+      const opt = document.createElement('option');
+      opt.value = d.deviceId;
+      opt.textContent = d.label || `${noun} ${d.deviceId.slice(0, 8)}`;
+      if (saved === d.deviceId) opt.selected = true;
+      input.appendChild(opt);
+    }
+    if (saved) input.value = saved;
+  }).catch(() => {
+    input.innerHTML = '';
+    const errOpt = document.createElement('option');
+    errOpt.value = '';
+    errOpt.textContent = 'Permission denied';
+    input.appendChild(errOpt);
+  });
+  return input;
+}
+
 function _hasInstanceFields(configSchema) {
   if (!configSchema || !configSchema.properties) return false;
   return Object.values(configSchema.properties).some(def => def.scope === 'instance');
@@ -604,50 +740,11 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
-    } else if (def.format === 'audio-input-device') {
-      input = document.createElement('select');
-      input.className = 'tool-config-input';
-      input.dataset.key = key;
-      const saved = savedValues[key] || '';
-      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
-        // Non-secure context (HTTP) — fall back to text input
-        input = document.createElement('input');
-        input.className = 'tool-config-input';
-        input.dataset.key = key;
-        input.type = 'text';
-        input.placeholder = 'Requires HTTPS or localhost';
-        input.value = saved;
-      } else {
-        const loadingOpt = document.createElement('option');
-        loadingOpt.value = '';
-        loadingOpt.textContent = 'Loading devices...';
-        input.appendChild(loadingOpt);
-        // Request mic permission first to get device labels, then enumerate
-        navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-          stream.getTracks().forEach(t => t.stop()); // release immediately
-          return navigator.mediaDevices.enumerateDevices();
-        }).then(devices => {
-          input.innerHTML = '';
-          const defaultOpt = document.createElement('option');
-          defaultOpt.value = '';
-          defaultOpt.textContent = '-- Default --';
-          input.appendChild(defaultOpt);
-          for (const d of devices.filter(d => d.kind === 'audioinput')) {
-            const opt = document.createElement('option');
-            opt.value = d.deviceId;
-            opt.textContent = d.label || `Microphone ${d.deviceId.slice(0, 8)}`;
-            if (saved === d.deviceId) opt.selected = true;
-            input.appendChild(opt);
-          }
-          if (saved) input.value = saved;
-        }).catch(() => {
-          input.innerHTML = '';
-          const errOpt = document.createElement('option');
-          errOpt.value = '';
-          errOpt.textContent = 'Permission denied';
-          input.appendChild(errOpt);
-        });
-      }
+    } else if (def.format === 'audio-input-device'
+               || def.format === 'video-input-device') {
+      input = _mediaDeviceInput(
+        def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
+        key, savedValues[key] || '');
     } else if (def.format === 'channel-select') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -679,6 +776,9 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         errOpt.textContent = 'Failed to load channels';
         input.appendChild(errOpt);
       });
+    } else if (isDisplayOnly(def)) {
+      // 只读展示，不挂 data-key —— 保存时按 [data-key] 收集，所以它不会进配置值
+      input = makeQrField(key, def);
     } else if (_isStructuredField(def)) {
       input = _makeStructuredInput(key, def, savedValues[key]);
     } else {
@@ -859,7 +959,7 @@ function _hideDetail() {
  * Open a config modal for a specific canvas card instance.
  * Only shows fields with scope === "instance".
  */
-export async function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema) {
+export async function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema, description) {
   if (isProjectRunning()) {
     alert('Stop agent before modifying');
     return;
@@ -873,10 +973,42 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   titleEl.textContent = `Instance Config: ${toolName}`;
   bodyEl.innerHTML = '';
 
+  // The fields below state what can be *changed*; nothing else in this dialog
+  // states what the tool is or what it is fixed to. That gap is invisible for a
+  // tool whose settings are the whole story, and misleading for one whose
+  // capability is baked in at build time — vop runs a TensorRT engine with a
+  // frozen class list, so "confidence and fps" is the complete set of knobs and
+  // the dialog read as though the tool had simply lost its configuration.
+  if (description) {
+    const note = document.createElement('p');
+    note.className = 'tool-config-desc';
+    note.textContent = description;
+    bodyEl.appendChild(note);
+  }
+
   const props = (configSchema && configSchema.properties) || {};
   const required = (configSchema && configSchema.required) || [];
   const configKey = `${mcpId}:${toolName}:${instanceId}`;
   const savedValues = _toolConfigs[configKey] || {};
+
+  // Expert settings go in a fold. A card whose every tuning knob is laid out
+  // flat is a card nobody can configure: the pose card reached 26 fields, each
+  // labelled with its own paragraph of rationale, and finding `fps` in it meant
+  // reading all of them. A schema says which of its fields are everyday by
+  // leaving `advanced` unset; one that marks nothing keeps the flat layout it
+  // had, so this changes no card that has not opted in.
+  let advancedBox = null;
+  const advancedHost = () => {
+    if (advancedBox) return advancedBox;
+    const details = document.createElement('details');
+    details.className = 'tool-config-advanced';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Advanced settings';
+    details.appendChild(summary);
+    bodyEl.appendChild(details);
+    advancedBox = details;
+    return details;
+  };
 
   let hasFields = false;
   for (const [key, def] of Object.entries(props)) {
@@ -886,6 +1018,10 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
 
     const label = document.createElement('label');
     label.className = 'tool-config-label';
+    // `title` is the name of the setting; `description` is what it does. They
+    // were one field, so a description written to explain a trade-off became
+    // the label and the form turned into an essay. A schema with no title
+    // still falls back to its description, as before.
     label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
 
     let input;
@@ -935,50 +1071,11 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
-    } else if (def.format === 'audio-input-device') {
-      input = document.createElement('select');
-      input.className = 'tool-config-input';
-      input.dataset.key = key;
-      const saved = savedValues[key] || '';
-      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
-        // Non-secure context (HTTP) — fall back to text input
-        input = document.createElement('input');
-        input.className = 'tool-config-input';
-        input.dataset.key = key;
-        input.type = 'text';
-        input.placeholder = 'Requires HTTPS or localhost';
-        input.value = saved;
-      } else {
-        const loadingOpt = document.createElement('option');
-        loadingOpt.value = '';
-        loadingOpt.textContent = 'Loading devices...';
-        input.appendChild(loadingOpt);
-        // Request mic permission first to get device labels, then enumerate
-        navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-          stream.getTracks().forEach(t => t.stop()); // release immediately
-          return navigator.mediaDevices.enumerateDevices();
-        }).then(devices => {
-          input.innerHTML = '';
-          const defaultOpt = document.createElement('option');
-          defaultOpt.value = '';
-          defaultOpt.textContent = '-- Default --';
-          input.appendChild(defaultOpt);
-          for (const d of devices.filter(d => d.kind === 'audioinput')) {
-            const opt = document.createElement('option');
-            opt.value = d.deviceId;
-            opt.textContent = d.label || `Microphone ${d.deviceId.slice(0, 8)}`;
-            if (saved === d.deviceId) opt.selected = true;
-            input.appendChild(opt);
-          }
-          if (saved) input.value = saved;
-        }).catch(() => {
-          input.innerHTML = '';
-          const errOpt = document.createElement('option');
-          errOpt.value = '';
-          errOpt.textContent = 'Permission denied';
-          input.appendChild(errOpt);
-        });
-      }
+    } else if (def.format === 'audio-input-device'
+               || def.format === 'video-input-device') {
+      input = _mediaDeviceInput(
+        def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
+        key, savedValues[key] || '');
     } else if (def.format === 'channel-select') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -1010,6 +1107,9 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
         errOpt.textContent = 'Failed to load channels';
         input.appendChild(errOpt);
       });
+    } else if (isDisplayOnly(def)) {
+      // 只读展示，不挂 data-key —— 保存时按 [data-key] 收集，所以它不会进配置值
+      input = makeQrField(key, def);
     } else if (_isStructuredField(def)) {
       input = _makeStructuredInput(key, def, savedValues[key]);
     } else {
@@ -1022,12 +1122,28 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.value = savedValues[key] != null ? savedValues[key] : (def.default != null ? def.default : '');
     }
 
-    bodyEl.appendChild(label);
-    bodyEl.appendChild(input);
+    // Help text, only when there is a separate title to help — otherwise the
+    // description is already serving as the label and repeating it is noise.
+    let help = null;
+    if (def.title && def.description) {
+      help = document.createElement('p');
+      help.className = 'tool-config-help';
+      help.textContent = def.description;
+    }
+
+    const host = def.advanced ? advancedHost() : bodyEl;
+    host.appendChild(label);
+    host.appendChild(input);
+    if (help) host.appendChild(help);
   }
 
   if (!hasFields) {
-    bodyEl.innerHTML = '<p style="color:var(--text-secondary)">No instance config fields</p>';
+    // Appended, not assigned: replacing innerHTML here would wipe the
+    // description above, which is exactly the case where it matters most.
+    const empty = document.createElement('p');
+    empty.style.color = 'var(--text-secondary)';
+    empty.textContent = 'No instance config fields';
+    bodyEl.appendChild(empty);
   }
 
   const close = () => { overlay.classList.add('hidden'); };

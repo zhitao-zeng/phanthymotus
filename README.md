@@ -61,6 +61,180 @@ The platform runs a single **sense → think → act** loop:
 
 Hardware drivers are maintained in a separate repository: **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**.
 
+### Multi-Agent Peers
+
+> **Status: partly implemented.** Measured on two Orin test rigs, per granularity:
+>
+> | Piece | State |
+> |---|---|
+> | mDNS discovery, SAS pairing | works — both rigs paired, `operator` role |
+> | State sharing (signed HTTPS) | works — each side holds the other's topic list, refreshed every 5s |
+> | Tool proxy, **inbound** (serving a peer) | works — a signed `tools/list` returns exactly the tools bound on the receiver's canvas |
+> | Tool proxy, **outbound** (calling a peer's tools) | **not implemented** — nothing registers a peer as a synthetic MCP entry, so the local LLM cannot see or call them |
+> | Messaging (`lan` ChannelAdapter) | code exists, **not exercised** — no `lan` channel was configured on either rig |
+> | Task delegation (`peer_delegate`) | code and hop-count limit exist, **not exercised across machines** |
+> | Cloud roster discovery | stub |
+> | More than two peers | never tried |
+>
+> Feishu bot-to-bot (`bot_to_bot_enabled` + `trusted_bots`, see
+> [Feishu channel setup](docs/feishu-channel-setup.md)) remains the internet-dependent path.
+
+![Peer mesh & security](docs/images/peer-mesh.png)
+
+> Editable source: [`docs/peer-mesh.svg`](docs/peer-mesh.svg) — re-export the PNG after changing it.
+
+Robots collaborate as **peers**: each side runs its own Agent Core and keeps its own autonomy.
+Discovery, transport and trust are three independent, pluggable layers, so a peer can be found
+over mDNS and talked to over mTLS, or found via a cloud roster and talked to over Feishu.
+
+**Discovery** — providers all emit the same `PeerAdvert`, keyed by `peer_id` (an Ed25519 public-key
+fingerprint, *not* an IP or platform account). One peer discovered over several paths therefore
+stays one record with several links, which is what makes fallback possible.
+
+| Provider | Needs | Used for |
+|---|---|---|
+| mDNS / DNS-SD (`_motus._tcp.local`) | Same LAN | Same site — the primary path |
+| ~~DDS presence (`/motus/presence`)~~ | — | **Not usable.** DDS is now pinned to loopback (see below), so nothing DDS-based crosses machines |
+| Cloud roster | Internet | Across sites and subnets |
+| BLE advert | A Bluetooth radio, unblocked | **Discovery** where there is no shared IP network. Carries the key, not a data plane — the pairing handshake that follows still needs IP reachability |
+| Static list | Nothing | Fallback, always kept |
+
+**Transport — four granularities of collaboration:**
+
+1. **Messages** — a `lan` `ChannelAdapter`, so peer conversations reuse the existing channel stack
+   unchanged: `InboundMessage`/`OutboundMessage`, ACL roles, rate limiting, `expect_reply` loop
+   guard, and collector batching by trust level. Feishu and LAN are then two links with identical
+   agent-side semantics, which gives "internet when available, LAN when not" for free.
+2. **Tools** — the receiving half is built: `/api/peer/tools/list` and `/api/peer/tools/call`
+   authenticate the caller, then apply its role, its `tool_filter`, **and the receiver's own canvas
+   gate**, so a peer can only reach what a human wired locally. The sending half — registering a
+   peer as a synthetic MCP entry (`transport: 'peer'`) so its tools appear to the local LLM as
+   `mcp__peer:<id>__<tool>` — is **not implemented yet**; it needs a decision on whether peer tools
+   are exposed through the canvas (no UI for a peer card today) or exempted from it.
+3. **State** — topic lists and, later, pose/battery/task state, pushed over the same signed HTTPS
+   link (`POST /api/peer/inbox/state`). This used to be DDS topics; DDS is now confined to the
+   local host, and a FastDDS *default* profile applies to every participant in the process, so the
+   loopback restriction cannot be lifted for peer traffic alone by configuration. (Per-participant
+   profiles are possible by setting `FASTRTPS_DEFAULT_PROFILES_FILE` around each participant's
+   creation — the Tianyi driver's bridge does exactly that for its two domains — but that requires
+   owning every creation site, which is not the case across agent-core, perception, actucore and a
+   dozen drivers. Signed HTTPS is also the better answer on its own terms: it authenticates.) The move fixed a real hole on the way: the DDS peer bus
+   had **no authentication**, so anything on the same `ROS_DOMAIN_ID` could forge another robot's
+   state. It still carries state only, never commands.
+4. **Tasks** — `peer_delegate` ships a `SubagentSpec` to a peer, which spawns a subagent locally and
+   returns a `SubagentResult`. The receiver re-clips `tool_filter` against the peer's own role — the
+   sender's list is a request, not a grant — and `hop_count > 2` is refused so delegation chains
+   cannot storm.
+
+**Trust** — every Agent Core generates an Ed25519 identity key on first boot; `ACCESS_TOKEN` narrows
+to "a human operating this dashboard" and is no longer the cross-machine credential. Pairing follows
+the Bluetooth model: both dashboards show the same 6-digit short code derived from both public keys
+plus nonces, and a human confirms on both sides. That resists a man-in-the-middle without needing a
+CA, and is the only scheme that also works over BLE with no network. Links then run over pinned
+mTLS. Peers reuse the `channel/acl.py` role ladder and default to `viewer` (read-only sensors).
+
+**The internal bus stays on one machine.** Every robot runs `ROS_DOMAIN_ID=42` and the same
+loopback-only FastDDS profile (`agent-core/deploy/dds-local.xml`, mounted at
+`/opt/phanthy-motus/dds-local.xml`), which whitelists `127.0.0.1`. Under `network_mode: host` all
+containers on a machine share one loopback, so the local bus works normally while nothing leaves
+the host. Configuration is identical everywhere — no per-robot domain numbers to hand out, which is
+the point: `ROS_DOMAIN_ID` has a narrow usable range and cloned images cannot coordinate.
+
+Why this is not optional: `/remote_control/message` — a *command* — was reaching every robot on the
+office LAN. One instruction typed on Orin5 was executed by Orin6 as well, with the identical
+timestamp in both logs. DDS has no addressing and no authentication; every subscriber on the domain
+receives everything.
+
+Two operational consequences:
+
+- **Every DDS container must load the profile.** A container that misses it isolates *itself* from
+  the rest of the machine — the symptom is a robot that suddenly hears nothing. Agent Core
+  self-checks at startup and exposes `GET /api/peer/dds_isolation`; the judgement is whether the
+  process's UDP sockets bind `127.0.0.1`, not whether the file exists.
+- **A missing file fails silently.** If the host lacks `/opt/phanthy-motus/dds-local.xml`, Docker's
+  bind mount creates a *directory* with that name, FastDDS ignores it and falls back to every
+  interface — isolation gone, nothing in the log. Agent Core writes the file from its image when it
+  is absent; containers that already mounted the phantom directory must be **recreated**, not
+  restarted, because the mount type is fixed at creation.
+
+**What a peer may reach, per path.** The two inbound paths carry different guarantees, and it is
+worth being exact about which.
+
+*Messages and delegation* — a peer's message enters the collector as **input**, not a command, and
+the local LLM decides what to do with it; a delegated task runs in a subagent whose tool filter the
+receiver re-clips against that peer's role. On these paths a peer only ever *requests*.
+
+*`POST /api/peer/tools/call`* — a direct dispatch to the device: no LLM, no collector, no history
+(measured: a call executed while the receiver's agent loop was switched off). Three checks gate it:
+
+1. **role** — `viewer` reaches read-only tools only: `sensor`/`resource` from any layer, plus the
+   whole perception layer, whose `processor` tools compute on data and publish to a topic.
+   `operator` also reaches tools that act: `actuator`, the whole actucore layer (the execution
+   layer — `vla` and navigation drive the robot despite declaring `processor`), and `controller`.
+   An undeclared type counts as acting.
+2. **`tool_filter`** — narrows further within the role.
+3. **the local canvas** — the tool must be wired to `decision_core` on *this* machine.
+
+So an `operator` peer **can** drive this robot's actuators directly. That is the policy, not an
+oversight: granting `operator` is what authorises it, which is why a newly paired peer defaults to
+`viewer`, and why every such call is announced on the activity stream.
+
+### ACP Barrier — what may run at the same time
+
+An actuator tool returns when the driver has *accepted* the action, not when the world
+has finished changing, so the agent loop needs a rule for what may start next. That
+rule is the **ACP barrier**, and it is scoped by **physical channel**.
+
+Drivers declare which channel each acting tool occupies via `x-resource` beside
+`x-completion` (spec: `phanthymotus-driver/README_dev.md` § *Physical Resources*).
+The barrier waits only for pending actions whose channel intersects the one the new
+call wants, so speaking no longer blocks driving while two `speak` calls still
+serialise. `finish` and the hand-off tools (`peer_call`, `peer_delegate`,
+`subagent_spawn*`, `subagent_message`) wait for **everything**, because ending a turn
+or handing work to another executor cannot know what will be touched.
+
+**Agent Core defines no channel names.** It only intersects the strings drivers
+declare, so `rotor`/`gimbal` or `thruster`/`ballast` work exactly as `mouth`/`base`
+does. Undeclared means "conflicts with everything", which is why an undeclared driver
+keeps its pre-barrier behaviour, and why a *partially* declared one is the case that
+behaves worst — see the driver README before declaring anything.
+
+Three properties are load-bearing and easy to break:
+
+- **Every dispatch path must consult the same table.** There are three — the main
+  loop, and the subagent's MCP and system-tool branches. Each was missed once, and
+  each miss reopened the whole bug through a different door. `_HANDOFF_SYSTEM_TOOLS`
+  is enumerated, not keyword-matched, and `tests/test_handoff_tools_partitioned.py`
+  fails if a new `peer_*`/`subagent_*` tool is left unclassified.
+- **Exclusion and ordering are separate rules.** A call waits for two independent
+  reasons, and only the first can be overridden:
+
+  | reason | scope | can the caller opt out? |
+  |---|---|---|
+  | resource conflict | any agent | **no** — one chassis cannot drive two ways |
+  | own ordering | the same agent's own calls | yes, via `concurrent: true` |
+
+  Exclusion cannot answer "must this finish first". "Announce before moving" is a
+  *sequencing* requirement: `mouth` and `leg` are different channels, so exclusion
+  permits the overlap. The same pair must overlap when it is a gesture accompanying
+  speech and must not when it is a warning preceding motion — identical tools, and
+  only the intent differs. So ordering is enforced **within one agent's own sequence
+  of calls**, where the order it emitted them in is the script, and not across
+  independent agents, which share no script.
+
+  Agent Core injects a `concurrent` parameter into every acting tool's schema
+  (`mcp_client.with_parallel_param`) — drivers do not declare it, because whether a
+  call should overlap the previous one is a property of the intent, not the hardware.
+  It defaults to **false**: a model does not reason about concurrency unless made to,
+  and the unsafe direction — a warning overlapping the motion it warns about — is the
+  one that should require an explicit request. Ownership comes from
+  `mcp_client.current_agent_context`, which each subagent sets to its own id.
+- **A timeout clears pending and proceeds exactly like success.** So a terminal state
+  has to outlive its pending (`mcp_client.action_outcome`), and anything reporting
+  work upward must carry `SubagentResult.confirmed_actions()` rather than prose — an
+  agent that reads "failed" with no record of what already happened will redo it,
+  physically.
+
 ### Memory & Long-Running Agent Architecture
 
 The Agent Core is designed for **continuous operation over days or months**. The architecture separates real-time interaction from background intelligence:
@@ -96,6 +270,256 @@ The Agent Core is designed for **continuous operation over days or months**. The
 - **Urgent interrupts only** — background subagents only interrupt the main agent for safety-critical alerts (battery critical, hardware faults). Routine reports go to the database silently.
 - **Daily auto-summary** — a scheduled subagent generates daily reports covering user interactions, task completion, anomalies, performance review, and skill discovery opportunities.
 - **Prefix caching optimized** — stable system prompt (L1 + L2-static) is frozen per turn; dynamic status is minimal and placed in user messages to maximize LLM prefix cache hits.
+
+## File Arguments (`format: file`)
+
+A tool that needs a file — a photo to enrol a face, an audio clip to play —
+cannot simply be handed a path. The service that reads it usually runs in a
+**different container**, and containers share no filesystem here: agent-core
+mounts `/opt/phanthy-motus`, perception mounts `/opt/embodied/models`, and each
+one's `/tmp` and `/work` is its own. A path minted on one side is meaningless on
+the other.
+
+### Declaring one
+
+Mark the parameter in the tool's `inputSchema`:
+
+```python
+"image_path": {
+    "type": "string",
+    "format": "file",        # → the canvas renders a file picker
+    "accept": "image/*",     # → picker filter
+    "uploadTo": "mcp",       # → route the upload to *this* service
+    "description": "...",
+},
+```
+
+`uploadTo: "mcp"` is the important one. Omit it and the browser uploads into
+agent-core's own `/tmp/uploads`, which is correct only for a tool agent-core
+serves itself (`remote_image`, `remote_audio`) and invisible to anything else.
+
+### How the file actually moves
+
+```
+browser ──pick──▶ agent-core  POST /api/mcp/{mcp_id}/file/upload
+LLM ─────path──▶      │   address resolved from the MCP registry;
+                      │   body streamed on in 1 MiB chunks
+                      ▼
+                 the service  POST /file/upload
+                      │   writes it somewhere it can see
+                      ▼
+              ◀──reply── {"path": "/models/uploads/2026-09-08/alice.jpg"}
+                  that path becomes the tool argument, verbatim
+```
+
+The reply carries the path **in the receiving container's own namespace**, so
+there is one viewpoint and nothing to translate. No shared mount, and therefore
+no container recreation to enable it.
+
+The target's address comes from the MCP registry — every service reports `url`
+when it registers — so one route covers perception, actucore and every driver
+even though their ports all differ.
+
+### Two callers, one pipeline
+
+**Browser**: the canvas picker uploads and fills the returned path into the
+field. This has worked since `format: file` existed.
+
+**LLM**: it has no picker, so `mcp_client.call_tool` does it. Before validating
+arguments, any parameter declared `format: file` whose value is a file that
+exists **locally** is uploaded, and the argument is rewritten to the path the
+service returned. A value that is not a local file is passed through untouched —
+it is either already the target's path (the picker's output, or a second call
+reusing an earlier result) or something the model invented, and the tool's own
+error is the better answer.
+
+This lives in `call_tool`, the single point every MCP call passes through, **not
+in any card**. A tool added later gets the behaviour without knowing the code
+exists. It also survives `x-action-params` splitting, which rebuilds each
+action's properties from the parent schema (there is a test pinning that: drop
+`format` there and no split tool would ever be recognised).
+
+### Why not the alternatives
+
+**base64 in the argument.** Tried, and it failed in production: a 43 800
+character string does not survive being carried through an LLM's context, and
+what arrived was truncated.
+
+**A shared host mount.** Works, but needs every participating container
+recreated (Docker fixes mounts at creation), one host directory per pairing, and
+leaves the path ambiguous — `/uploads` here, something else there.
+
+**Letting the model guess.** This was the status quo, and the model guessed
+wrong twice: it downloaded a photo to `/tmp` and then passed
+`/work/dai_wenyuan_1.jpeg`. Told only "cannot read", it retried with another
+invisible path.
+
+### Receiving end
+
+`perception/utils/file_intake.py` implements `POST /file/upload` and is
+deliberately **stdlib-only**, because the drivers run a bare
+`ThreadingHTTPServer` rather than FastAPI and can adopt the identical endpoint in
+about five lines. All 15 HTTP driver bundles now do, via a copy of this module at
+`phanthymotus-driver/common/file_intake.py` — the same two-implementations-one-
+document rule as `motus.vla/1`, since the whole surface is four lines of wire
+format. See that repo's README_dev.md § File Arguments for the per-bundle glue
+and the three ordering requirements it has to satisfy.
+
+Its behaviour, each point with a test:
+
+| | |
+|---|---|
+| size capped **while** writing | an oversized body is never fully committed or buffered |
+| `.part` then rename | a reader listing the directory never sees half a file |
+| filename → one component, CJK kept | users name files in Chinese; NFC-normalised so a macOS and a Linux upload of one name agree |
+| `subdir` refused, not sanitised | `../escape` became `.._escape` — a valid name, so the write succeeded somewhere unasked-for, silently |
+| pruned after `retention_days` (7) | uploads are a transfer buffer; enrolment keeps the *embedding*, never the photo |
+| `ACCESS_TOKEN` honoured when set | today perception is not given one, and the same port already serves `tools/call` — so this is reachability-gated, and the check is ready for when a token is wired in |
+
+## Skill Files
+
+A skill can ship files alongside its instruction. The definition declares a
+manifest — each entry just `{path, bytes, sha256}` — and **says nothing about
+who reads them**:
+
+```json
+"files": [
+  {"path": "reference/etiquette.md", "bytes": 1840,   "sha256": "…"},
+  {"path": "trajectory.jsonl",       "bytes": 482301, "sha256": "…"}
+]
+```
+
+That omission is the design. Every other tool-to-skill relationship here is
+descriptive: `requiredTools` is enforced nowhere (one display label in the skill
+panel is its only reader), a skill says in prose "use tool X", and the LLM
+routes the call. A file is the same, and it reaches either reader through a
+mechanism that already exists:
+
+| | the model reads it | a tool consumes it |
+|---|---|---|
+| how | `skill_file(slug, path)` → text, bounded, resumable by `offset` | `skill_file(…, as_path=true)` → a local path, passed to any `format: file` parameter |
+| who decides | the LLM, from the instruction | the LLM, **by which tool it calls** |
+| transport | `agent-core/src/skill_files.py` | the `format: file` path above — **the only transport** |
+
+The second row is the whole point: the tool the model called *is* the
+destination, so a skill never names a device, a protocol, or a tool. It is also
+why `agent-core/src/api/skill_execution.py` (once `skill_packages.py`) no longer
+carries a chunked transfer of its own — that existed only while no driver served
+`POST /file/upload`, and two transports for one job is the thing not to ship. Earlier
+drafts had each entry declare its consumer, a protocol `schema`, and the `tools`
+allowed to receive it; all three were wrong in the same direction — `tools`
+duplicated `schema` and forced a marketplace author to enumerate driver tool
+names they cannot know, and `schema`/`consumer` froze a per-call routing
+decision at authoring time.
+
+Progressive disclosure follows from it: the `description` is always in context,
+an activated skill's `instruction` is injected whole, and files are read only
+when the instruction points at one. Before this, `instruction` was the only
+place to put content.
+
+### What Core enforces
+
+This is an **LLM-facing read primitive on a robot** whose path argument
+ultimately comes from text in a prompt, so confinement carries the weight:
+
+| | |
+|---|---|
+| a declared path cannot leave the skill's directory | `resolve()` then verify via `parents` — **not** a string prefix, which accepts a sibling directory whose name merely starts the same way (`<slug>-evil/x`) |
+| declaration first, content second | a write must match the declared length and SHA256; a file the skill never declared has no storage and no reader |
+| `O_NOFOLLOW` + regular-file check | this process can write the directory, so a planted symlink must not redirect the read |
+| bounded reads | 64 KiB per read, 1 MiB per text read, 16 MiB per file, 32 MiB per skill |
+| **activation is the gate** | only an activated skill's files are readable — this cannot browse what is merely installed |
+
+`skill_file` needs no canvas card, unlike every device tool. The canvas is an
+authorization surface (`agent-core/src/canvas_binding.py`), but skill *text* has
+never been gated by it: `prompt._env_static` injects an activated skill's
+`instruction` with no card involved. A skill file is the same operator-installed
+content, read on demand rather than always. **The tool does not widen what the
+LLM can read; it narrows when.**
+
+Full protocol, the storage layout, and the authoring paths:
+[`docs/SKILL_WORKBENCH.md`](docs/SKILL_WORKBENCH.md).
+
+## Capability Declarations (`x-*`)
+
+A driver's tool says what it can do; agent-core never infers it from the tool's
+name or the robot's model. The declarations live **inside `inputSchema`**, not
+at the top level of the tool object — MCP registration whitelists top-level
+fields, so an unknown key there is silently dropped.
+
+| Declaration | What the driver is telling Core |
+|---|---|
+| `x-action-params` | each action takes its own parameters — split this tool per action, and `<action>.required` is that action's required set |
+| `x-completion` | this action is asynchronous; here is how its completion receipt arrives (ACP) |
+| `x-resource` | this tool can serve a resource, e.g. the URDF a skeleton renderer needs |
+| `format: file` / `uploadTo` | this parameter is a file, and which service should receive the upload |
+| `x-hooks`, `x-show-when`, `x-sensitive` | how to render this field in the config form |
+| `x-skill-package` | this card can receive and emit skill packages — see below |
+| `x-workbench` | this card provides an interactive page to host in an iframe |
+| `x-stop` | this card has a release protocol; here is what "still stopping" looks like |
+
+A skill's own `files` manifest is **not** in this family — it is not a tool
+declaration. See [Skill Files](#skill-files) above.
+
+The pattern is the same one used for LLMs: `config.main['client']['llm']` is
+`{url, key, model}` and there is not a line of inference about which model is
+behind it. A keyword guess is the failure mode this exists to avoid — the peer
+tool classifier once sorted tools by name and matched none of `loco`, `led`,
+`speaker` or `switch_mode`, which let a `viewer` drive locomotion.
+
+### `x-skill-package`
+
+A **skill package** is a portable archive a device produces and consumes: a
+manifest plus whatever payload that device's own protocol calls for. Core
+transfers it between one card and the browser, and stores whether the resulting
+skill may run without asking. It does not open the payload.
+
+```json
+{
+  "x-skill-package": {
+    "schema": "example.device.package/1",
+    "pending": true,
+    "session_authorization": true,
+    "persistent_execution": true,
+    "legacy_slug_prefix": "recorded-"
+  }
+}
+```
+
+One identity field and a set of capability bits:
+
+| Field | Effect |
+|---|---|
+| `schema` | the protocol this card speaks. A package is routed here only if its `manifest.schema` is the same string, and refused with 409 before the device is contacted if not. **Required** — a tool without it is not a package card. |
+| `pending` | the card can list unvalidated drafts, so "待验证 → 继续验证" appears in the skill list |
+| `session_authorization` | the card supports a time-boxed grant (the pre-`persistent_execution` path) |
+| `persistent_execution` | the card supports an auto-execution setting that survives a stop and a restart |
+| `legacy_slug_prefix` | how to resolve skills installed before packages carried `attachment` |
+
+A capability that is not declared has no UI entry and no code path. What Core
+reads out of a package is the `schema` and, for routing, `tool`; everything
+else — including all of `compatibility` — is forwarded to the device to judge
+and to the page to display.
+
+Two things to get right, both of which have already gone wrong once:
+
+- **A declaration is not an authorization.** `persistent_execution: true` means
+  the card *supports* the feature. It grants nothing: a skill runs
+  unattended only if a logged-in browser enabled it, the stored device binding
+  still matches, and the tool is wired to `decision_core` on this canvas. The
+  declaration comes from the driver, so it decides visibility and code paths —
+  never permission.
+- **A declaration only decouples if Core reads nothing else.** The mechanism can
+  be present and bypassed: a first cut of this declared `persistent_execution`
+  properly while also hardcoding one application's protocol id, archive entry
+  name, slug prefix and id formats. A correctly-declaring new card still could
+  not work, and the interface looked generic the whole time, which is worse
+  than having no declaration at all. `agent-core/tests/test_skill_packages.py`
+  runs the whole suite on identifiers no shipped driver uses, so a hardcoded
+  string turns it red.
+
+Full protocol, transfer boundaries, the `motus.workbench/1` message channel and
+the auto-execution gates: [`docs/SKILL_WORKBENCH.md`](docs/SKILL_WORKBENCH.md).
 
 ## Web Dashboard
 
@@ -135,6 +559,116 @@ Two rules follow, both of which were learned the hard way:
   until you visited the canvas.
 
 Frontend tests: `node --test "agent-core/web/js/*.test.mjs"` (no dependencies).
+
+#### Stopping is two stages, and they have different guarantees
+
+「停止智能控制」 used to be one `await fetch` with **no UI feedback of any kind** —
+the button did not change, did not disable, showed no spinner — and the backend
+behind it walked the cards **serially** with `mcp_call_tool` and no timeout, whose
+default is no deadline at all. Measured on Orin 5:
+
+| | |
+|---|---|
+| 6 idle cards | 70 ms |
+| cards mid-model-load | 0.46 s |
+| one MCP that accepts but never answers, `timeout=None` | **still waiting at 25 s** (we cut it) |
+| the same MCP with a 5 s deadline | fails at 5.3 s |
+
+So the problem was never "slow", it was **unbounded** — and the ordering made it a
+safety problem rather than a cosmetic one: the cards were stopped *first* and
+`project_running` was flipped *last*, so throughout that unbounded wait **the agent
+loop was still live**, still able to call TTS and drive actuators. The operator
+pressing 停止 wants exactly that to end immediately, and saw nothing happen at all,
+so they pressed it again — which fired a second POST, because there was no
+in-flight guard either.
+
+It is now two stages:
+
+| stage | time | can fail | what |
+|---|---|---|---|
+| 1 | ≤100 ms | no | agent loop off (`project_running = False`, broadcast), browser mic/camera capture stopped |
+| 2 | seconds | yes, partially | per-card `stop` — **parallel**, each with a `STOP_CARD_TIMEOUT_S` deadline |
+
+`POST /api/config/stop-project` returns after stage 1 and runs stage 2 as a
+background task, so the button can honestly flip the moment the agent is off
+instead of waiting on a broken device. Stage 2 reports `project_stop_begin` →
+`project_stop_item`×N → `project_stop_done` on `/ws/motus`, which drives a
+dismissible chip beside the button (`web/js/teardown-chip.js`, state and HTML both
+pure so `node --test` covers them) and leaves a row per device in the activity log.
+
+Four things in there are deliberate and easy to undo by accident:
+
+- **The deadline is enforced twice** — `timeout_s` on the request *and*
+  `asyncio.wait_for` around the whole call. A stop must come back regardless of
+  *where* it hung, and the hang is not always the socket (registry lookup, a lock,
+  a thread holding the GIL).
+- **Parallel, so one dead device cannot hold the others.** Total time is `max()`,
+  not `sum()`. "One device broke, so none of the others could be stopped" is the
+  worst possible coupling direction for a stop path.
+- **Partial failure states the consequence, not the completion rate.** The chip
+  says 「1 台设备未停止」, not 「5/6 完成」, and it does not auto-hide — unlike the
+  all-clear, which disappears after a few seconds. A card that never answered is
+  counted as failed, because "no result" has the same consequence as an error here:
+  that device may still be running.
+- **A second click does not start a second teardown.** Stop is idempotent, but two
+  overlapping rounds make the per-item progress overwrite itself.
+
+Two conventions this toolbar has that break **silently, and only in the hand** — the
+teardown chip got both wrong first time round, and the desktop looked perfect:
+
+- **`pointer-events` is opt-in below 768px.** `.canvas-top-control` is
+  `pointer-events: none` there so touches fall through to the canvas, and every
+  interactive child declares `auto` for itself. The chip did not, so on a 390x844
+  phone `tap()` simply timed out — while the chip was the *only* thing on screen
+  saying a device had not stopped, because the activity log is a closed drawer at
+  that width. (Hence the extra toast on failure: a row written into a drawer nobody
+  opened is not a report.)
+- **Touch sizing is keyed on `pointer: coarse`, not on width** — a tablet is a wide
+  screen with a coarse pointer, and keying on 768px hands it desktop-sized targets.
+  Measured first cut: the 「重试」 button was **42x19 px**, under half the 44px floor
+  the rest of this stylesheet uses.
+
+Measured after fixing, on Orin 5 through Playwright:
+
+| | summary row | 重试 | dropdown |
+|---|---|---|---|
+| phone 390x844, coarse | 270x**44** | 63x**44** | within viewport, full container width |
+| tablet 1024x768, coarse | 123x**59** | 63x**44** | within viewport |
+| desktop 1440x900, mouse | 141x33 | 42x19 | within viewport |
+
+`tests/test_canvas_toolbar_touch.py` asserts both conventions against the stylesheet
+itself, so the next control added to that toolbar cannot quietly repeat it. Those
+assertions were mutation-checked: putting each of the three original mistakes back
+makes them fail.
+
+#### The activity log, and what the robot *overheard*
+
+The strip at the bottom subscribes to `/ws/motus` and renders one line per event.
+Each event type gets its own branch in `web/js/activity-summary.js` — a separate,
+import-free module purely so it can be covered by `node --test`; `activity-log.js`
+itself cannot be imported there, because it pulls in `mobile.js` and from there the
+whole renderer tree and three.js.
+
+Speech the robot was addressed with has always shown up (as a `trigger`). Speech it
+merely *overheard* — `<topic>/asr_background`, the utterances with no wake word —
+**had no trace in the log at all**. Those events go to the P=0 pipeline, where a
+background subagent may be collapsed by the 1-second throttle or judged
+substance-free and never spawned at all, so the sentence existed only on DDS. A
+`👂` row is now pushed from `collector._push_asr_background` before any of that is
+decided, carrying whatever the payload actually knows — speaker, language, emotion,
+audio event — and nothing it does not.
+
+Two things about it worth keeping:
+
+- **Only ASR background events go to the activity stream, not every P=0 event.**
+  Most of P=0 is battery, temperature and IMU readings arriving every second;
+  pushing those would flush the log, and being readable at a glance is the whole
+  point of it.
+- **Both the `background` flag and the `asr_background` topic name count as
+  evidence.** The flag is written into the JSON by perception, the topic name comes
+  from the canvas wiring; the two are independent, so recognising only one of them
+  means the rows silently stop appearing when the other end changes — and "a kind
+  of thing that stopped showing up in the log" is a failure nobody reports.
 
 ### Agent Definition
 
@@ -235,6 +769,9 @@ services:
 | PR Review Agent (optional) | 25000 |
 
 Hardware driver ports are documented in [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver).
+
+Peer-to-peer collaboration adds **no new port** — peers talk to each other over the Agent Core's
+existing 15678, under `/api/peer/*`. There is nothing extra to open on a firewall.
 
 ## Container Logs
 

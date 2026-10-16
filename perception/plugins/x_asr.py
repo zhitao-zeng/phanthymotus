@@ -16,8 +16,8 @@ from pathlib import Path
 SAMPLE_RATE = 16000
 # Defaults for the bundled model. Deployments can override both values through
 # asr_beam_paths and asr_tail_pad_ms.
-TAIL_PADDING_SECONDS = 0.3
-MAX_ACTIVE_PATHS = 3
+TAIL_PADDING_SECONDS = 0.5
+MAX_ACTIVE_PATHS = 10
 HOTWORDS_SCORE = 2.5
 
 log = logging.getLogger(__name__)
@@ -242,6 +242,9 @@ class XASRAdapter:
         )
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
+        return self.transcribe_aligned(wav_bytes, language)[0]
+
+    def transcribe_aligned(self, wav_bytes: bytes, language: str) -> tuple[str, dict]:
         del language
         with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
             if wav_file.getnchannels() != 1 or wav_file.getsampwidth() != 2:
@@ -261,4 +264,7 @@ class XASRAdapter:
             stream.accept_waveform(sample_rate, samples)
             self._recognizer.decode_streams([stream])
             result = stream.result
-        return str(getattr(result, "text", result or "")).strip()
+        alignment = {'tokens': list(getattr(result, 'tokens', ()) or ()),
+                     'timestamps': list(getattr(result, 'timestamps', ()) or ()),
+                     'duration_s': sample_count / sample_rate}
+        return str(getattr(result, "text", result or "")).strip(), alignment
