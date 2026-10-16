@@ -128,8 +128,10 @@ class IcefallMultilingualASRAdapter:
             manifest = json.loads((self._root / "manifest.json").read_text())
             models = manifest["languages"]
             for language, model in models.items():
-                keys = ("encoder", "decoder", "joiner", "tokens") if model["type"] == "transducer" else ("model", "tokens")
-                if model["type"] not in ("transducer", "paraformer"):
+                keys = ("encoder", "decoder", "joiner", "tokens") if model["type"] in ("transducer", "x-asr") else ("model", "tokens")
+                if model["type"] == "x-asr":
+                    keys += ("bpe_model", "bpe_vocab", "hotwords", "hotwords_bpe", "prefix_lm")
+                if model["type"] not in ("transducer", "paraformer", "x-asr"):
                     raise ValueError("Unsupported recognizer type for " + language)
                 for key in keys:
                     path = self._root / model[key]
@@ -145,6 +147,17 @@ class IcefallMultilingualASRAdapter:
         import sherpa_onnx
 
         spec = self._models[language]
+        if spec["type"] == "x-asr":
+            from plugins.x_asr import XASRAdapter
+
+            return XASRAdapter(
+                str((self._root / spec["tokens"]).parent), "cpu", self._num_threads,
+                max_active_paths=spec["max_active_paths"],
+                tail_padding_seconds=spec.get("tail_pad_ms", 300) / 1000.0,
+                prefix_lm_path=str(self._root / spec["prefix_lm"]),
+                prefix_lm_scale=spec["prefix_lm_scale"],
+                entity_boost=spec["entity_boost"],
+            )
         options = dict(num_threads=self._num_threads, provider="cpu")
         tokens = str(self._root / spec["tokens"])
         if spec["type"] == "paraformer":
@@ -183,6 +196,8 @@ class IcefallMultilingualASRAdapter:
                 log.info("[asr] active language=%s, provider=cpu", detected)
             self.last_language = detected
             self.last_language_probability = probability
+            if self._models[detected]["type"] == "x-asr":
+                return self._recognizer.transcribe(wav_bytes, "zh-CN")
             samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
             padding = int(self._models[detected].get("tail_pad_ms", 300)) * 16
             if padding:

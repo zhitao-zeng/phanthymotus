@@ -211,6 +211,29 @@ class RoutingTests(unittest.TestCase):
         finally:
             identifier.close()
 
+    def test_chinese_uses_the_original_xasr_delegate_and_decoder_configuration(self):
+        manifest = json.loads((self.root / "manifest.json").read_text())
+        chinese = {"type": "x-asr", "max_active_paths": 3, "tail_pad_ms": 300,
+                   "prefix_lm_scale": 0.05, "entity_boost": {"万神殿": 4.0}}
+        for key in ("encoder", "decoder", "joiner", "tokens", "bpe_model", "bpe_vocab",
+                    "hotwords", "hotwords_bpe", "prefix_lm"):
+            chinese[key] = "zh/" + key
+            (self.root / chinese[key]).write_bytes(b"test")
+        manifest["languages"]["zh"] = chinese
+        (self.root / "manifest.json").write_text(json.dumps(manifest))
+        self.loader.stop()
+        FakeIdentifier.selected = "zh"
+        delegate = mock.Mock()
+        delegate.transcribe.return_value = "中文识别结果"
+        with mock.patch("plugins.x_asr.XASRAdapter", return_value=delegate) as constructor:
+            self.assertEqual(self.adapter.transcribe(wav(), "zh-CN"), "中文识别结果")
+        self.assertEqual(constructor.call_args.args[:2], (str(self.root / "zh"), "cpu"))
+        self.assertEqual(constructor.call_args.kwargs["max_active_paths"], 3)
+        self.assertEqual(constructor.call_args.kwargs["prefix_lm_scale"], 0.05)
+        self.assertEqual(constructor.call_args.kwargs["entity_boost"], {"万神殿": 4.0})
+        delegate.transcribe.assert_called_once_with(wav(), "zh-CN")
+        self.loader.start()
+
 
 class ModelReleaseTests(unittest.TestCase):
     def setUp(self):
