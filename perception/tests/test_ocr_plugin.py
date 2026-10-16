@@ -127,7 +127,8 @@ def test_ocr_latest_frame_wins(ocr):
     time.sleep(0.2)
     assert adapter.seen == [b"f0", b"f5"], adapter.seen
     payload = json.loads(node.publishers[0].messages[-1])
-    assert payload["text"] == "f5"
+    assert payload["items"][0]["text"] == "f5"
+    assert "“f5”" in payload["text"]
 
 
 def test_ocr_stop_wakes_worker_promptly(ocr):
@@ -396,13 +397,14 @@ def test_ocr_payload_carries_size_and_hierarchy():
     assert heights == [80, 40, 30, 20]
     assert payload["items"][0]["prominence"] == 1.0
     assert payload["items"][3]["prominence"] == 0.25
-    # 同一水平带的两段并入一行，text 按行拼接
+    # line 仍记录同一水平带；text 现在提供区域描述。
     lines = [item["line"] for item in payload["items"]]
     assert lines == [0, 1, 1, 2]
-    assert payload["text"] == "大标题\n左栏 右栏\n小字注脚"
+    assert all(f"“{item['text']}”" in payload["text"] for item in items)
+    assert "画面" in payload["text"]
 
 
-def test_ocr_payload_line_join_sorts_left_to_right():
+def test_ocr_payload_without_frame_dimensions_preserves_all_text():
     from plugins.ocr_runtime import build_ocr_payload
 
     items = [
@@ -410,7 +412,8 @@ def test_ocr_payload_line_join_sorts_left_to_right():
         {"text": "first", "bbox": [10, 12, 120, 48], "score": 0.9},
     ]
     payload = build_ocr_payload(items, 0.0, "en")
-    assert payload["text"] == "first second"
+    assert "“first”" in payload["text"] and "“second”" in payload["text"]
+    assert "画面偏左" not in payload["text"] and "画面偏右" not in payload["text"]
     assert "image_size" not in payload
 
 
@@ -418,7 +421,7 @@ def test_ocr_payload_empty_and_error():
     from plugins.ocr_runtime import build_ocr_payload
 
     payload = build_ocr_payload([], 0.0, "zh", error=RuntimeError("boom"))
-    assert payload["text"] == "" and payload["items"] == []
+    assert payload["text"] == "文字识别失败，暂时无法生成描述。" and payload["items"] == []
     assert payload["error"] == "boom"
 
 
@@ -584,6 +587,7 @@ def test_recognize_by_photo_loads_the_adapter_on_demand(monkeypatch, tmp_path):
     # The stubbed adapter echoes the bytes back as the recognised text, so this
     # also proves the image reached it intact.
     assert result["items"][0]["text"] == "hello-world"
+    assert "“hello-world”" in result["text"]
     assert executor.nodes == []          # nothing was started
     assert builder.calls == 1
 

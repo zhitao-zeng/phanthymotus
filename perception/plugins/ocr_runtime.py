@@ -8,6 +8,7 @@ from io import BytesIO
 from pathlib import Path
 
 from plugins.ocr_preprocess import preprocess_for_ocr
+from plugins.ocr_summary import build_ocr_summary
 from utils.tensorrt_runtime import TensorRTEngine
 
 _log = logging.getLogger(__name__)
@@ -157,17 +158,23 @@ def decode_vips_overview(image_bytes: bytes, max_side: int):
     return np.ascontiguousarray(rgb[:, :, ::-1], dtype=np.uint8)
 
 
-def probe_image_header(image_bytes: bytes) -> tuple[int, int]:
+def probe_image_info(image_bytes: bytes) -> tuple[int, int, int]:
     try:
         from PIL import Image
 
         with Image.open(BytesIO(image_bytes)) as image:
             width, height = image.size
+            orientation = image.getexif().get(274, 1)
     except Exception as exc:
         raise ValueError("invalid or unsupported compressed image header") from exc
 
     if width <= 0 or height <= 0:
         raise ValueError("compressed image has invalid dimensions")
+    return width, height, orientation if orientation in range(1, 9) else 1
+
+
+def probe_image_header(image_bytes: bytes) -> tuple[int, int]:
+    width, height, _orientation = probe_image_info(image_bytes)
     return width, height
 
 
@@ -225,38 +232,32 @@ def annotate_ocr_items(items: list[dict]) -> list[dict]:
 
 
 def build_ocr_payload(
-    results, timestamp, language, error=None, image_size=None
+    results, timestamp, language, error=None, image_size=None, image_orientation=1
 ) -> dict:
     """Assemble the published OCR result.
 
-    ``text`` joins recognized fragments per visual line (left-to-right)
-    with newlines between lines; ``items`` carry bbox (source-pixel
+    ``text`` describes the text layout and content using fixed templates,
+    without detected screen outlines or a language model. ``items`` carry
+    the unchanged OCR text, bbox (source-pixel
     [x1,y1,x2,y2]), score, height, prominence and line so consumers can
     reason about size and importance; ``image_size`` ([width, height]) is
-    the coordinate reference frame for every bbox.
+    the coordinate reference frame for every bbox. Description positions follow
+    display orientation; item coordinates stay in stored image pixels.
     """
     items = annotate_ocr_items(results)
-    lines: dict[int, list[dict]] = {}
-    for item in items:
-        if item.get("text"):
-            lines.setdefault(item["line"], []).append(item)
-    text = "\n".join(
-        " ".join(
-            item["text"]
-            for item in sorted(members, key=lambda entry: entry["bbox"][0])
-        )
-        for _line, members in sorted(lines.items())
-    )
     payload = {
-        "text": text,
+        "text": build_ocr_summary(items, image_size, image_orientation),
         "items": items,
         "timestamp": timestamp,
         "language": language,
     }
     if image_size is not None:
         payload["image_size"] = [int(image_size[0]), int(image_size[1])]
+        if image_orientation != 1:
+            payload["image_orientation"] = image_orientation
     if error is not None:
         payload["error"] = str(error)
+        payload["text"] = "文字识别失败，暂时无法生成描述。"
     return payload
 
 
@@ -265,12 +266,14 @@ def recognize_to_payload(
 ) -> dict:
     try:
         items = adapter.recognize(image_bytes, language)
+        image_orientation = 1
         try:
-            image_size = probe_image_header(image_bytes)
+            width, height, image_orientation = probe_image_info(image_bytes)
+            image_size = width, height
         except ValueError:
             image_size = None
         return build_ocr_payload(
-            items, timestamp, language, image_size=image_size
+            items, timestamp, language, image_size=image_size, image_orientation=image_orientation
         )
     except Exception as exc:
         return build_ocr_payload([], timestamp, language, error=exc)
