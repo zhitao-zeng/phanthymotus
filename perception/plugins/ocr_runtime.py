@@ -8,6 +8,7 @@ from io import BytesIO
 from pathlib import Path
 
 from plugins.ocr_preprocess import preprocess_for_ocr
+from plugins.ocr_summary import build_ocr_summary
 
 _log = logging.getLogger(__name__)
 
@@ -185,15 +186,20 @@ def scale_ocr_items(
     return scaled_items
 
 
-def build_ocr_payload(results, timestamp, language, error=None) -> dict:
+def build_ocr_payload(
+    results, timestamp, language, error=None, image_size=None
+) -> dict:
     payload = {
-        "text": " ".join(item["text"] for item in results if item.get("text")),
+        "text": build_ocr_summary(results, image_size),
         "items": results,
         "timestamp": timestamp,
         "language": language,
     }
+    if image_size is not None:
+        payload["image_size"] = [int(image_size[0]), int(image_size[1])]
     if error is not None:
         payload["error"] = str(error)
+        payload["text"] = "文字识别失败，暂时无法生成描述。"
     return payload
 
 
@@ -201,8 +207,16 @@ def recognize_to_payload(
     adapter, image_bytes: bytes, language: str, timestamp: float
 ) -> dict:
     try:
+        items = adapter.recognize(image_bytes, language)
+        try:
+            image_size = probe_image_header(image_bytes)
+        except ValueError:
+            image_size = None
+        # The adapter applies EXIF during decode, then scales boxes to the
+        # header dimensions. Describe that existing coordinate frame directly;
+        # applying EXIF again here would rotate already-oriented observations.
         return build_ocr_payload(
-            adapter.recognize(image_bytes, language), timestamp, language
+            items, timestamp, language, image_size=image_size
         )
     except Exception as exc:
         return build_ocr_payload([], timestamp, language, error=exc)

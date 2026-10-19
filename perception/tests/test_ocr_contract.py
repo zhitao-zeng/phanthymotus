@@ -894,7 +894,7 @@ class OCRContractTest(unittest.TestCase):
         self.assertEqual(
             payload,
             {
-                "text": "",
+                "text": "文字识别失败，暂时无法生成描述。",
                 "items": [],
                 "error": "invalid image",
                 "timestamp": 123.0,
@@ -1206,6 +1206,45 @@ class OCRContractTest(unittest.TestCase):
         self.assertIs(plugin._nodes["/camera"], node)
         self.assertEqual(node.start.call_count, 250)
         self.assertEqual(node.stop.call_count, 250)
+
+    def test_rule_description_survives_config_start_image_stop_cycles(self):
+        from io import BytesIO
+        from PIL import Image
+
+        raw_items = [{"text": "方向测试", "bbox": [2, 2, 20, 10], "score": 0.99}]
+        adapter = mock.Mock()
+        adapter.recognize.return_value = raw_items
+        image = BytesIO()
+        Image.new("RGB", (60, 30), "white").save(image, format="PNG")
+        executor = mock.Mock()
+        with mock.patch("plugins.ocr._build_ocr_adapter", return_value=adapter) as build:
+            plugin = self.ocr.OCRPlugin({"provider": "rapidocr"}, executor)
+            first_node = None
+            try:
+                for count in range(1, 4):
+                    plugin.dispatch("ocr", {"action": "config", "language": "zh"})
+                    plugin.dispatch("ocr", {"action": "start", "input_topic": "/camera"})
+                    node = plugin._nodes["/camera"]
+                    if first_node is None:
+                        first_node = node
+                    self.assertIs(node, first_node)
+                    node._image_cb(types.SimpleNamespace(data=image.getvalue()))
+                    deadline = time.monotonic() + 2.0
+                    while node._pub.publish.call_count < count and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertEqual(node._pub.publish.call_count, count)
+                    payload = json.loads(node._pub.publish.call_args.args[0].data)
+                    self.assertEqual(payload["items"], raw_items)
+                    self.assertEqual(payload["image_size"], [60, 30])
+                    self.assertIn("“方向测试”", payload["text"])
+                    self.assertIn("画面", payload["text"])
+                    plugin.dispatch("ocr", {"action": "stop"})
+                    self.assertFalse(node.worker_alive)
+                build.assert_called_once()
+                executor.add_node.assert_called_once_with(first_node)
+                executor.remove_node.assert_not_called()
+            finally:
+                plugin.dispatch("ocr", {"action": "stop"})
 
     def test_concurrent_starts_create_one_ocr_node(self):
         executor = mock.Mock()
