@@ -15,6 +15,9 @@ _NUMBER_TEXT = re.compile(
     r"[¥$€£]?[+-]?[0-9OoIlLSsBZbz][0-9OoIlLSsBZbz,.]*(?:[x×]\d+)?"
     r"(?:万|千|亿)?(?:%|\+|元|人|家|项|次|台|个|年|月|天|米|秒|kg|km|cm|mm|m|g)?[↑↓]?"
 )
+_DATE_TEXT = re.compile(
+    r"((?:19|20)\d{2})(?:[./-](\d{1,2})(?:[./-](\d{1,2}))?|H([12]))?"
+)
 
 
 def _reading_order(item):
@@ -102,7 +105,199 @@ def _title_candidates(members):
     return [item for item in upper if _font_size(item) >= .8 * largest]
 
 
+def _bounds(members):
+    return [min(item["bbox"][0] for item in members),
+            min(item["bbox"][1] for item in members),
+            max(item["bbox"][2] for item in members),
+            max(item["bbox"][3] for item in members)]
+
+
+def _date_key(item):
+    text = unicodedata.normalize("NFKC", item["text"]).strip()
+    match = _DATE_TEXT.fullmatch(text)
+    if not match:
+        return None
+    year, month, day, half = match.groups()
+    if (month and not 1 <= int(month) <= 12) or (day and not 1 <= int(day) <= 31):
+        return None
+    return int(year), int(month or (int(half) * 6 if half else 0)), int(day or 0)
+
+
+def _vertical_blocks(members):
+    """Keep nearby, aligned lines together without bridging adjacent columns.
+
+    Each observation can have one predecessor and one successor. A wide line
+    cannot join several columns through overlapping text boxes.
+    """
+    ordered = sorted(members, key=_reading_order)
+    edges = []
+    for lower_index, lower in enumerate(ordered):
+        lx1, ly1, lx2, ly2 = lower["bbox"]
+        for upper_index, upper in enumerate(ordered[:lower_index]):
+            ux1, uy1, ux2, uy2 = upper["bbox"]
+            scale = max(1, min(ly2 - ly1, uy2 - uy1))
+            if (ly1 + ly2 - uy1 - uy2) / 2 < .4 * scale:
+                continue
+            gap = ly1 - uy2
+            if gap > scale or min(ly2, uy2) - max(ly1, uy1) > .65 * scale:
+                continue
+            left_offset = abs(lx1 - ux1)
+            center_offset = abs(lx1 + lx2 - ux1 - ux2) / 2
+            width_ratio = max(lx2 - lx1, ux2 - ux1) / max(1, min(lx2 - lx1, ux2 - ux1))
+            if left_offset > .75 * scale and not (width_ratio < 1.5 and center_offset < .5 * scale):
+                continue
+            edges.append((max(0, gap) + 2 * min(left_offset, center_offset), upper_index, lower_index))
+    successor, predecessor = {}, {}
+    for _distance, upper, lower in sorted(edges):
+        if upper not in successor and lower not in predecessor:
+            successor[upper] = lower
+            predecessor[lower] = upper
+    blocks = []
+    for index in range(len(ordered)):
+        if index in predecessor:
+            continue
+        chain = [ordered[index]]
+        while index in successor:
+            index = successor[index]
+            chain.append(ordered[index])
+        blocks.append(chain)
+    return blocks
+
+
+def _dated_blocks(members):
+    """Organize date markers and unambiguous aligned text, without filling gaps.
+
+    Association describes geometry only. Text above a marker, between equally
+    plausible columns, or beyond the next marker in that column stays separate.
+    """
+    anchors = [item for item in members if _date_key(item) is not None]
+    if len({_date_key(item) for item in anchors}) < 4:
+        return None
+    x1, _y1, x2, _y2 = _bounds(members)
+    if max(item["bbox"][0] for item in anchors) - min(item["bbox"][0] for item in anchors) < .4 * (x2 - x1):
+        return None
+    groups = [[anchor] for anchor in anchors]
+    remaining = []
+    for item in sorted(members, key=_reading_order):
+        if any(item is anchor for anchor in anchors):
+            continue
+        bx1, by1, bx2, by2 = item["bbox"]
+        candidates = []
+        for index, anchor in enumerate(anchors):
+            ax1, ay1, ax2, ay2 = anchor["bbox"]
+            scale = max(1, ay2 - ay1)
+            offset = abs(bx1 - ax1)
+            if offset > max(1.4 * scale, .5 * (ax2 - ax1)):
+                continue
+            previous_bottom = max(member["bbox"][3] for member in groups[index])
+            if (by1 + by2) / 2 <= (ay1 + ay2) / 2 or by1 - previous_bottom > 6 * scale:
+                continue
+            following = [other["bbox"][1] for other in anchors
+                         if other["bbox"][1] > ay1 and abs(other["bbox"][0] - ax1) <= max(1.4 * scale, .5 * (ax2 - ax1))]
+            if following and by1 >= min(following):
+                continue
+            candidates.append((offset + .15 * max(0, by1 - ay2), index))
+        candidates.sort()
+        if not candidates or (len(candidates) > 1 and candidates[1][0] - candidates[0][0] < .5 * max(1, by2 - by1)):
+            remaining.append(item)
+        else:
+            groups[candidates[0][1]].append(item)
+    groups.sort(key=lambda group: (_date_key(group[0]), _reading_order(group[0])))
+    return groups, remaining
+
+
+def _local_position(box, bounds):
+    x1, y1, x2, y2 = bounds
+    x = ((box[0] + box[2]) / 2 - x1) / max(1, x2 - x1)
+    y = ((box[1] + box[3]) / 2 - y1) / max(1, y2 - y1)
+    return (0 if x < 1 / 3 else 2 if x > 2 / 3 else 1,
+            0 if y < 1 / 3 else 2 if y > 2 / 3 else 1)
+
+
+def _numeric_observation(item):
+    text = unicodedata.normalize("NFKC", item["text"]).replace(" ", "").strip("()")
+    return bool(_NUMBER_TEXT.fullmatch(text))
+
+
+def _local_layout(members):
+    bounds = _bounds(members)
+    typical = median(_font_size(item) for item in members)
+    prominent = [item for item in members
+                 if _date_key(item) is None
+                 and not _numeric_observation(item)
+                 and _font_size(item) >= 1.35 * typical
+                 and item["bbox"][2] - item["bbox"][0] >= .35 * (bounds[2] - bounds[0])]
+    body = [item for item in members if not any(item is title for title in prominent)]
+    # A dense numeric table needs row/column matching. Merely listing its
+    # numeric columns separately loses useful row context; keep the fallback.
+    numeric = sum(_numeric_observation(item) for item in body)
+    if body and numeric >= len(body) / 2:
+        return None
+    blocks = _vertical_blocks(body)
+    # Refine only genuinely two-dimensional groups. Ordinary paragraphs and
+    # small title/body groups retain their existing concise presentation.
+    columns = {_local_position(_bounds(block), bounds)[0] for block in blocks}
+    if len(blocks) < 3 or len(columns) < 2:
+        return None
+    parallel = False
+    for index, block in enumerate(blocks):
+        first = _bounds(block)
+        for other in blocks[index + 1:]:
+            second = _bounds(other)
+            if _local_position(first, bounds)[0] == _local_position(second, bounds)[0]:
+                continue
+            horizontal_overlap = min(first[2], second[2]) - max(first[0], second[0])
+            if horizontal_overlap > .3 * min(first[2] - first[0], second[2] - second[0]):
+                continue
+            overlap = min(first[3], second[3]) - max(first[1], second[1])
+            if overlap > .3 * min(first[3] - first[1], second[3] - second[1]):
+                parallel = True
+                break
+        if parallel:
+            break
+    if not parallel:
+        return None
+    return bounds, prominent, blocks
+
+
+def _describe_local_layout(layout):
+    bounds, prominent, blocks = layout
+    clauses = []
+    for title in sorted(prominent, key=_reading_order):
+        vertical = _local_position(title["bbox"], bounds)[1]
+        where = ["上方", "中部", "下方"][vertical]
+        clauses.append(f"组内{where}醒目文字为{_quotes([title])}")
+    for column, label in enumerate(["偏左", "中间", "偏右"]):
+        located = [block for block in blocks if _local_position(_bounds(block), bounds)[0] == column]
+        if not located:
+            continue
+        located.sort(key=lambda block: _reading_order({"bbox": _bounds(block), "text": ""}))
+        entries = []
+        for block in located:
+            vertical = _local_position(_bounds(block), bounds)[1]
+            entries.append(f"{['上部', '中部', '下部'][vertical]}文字块为{_quotes(block)}")
+        clauses.append(f"组内{label}，从上到下：" + "；".join(entries))
+    return "；".join(clauses)
+
+
 def _describe_group(members):
+    dated = _dated_blocks(members)
+    if dated is not None:
+        groups, remaining = dated
+        clauses = []
+        for group in groups:
+            clause = _quotes(group[:1])
+            if len(group) > 1:
+                clause += f"，同列下方原文为{_quotes(group[1:])}"
+            clauses.append(clause)
+        result = "日期文字按年月顺序整理（附近原文仅按位置归组）：" + "；".join(clauses)
+        if remaining:
+            layout = _local_layout(remaining)
+            result += "；其余文字另列：" + (_describe_local_layout(layout) if layout else _quotes(remaining))
+        return result
+    layout = _local_layout(members)
+    if layout is not None:
+        return _describe_local_layout(layout)
     members = _unique_items(members)
     titles = _title_candidates(members)
     if not titles:
