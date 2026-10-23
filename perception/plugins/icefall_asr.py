@@ -16,6 +16,8 @@ import threading
 import time
 import wave
 
+from plugins.numeric_dictation import normalize_long_numeric_dictation
+
 log = logging.getLogger(__name__)
 
 
@@ -207,7 +209,8 @@ class IcefallMultilingualASRAdapter:
             self.last_language = detected
             self.last_language_probability = probability
             if self._models[detected]["type"] == "x-asr":
-                return self._recognizer.transcribe(wav_bytes, "zh-CN")
+                return normalize_long_numeric_dictation(
+                    self._recognizer.transcribe(wav_bytes, "zh-CN"), detected)
             samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
             padding = int(self._models[detected].get("tail_pad_ms", 300)) * 16
             if padding:
@@ -215,7 +218,7 @@ class IcefallMultilingualASRAdapter:
             stream = self._recognizer.create_stream()
             stream.accept_waveform(16000, samples)
             self._recognizer.decode_stream(stream)
-            return stream.result.text.strip()
+            return normalize_long_numeric_dictation(stream.result.text.strip(), detected)
 
     def transcribe_rich(self, wav_bytes, language="auto", include_emotion=False):
         return self.transcribe(wav_bytes, language), {}
