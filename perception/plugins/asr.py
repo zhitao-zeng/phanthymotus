@@ -1329,7 +1329,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 stop_evt: multiprocessing.Event,
                 backend: str, threshold: float, silence_ms: int,
                 save_vad_segments: bool = False, max_saved_segments: int = 1000,
-                pre_roll_ms: int = 500, log_level: int = logging.INFO):
+                pre_roll_ms: int = 500, log_level: int = logging.INFO,
+                recover_quiet: bool = False):
     """Runs in a child process — sherpa-onnx ONNX VAD.
 
     Pipeline: Audio → VAD → utterance output. Every completed utterance is
@@ -1389,6 +1390,12 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         vad_config, buffer_size_in_seconds=VAD_BUFFER_S)
     pre_roll_samples = max(0, int(SAMPLE_RATE * pre_roll_ms / 1000))
     silence_samples = max(0, int(SAMPLE_RATE * silence_ms / 1000))
+    endpoint = None
+    if recover_quiet:
+        from plugins.vad_recovery import QuietEndpointer
+        endpoint = QuietEndpointer(SAMPLE_RATE, silence_samples)
+    vad_sample_offset = 0
+    pending_hearing = False
     # One second past the longest segment the VAD can hand us, so pre_roll()
     # can still address the samples just before a maximum-length segment.
     pcm_history = PcmHistory(SAMPLE_RATE * (VAD_BUFFER_S + 1))
@@ -1498,13 +1505,25 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         capture_history.append((chunk_start, pcm_history.total_samples, capture_trusted))
         while capture_history and capture_history[0][1] <= pcm_history.start_sample:
             capture_history.popleft()
+        if endpoint is not None:
+            endpoint.observe(float_samples)
         vad.accept_waveform(float_samples)
 
         # Detect speech onset → notify main thread for on_hearing hook
         _is_speaking = vad.is_speech_detected()
         if _is_speaking and not _was_speaking:
+            if endpoint is not None:
+                endpoint.begin()
+            pending_hearing = endpoint is not None and endpoint.quiet
+            if not pending_hearing:
+                result_q.put(("speech_start", ts, ts))
+        elif _is_speaking and pending_hearing and endpoint is not None and not endpoint.quiet:
             result_q.put(("speech_start", ts, ts))
+            pending_hearing = False
         _was_speaking = _is_speaking
+        forced_endpoint = endpoint is not None and endpoint.ready() and _is_speaking
+        if forced_endpoint:
+            vad.flush()
 
         # Collect completed VAD segments.
         # The VAD only reports a segment after min_silence_duration of
@@ -1516,7 +1535,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         # PcmHistory.pre_roll() rewinds by silence_samples to locate the
         # segment start in the sample domain.
         chunk_end_ts = ts + n / SAMPLE_RATE if len(audio_item) > 2 and capture_trusted else ts
-        seg_end_ts = chunk_end_ts - silence_samples / SAMPLE_RATE
+        seg_end_ts = chunk_end_ts if forced_endpoint else chunk_end_ts - silence_samples / SAMPLE_RATE
         while not vad.empty():
             seg = vad.front
             seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
@@ -1524,6 +1543,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             segment_start = getattr(seg, 'start', None)
             if segment_start is None:
                 segment_start = max(0, pcm_history.total_samples - len(seg.samples) - silence_samples)
+            else:
+                segment_start += vad_sample_offset
             segment_end = segment_start + len(seg.samples)
             # VAD reports speech after it has heard enough samples. Use the
             # completed segment's range so early speech counts too. The current
@@ -1537,7 +1558,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             # otherwise be re-stamped.
             if start_ts is None:
                 pre_pcm = pcm_history.pre_roll(
-                    getattr(seg, 'start', None),
+                    segment_start,
                     len(seg.samples),
                     pre_roll_samples,
                     silence_samples,
@@ -1571,16 +1592,28 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 # 必须从这里传出去：speech_buf 是 pre_pcm + seg_pcm 拼好的，
                 # 父进程看不出边界在哪。不传的话，调 vad_pre_roll_ms 会改变声纹
                 # 识别率，而没有人会想到去那里找。
-                result_q.put((speech_buf,
-                              seg_end_ts if start_ts is None else start_ts,
-                              seg_end_ts if end_ts is None else end_ts,
-                              utterance_pre_roll_bytes,
-                              utterance_capture_trusted))
+                packet = (speech_buf,
+                          seg_end_ts if start_ts is None else start_ts,
+                          seg_end_ts if end_ts is None else end_ts,
+                          utterance_pre_roll_bytes, utterance_capture_trusted)
+                if forced_endpoint or pending_hearing:
+                    packet += ('quiet_flush' if forced_endpoint else 'quiet_primary',)
+                result_q.put(packet)
+                pending_hearing = False
                 speech_buf = b''
                 start_ts = None
                 end_ts = None
                 utterance_pre_roll_bytes = 0
                 utterance_capture_trusted = True
+
+        if forced_endpoint:
+            # Flush releases the segment but does not reset Silero's recurrent
+            # speech state. Reset it after draining, retaining absolute offsets.
+            vad.reset()
+            vad_sample_offset = pcm_history.total_samples
+            _was_speaking = False
+        if endpoint is not None and not vad.is_speech_detected():
+            endpoint.end()
 
     _log.info("[vad-worker] process exiting")
 
@@ -1697,12 +1730,13 @@ class _ASRNode(Node):
         self._pcm_queue = context.Queue(maxsize=1000)
         self._utterance_queue = context.Queue(maxsize=100)
         self._vad_stop = context.Event()
+        recover_quiet = callable(getattr(self._adapter, 'transcribe_recovered', None))
         self._vad_proc = context.Process(
             target=_vad_worker,
             args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
                   self._vad_backend, self._vad_threshold, self._vad_silence_ms,
                   self._save_vad_segments, self._max_saved_segments,
-                  self._vad_pre_roll_ms, log.getEffectiveLevel()),
+                  self._vad_pre_roll_ms, log.getEffectiveLevel(), recover_quiet),
             daemon=True, name="vad_worker",
         )
         self._vad_proc.start()
@@ -1852,16 +1886,22 @@ class _ASRNode(Node):
         if ts < 1e9:  # header.stamp not set by publisher
             ts = time.time()
         converted = getattr(self, '_audio_container_decoded', False)
+        timing_pcm_length = len(pcm)
         # Silero consumes 512-sample windows. Preserve that granularity for a
         # recovered file and drain with backpressure, rather than dropping the
         # second half when a minute of audio fills the live-input queue.
         if converted:
-            flush_ms = max(0, int(getattr(self, '_vad_silence_ms', 400))) + 100
+            silence_ms = max(0, int(getattr(self, '_vad_silence_ms', 400)))
+            # Preserve the established untrusted timing anchor of decoded
+            # speech; extra synthetic silence must not shift the speech earlier.
+            timing_pcm_length += (silence_ms + 100) * SAMPLE_RATE // 1000 * 2
+            quiet_capable = callable(getattr(getattr(self, '_adapter', None), 'transcribe_recovered', None))
+            flush_ms = silence_ms * (2 if quiet_capable else 1) + 100
             pcm += b'\0' * (flush_ms * SAMPLE_RATE // 1000 * 2)
         step = 1024 if converted else len(pcm)
         for offset in range(0, len(pcm), step):
             chunk = pcm[offset:offset + step]
-            chunk_ts = ts - (len(pcm) - offset - len(chunk)) / (SAMPLE_RATE * 2) if converted else ts
+            chunk_ts = ts - (timing_pcm_length - offset - len(chunk)) / (SAMPLE_RATE * 2) if converted else ts
             trusted = msg.header.stamp.sec >= 1_000_000_000 and not converted
             try:
                 if converted:
@@ -2028,6 +2068,21 @@ class _ASRNode(Node):
             self.state = "error"
             self._worker_ready.set()
 
+    def _fire_hearing_hook(self):
+        try:
+            import urllib.request as _urllib_req
+            import ssl as _ssl
+            request = _urllib_req.Request(
+                os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/") + "/api/hooks/fire",
+                data=json.dumps({"hook": "on_hearing"}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            context = _ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = _ssl.CERT_NONE
+            _urllib_req.urlopen(request, timeout=2, context=context)
+        except Exception as error:
+            log.debug("[asr] fire on_hearing failed: %s", error)
+
     def _worker_inner(self):
         # Pre-compute keyword IPA if in asr_kws mode
         _kws_triggered = False  # track whether current utterance was KWS-triggered
@@ -2052,22 +2107,7 @@ class _ASRNode(Node):
                 item = self._utterance_queue.get(timeout=1)
                 # Handle speech onset signal from VAD worker
                 if len(item) >= 2 and item[0] == "speech_start":
-                    try:
-                        import urllib.request as _urllib_req
-                        import json as _json_hook
-                        _hook_req = _urllib_req.Request(
-                            os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/") + "/api/hooks/fire",
-                            data=_json_hook.dumps({"hook": "on_hearing"}).encode(),
-                            headers={"Content-Type": "application/json"},
-                            method="POST"
-                        )
-                        import ssl as _ssl
-                        _ctx = _ssl.create_default_context()
-                        _ctx.check_hostname = False
-                        _ctx.verify_mode = _ssl.CERT_NONE
-                        _urllib_req.urlopen(_hook_req, timeout=2, context=_ctx)
-                    except Exception as _he:
-                        log.debug(f"[asr] fire on_hearing failed: {_he}")
+                    self._fire_hearing_hook()
                     continue
                 utterance, start_ts, end_ts = item[:3]
                 # Fourth element since speaker recognition: how many leading
@@ -2076,6 +2116,8 @@ class _ASRNode(Node):
                 # degrades to "no pre-roll known" instead of raising.
                 pre_roll_bytes = int(item[3]) if len(item) > 3 else 0
                 trusted_audio = bool(item[4]) if len(item) > 4 else False
+                packet_kind = item[5] if len(item) > 5 else None
+                quiet_packet = packet_kind in ('quiet_flush', 'quiet_primary')
                 with self._direction_lock:
                     windows = list(self._direction_windows)
             except Exception:
@@ -2095,11 +2137,18 @@ class _ASRNode(Node):
                 #
                 # 并行只比 max(两者) 高 2-7 ms，即几乎完全重叠：sherpa 在推理里
                 # 放了 GIL，6 核跑 2+2 线程在 vop/OCR/TTS 都在的情况下仍有余量。
-                _identity = self._start_identify(utterance, pre_roll_bytes)
+                _identity = None if quiet_packet else self._start_identify(utterance, pre_roll_bytes)
                 _t0 = time.time()
                 alignment = None
                 aligned_transcribe = getattr(self._adapter, 'transcribe_aligned', None)
-                if self._direction_topic and callable(aligned_transcribe):
+                if packet_kind == 'quiet_flush':
+                    confirmed_transcribe = getattr(self._adapter, 'transcribe_recovered', None)
+                    if not callable(confirmed_transcribe):
+                        log.warning("[asr] adapter cannot confirm a quiet endpoint; retaining normal VAD")
+                        continue
+                    text = confirmed_transcribe(wav, self._language)
+                    _audio_tags = {}
+                elif self._direction_topic and callable(aligned_transcribe):
                     text, _audio_tags, alignment = aligned_transcribe(
                         wav, self._language, self._emit_emotion)
                     if not self._emit_audio_tags:
@@ -2110,6 +2159,11 @@ class _ASRNode(Node):
                 else:
                     text = self._adapter.transcribe(wav, self._language)
                     _audio_tags = {}
+                if quiet_packet:
+                    if not any(character.isalnum() for character in text):
+                        continue
+                    self._fire_hearing_hook()
+                    _identity = self._start_identify(utterance, pre_roll_bytes)
                 _spans.append({"span": "asr_transcribe", "component": "perception",
                                "start_ts": _t0, "end_ts": time.time(),
                                "meta": {"audio_ms": int(len(utterance) / 32)}})

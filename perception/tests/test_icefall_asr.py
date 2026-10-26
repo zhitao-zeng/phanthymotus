@@ -118,11 +118,44 @@ class RoutingTests(unittest.TestCase):
         FakeIdentifier.selected = "ja"
         self.assertEqual(self.adapter.transcribe_rich(wav(), "zh-CN", True), ("ja", {}))
 
+    def test_recovered_audio_needs_confident_language_before_loading_asr(self):
+        self.adapter.prepare()
+        with mock.patch.object(self.adapter._identifier, "identify", return_value=("en", 0.4)):
+            self.assertEqual(self.adapter.transcribe_recovered(wav(), "zh-CN"), "")
+            self.assertEqual(self.loaded, [])
+            self.assertEqual(self.adapter.transcribe(wav(), "zh-CN"), "en")
+
+    def test_confident_recovery_keeps_existing_language_and_decode_contract(self):
+        FakeIdentifier.selected = "ja"
+        self.assertEqual(self.adapter.transcribe_recovered(wav(), "zh-CN"), "ja")
+        self.assertEqual(self.loaded, ["ja"])
+
     def test_prepare_checks_assets_before_input(self):
         (self.root / "ja/encoder.onnx").unlink()
         with self.assertRaisesRegex(FileNotFoundError, "ja/encoder.onnx"):
             self.adapter.prepare()
         self.assertEqual(self.loaded, [])
+
+    def test_optional_verifier_is_passed_only_when_present(self):
+        manifest = json.loads((self.root / "manifest.json").read_text())
+        manifest["language_id"]["verification_model"] = "verification.bin"
+        (self.root / "manifest.json").write_text(json.dumps(manifest))
+        (self.root / "verification.bin").write_bytes(b"test")
+        with mock.patch.object(icefall_asr, "_LanguageIdentifier", return_value=FakeIdentifier()) as factory:
+            self.adapter.prepare()
+        factory.assert_called_once_with(
+            self.root / "lid.bin", 2, tuple(manifest["languages"]),
+            verification_model=self.root / "verification.bin")
+
+    def test_missing_optional_verifier_keeps_valid_primary_with_note(self):
+        manifest = json.loads((self.root / "manifest.json").read_text())
+        manifest["language_id"]["verification_model"] = "missing.bin"
+        (self.root / "manifest.json").write_text(json.dumps(manifest))
+        with mock.patch.object(icefall_asr, "_LanguageIdentifier", return_value=FakeIdentifier()) as factory:
+            with self.assertLogs(icefall_asr.log, level="WARNING") as notes:
+                self.adapter.prepare()
+        factory.assert_called_once_with(self.root / "lid.bin", 2, tuple(manifest["languages"]))
+        self.assertTrue(any("verification" in line for line in notes.output))
 
     def test_identifier_failure_does_not_use_previous_language(self):
         self.adapter.transcribe(wav(), "auto")

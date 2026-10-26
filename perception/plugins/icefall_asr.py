@@ -32,10 +32,13 @@ def _release_unused_heap():
 class _LanguageIdentifier:
     REQUEST_TIMEOUT_S = 30.0
 
-    def __init__(self, model, num_threads, languages):
+    def __init__(self, model, num_threads, languages, verification_model=None):
         binary = os.environ.get("ASR_LANGUAGE_ID_BINARY", "/opt/asr-language-id/bin/whisper-lid")
+        command = [binary, str(model), str(num_threads), ",".join(languages)]
+        if verification_model is not None:
+            command.append(str(verification_model))
         self._process = subprocess.Popen(
-            [binary, str(model), str(num_threads), ",".join(languages)],
+            command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
         )
         self._selector = selectors.DefaultSelector()
@@ -151,8 +154,21 @@ class IcefallMultilingualASRAdapter:
             lid_model = self._root / manifest["language_id"]["model"]
             if not lid_model.is_file():
                 raise FileNotFoundError("Missing language identifier model: " + str(lid_model))
+            identifier_options = {}
+            verification_model = manifest["language_id"].get("verification_model")
+            if verification_model and not isinstance(verification_model, str):
+                log.warning("[asr] optional language verification model must be a path; "
+                            "using primary language identification")
+            elif verification_model:
+                verification_path = self._root / verification_model
+                if verification_path.is_file():
+                    identifier_options["verification_model"] = verification_path
+                else:
+                    log.warning("[asr] optional language verification model unavailable: %s; "
+                                "using primary language identification", verification_path)
             self._models = models
-            self._identifier = _LanguageIdentifier(lid_model, self._num_threads, tuple(models))
+            self._identifier = _LanguageIdentifier(
+                lid_model, self._num_threads, tuple(models), **identifier_options)
 
     def _load_recognizer(self, language):
         import sherpa_onnx
@@ -179,6 +195,13 @@ class IcefallMultilingualASRAdapter:
             tokens=tokens, decoding_method="greedy_search", **options)
 
     def transcribe(self, wav_bytes, language="auto"):
+        return self._transcribe(wav_bytes, language, minimum_probability=0.0)
+
+    def transcribe_recovered(self, wav_bytes, language="auto"):
+        """Confirm supplementary quiet audio before allocating an ASR expert."""
+        return self._transcribe(wav_bytes, language, minimum_probability=0.8)
+
+    def _transcribe(self, wav_bytes, language, minimum_probability):
         import numpy as np
 
         with wave.open(io.BytesIO(wav_bytes), "rb") as audio:
@@ -197,6 +220,10 @@ class IcefallMultilingualASRAdapter:
                 raise
             if detected not in self._models:
                 raise RuntimeError("Unsupported detected language: " + detected)
+            self.last_language = detected
+            self.last_language_probability = probability
+            if probability < minimum_probability:
+                return ""
             if detected != self._current_language:
                 # Release the previous language before allocating the next one.
                 self._recognizer = None
@@ -206,8 +233,6 @@ class IcefallMultilingualASRAdapter:
                 self._recognizer = self._load_recognizer(detected)
                 self._current_language = detected
                 log.info("[asr] active language=%s, provider=cpu", detected)
-            self.last_language = detected
-            self.last_language_probability = probability
             if self._models[detected]["type"] == "x-asr":
                 return normalize_long_numeric_dictation(
                     self._recognizer.transcribe(wav_bytes, "zh-CN"), detected)
