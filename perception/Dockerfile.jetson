@@ -665,6 +665,9 @@ ARG ASR_PROFILE=icefall
 COPY perception/native/asr_language_id.cc perception/native/build_language_id.sh /work/native/
 COPY perception/utils/install_icefall_models.py /tmp/install_icefall_models.py
 RUN if [ "${ASR_PROFILE}" = "icefall" ]; then \
+      pip3 install --no-cache-dir --no-deps --only-binary=:all: \
+        -i "${PYPI_MIRROR}" "kaldifst==1.7.8" && \
+      python3 -c "import kaldifst; assert hasattr(kaldifst, 'StdVectorFst')" && \
       python3 /tmp/install_icefall_models.py \
         --base-url http://172.28.4.81:34567/zengzhitao/embodied-ai/icefall-base-xasr-numeric-v1-20261029 \
         --manifest-sha256 6a378091d852ed9ab8335b9971ada5ffc8cac646eea77ffd8b160852da4fd879 \

@@ -1,7 +1,6 @@
 """Output-only number rendering with small, lazily loaded OpenFst grammars."""
 
 from collections import OrderedDict
-from decimal import Decimal, InvalidOperation
 import json
 import logging
 from pathlib import Path
@@ -156,7 +155,9 @@ class NumericOutputNormalizer:
 
     def _cjk(self, text, language):
         chars = "零〇○一二三四五六七八九十百千万萬亿億兆两兩幺壹贰貳叁肆伍陆陸柒捌玖点點"
-        digits = dict(zip("零〇○一二三四五六七八九幺", "0001234567891"))
+        digits = {char: str(i) for i, aliases in enumerate(
+            ("零〇○", "一幺壹", "二两兩贰貳", "三叁", "四肆", "五伍", "六陆陸", "七柒", "八捌", "九玖"))
+                  for char in aliases}
         atom = "[" + chars + "0-9]"
         pattern = r"(?:负|負|マイナス)?(?:百分之)?" + atom + r"+(?:\." + atom + r"+)?(?:パーセント|%)?"
 
@@ -180,6 +181,9 @@ class NumericOutputNormalizer:
             if value.startswith("百分之"):
                 value = value[3:]
             value = re.sub(r"(?:パーセント|%)$", "", value)
+            if value.startswith(("万", "萬", "亿", "億", "兆")):
+                # Large units require a coefficient; 万一 is an ordinary word.
+                return original
             if all(c in digits or c.isdecimal() for c in value):
                 if (1 < len(value) < 7 and not any(c.isdecimal() or c in "零〇○" for c in value)
                         and not re.match(r"(?:年|月|日|号|號|番)", text[match.end():])):
@@ -187,6 +191,16 @@ class NumericOutputNormalizer:
                     return original
                 result = "".join(digits.get(c, c) for c in value)
             else:
+                whole = re.split(r"[点點.]", value, maxsplit=1)[0]
+                nonzero = "".join(c for c, number in digits.items() if number != "0")
+                if re.search("[" + nonzero + "]{2,}", whole):
+                    # 一五一十 / 十三五 are not canonical cardinal numbers.
+                    return original
+                if language == "zh" and (
+                        whole.startswith(("百", "千")) or
+                        re.search("[百千万萬亿億兆][" + nonzero + "1-9]$", whole)):
+                    # Compact spoken amounts such as 一千一 are ambiguous.
+                    return original
                 result = self._rewrite(value, language)
             return sign + result + ("%" if percent else "")
 
@@ -216,7 +230,8 @@ class NumericOutputNormalizer:
                 elif token == "ล้าน":
                     if digit == 0 and not group and not total:
                         raise ValueError("Ambiguous zero before Thai scale")
-                    total = (total + group + (digit or 0)) * 1000000
+                    coefficient = total + group + (digit or 0)
+                    total = (coefficient or 1) * 1000000
                     group, digit, previous = 0, None, 1000000
                 elif token in scales:
                     scale = scales[token]
@@ -266,11 +281,7 @@ class NumericOutputNormalizer:
                 value = value.replace(",", ".")
         elif "." in value and language in ("de", "es") and re.fullmatch(r"\d{1,3}(?:\.\d{3})+", value):
             value = value.replace(".", "")
-        if "." in value:
-            try:
-                value = format(Decimal(value).normalize(), "f")
-            except InvalidOperation:
-                pass
+        # Keep decimal precision: version 3.10 must not become version 3.1.
         return sign + value
 
     def normalize(self, text, language):

@@ -19,6 +19,7 @@ def normalizer():
     ("en", "One of the Eleven Labs models uses twenty percent.", "One of the Eleven Labs models uses 20%."),
     ("en", "OpenAI measured minus three point five volts.", "OpenAI measured -3.5 volts."),
     ("en", "It started in twenty fifteen.", "It started in 2015."),
+    ("en", "Use version three point one zero.", "Use version 3.10."),
     ("en", "zero zero one two three four five six seven", "001234567"),
     ("en", "零一八六一零二二三三四五。", "018610223345"),
     ("en", "18,610,223,345.", "18610223345"),
@@ -35,6 +36,9 @@ def normalizer():
     ("es", "Hay veinticinco por ciento.", "Hay 25%."),
     ("ru", "Это двадцать пять процентов.", "Это 25%."),
     ("th", "มีจำนวนสองล้านคน", "มีจำนวน2000000คน"),
+    ("th", "ล้านล้าน", "1000000000000"),
+    ("th", "ล้านสองแสน", "1200000"),
+    ("zh", "有一万零一名用户。", "有10001名用户。"),
 ])
 def test_native_number_rendering(normalizer, language, source, expected):
     assert normalizer.normalize(source, language) == expected
@@ -51,6 +55,15 @@ def test_native_number_rendering(normalizer, language, source, expected):
     ("th", "ปลาชนิดนี้ศูนย์พันธุ์"),
     ("zh", "每年节省数百万加仑燃料。"),
     ("zh", "一二线城市占百分之四五。"),
+    ("zh", "万一失败怎么办"),
+    ("zh", "一五一十地说明"),
+    ("zh", "十三五规划"),
+    ("zh", "九九八十一难"),
+    ("zh", "一万一"),
+    ("zh", "一千一"),
+    ("en", "Use version 3.10."),
+    ("zh", "三三两两地出现"),
+    ("ja", "万一の事故に備える"),
     ("en", "The year was 2015, not 2014. The ID is 001234567."),
 ])
 def test_preserve_prose_and_actual_values(normalizer, language, source):
