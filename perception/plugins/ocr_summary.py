@@ -18,6 +18,7 @@ _NUMBER_TEXT = re.compile(
 _DATE_TEXT = re.compile(
     r"((?:19|20)\d{2})(?:[./-](\d{1,2})(?:[./-](\d{1,2}))?|H([12]))?"
 )
+_CLOCK_TEXT = re.compile(r"(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?")
 
 
 def _reading_order(item):
@@ -40,9 +41,16 @@ def _layout_groups(items):
     if len(items) < 2:
         return [items]
     height = median(max(1, item["bbox"][3] - item["bbox"][1]) for item in items)
+    glyph_height = median(_font_size(item) for item in items)
+    horizontal_factor = 2.5
+    # A tilted long line has a tall axis-aligned box. That height must not
+    # bridge the whitespace to an unrelated sign or a distant lower label.
+    if height > 1.5 * glyph_height and _gaps(items, 0):
+        height = min(_font_size(item) for item in items) if len(items) == 2 else glyph_height
+        horizontal_factor = 2.
     splits = []
     # A larger vertical allowance keeps ordinary line spacing together.
-    for axis, factor in ((0, 2.5), (1, 4.0)):
+    for axis, factor in ((0, horizontal_factor), (1, 4.0)):
         for gap, split in _gaps(items, axis):
             if gap >= factor * height:
                 splits.append((gap / (factor * height), -axis, split))
@@ -93,7 +101,7 @@ def _title_candidates(members):
     upper = []
     for item in members:
         text = unicodedata.normalize("NFKC", item["text"]).replace(" ", "")
-        numeric = any(char.isdigit() for char in text) and _NUMBER_TEXT.fullmatch(text)
+        numeric = any(char.isdigit() for char in text) and (_NUMBER_TEXT.fullmatch(text) or _CLOCK_TEXT.fullmatch(text))
         if not numeric and item["bbox"][1] <= top + .4 * (bottom - top):
             upper.append(item)
     if not upper:
@@ -110,6 +118,55 @@ def _bounds(members):
             min(item["bbox"][1] for item in members),
             max(item["bbox"][2] for item in members),
             max(item["bbox"][3] for item in members)]
+
+
+def _row_order(members):
+    """Recognize a gently tilted row, without inferring a shared source."""
+    if len(members) < 3 or any(_numeric_observation(item) or _date_key(item) is not None for item in members):
+        return None
+    ordered = sorted(members, key=lambda item: (item["bbox"][0], _reading_order(item)))
+    if any(left["bbox"][2] >= right["bbox"][0] for left, right in zip(ordered, ordered[1:])):
+        return None
+    sizes = [_font_size(item) for item in ordered]
+    if max(sizes) > 2 * min(sizes):
+        return None
+    centers = [((item["bbox"][0] + item["bbox"][2]) / 2,
+                (item["bbox"][1] + item["bbox"][3]) / 2) for item in ordered]
+    slopes = [(y2 - y1) / (x2 - x1) for (x1, y1), (x2, y2) in zip(centers, centers[1:])]
+    slope = median(slopes)
+    intercept = median(y - slope * x for x, y in centers)
+    if abs(slope) > .2 or any(abs(y - slope * x - intercept) > .6 * size
+                               for (x, y), size in zip(centers, sizes)):
+        return None
+    return ordered
+
+
+def _merge_text_rows(groups):
+    """Keep aligned singleton labels together across whitespace splits."""
+    groups = list(groups)
+    while True:
+        singletons = [(index, group[0]) for index, group in enumerate(groups)
+                      if len(group) == 1 and not _numeric_observation(group[0])
+                      and _date_key(group[0]) is None]
+        candidates = []
+        for offset, (first_index, first) in enumerate(singletons):
+            fx, fy = [(first["bbox"][axis] + first["bbox"][axis + 2]) / 2 for axis in (0, 1)]
+            for second_index, second in singletons[offset + 1:]:
+                sx, sy = [(second["bbox"][axis] + second["bbox"][axis + 2]) / 2 for axis in (0, 1)]
+                if sx == fx or abs((sy - fy) / (sx - fx)) > .2:
+                    continue
+                slope = (sy - fy) / (sx - fx)
+                aligned = [(index, item) for index, item in singletons
+                           if abs((item["bbox"][1] + item["bbox"][3]) / 2 - fy
+                                  - slope * ((item["bbox"][0] + item["bbox"][2]) / 2 - fx))
+                           <= .6 * _font_size(item)]
+                row = _row_order([item for index, item in aligned])
+                if row:
+                    candidates.append((len(row), tuple(sorted(index for index, item in aligned)), row))
+        if not candidates:
+            return groups
+        _, indices, row = min(candidates, key=lambda candidate: (-candidate[0], candidate[1]))
+        groups = [group for index, group in enumerate(groups) if index not in indices] + [row]
 
 
 def _date_key(item):
@@ -281,6 +338,9 @@ def _describe_local_layout(layout):
 
 
 def _describe_group(members):
+    row = _row_order(members)
+    if row is not None:
+        return "同一横排文字从左到右为" + "、".join(_quotes([item]) for item in row)
     dated = _dated_blocks(members)
     if dated is not None:
         groups, remaining = dated
@@ -315,7 +375,7 @@ def _describe_group(members):
     return "，".join(clauses)
 
 
-def _describe_zone(regions):
+def _describe_zone(regions, image_height):
     # Identical text in distinct locations is reported as repetition, not as
     # independent exhibits or an inferred shared source.
     repeated = {}
@@ -329,7 +389,13 @@ def _describe_zone(regions):
             representative = [item for members in occurrences for item in members]
             clauses.append(f"{len(occurrences)}处重复出现{_quotes(representative)}")
         else:
-            clauses.extend(_describe_group(members) for members in occurrences)
+            for members in occurrences:
+                clause = _describe_group(members)
+                if _bounds(members)[3] - _bounds(members)[1] < image_height / 3:
+                    y = next(region[1] for region in regions if region[3] is members)
+                    if y < 1 / 3 or y > 2 / 3:
+                        clause += f"（位于画面{'上部' if y < 1 / 3 else '下部'}）"
+                clauses.append(clause)
     prefix = "按从上到下的顺序，" if len(clauses) > 1 else ""
     return prefix + "；另一个文字组中，".join(clauses)
 
@@ -375,7 +441,7 @@ def build_ocr_summary(items, image_size=None, image_orientation=1):
 
     width, height = image_size
     regions = []
-    for members in _layout_groups(readable):
+    for members in _merge_text_rows(_layout_groups(readable)):
         members = sorted(members, key=_reading_order)
         x1 = min(item["bbox"][0] for item in members)
         y1 = min(item["bbox"][1] for item in members)
@@ -394,5 +460,5 @@ def build_ocr_summary(items, image_size=None, image_orientation=1):
     for position in ["中间", "偏左", "偏右"]:
         located = [region for region in regions if region[0] == position]
         if located:
-            descriptions.append(f"画面{position}：{_describe_zone(located)}")
+            descriptions.append(f"画面{position}：{_describe_zone(located, height)}")
     return "。".join(descriptions) + "。"

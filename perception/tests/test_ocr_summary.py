@@ -320,3 +320,46 @@ def test_overlapping_slanted_boxes_do_not_turn_one_column_into_parallel_columns(
     summary = _describe_group(entries)
     assert "组内" not in summary
     assert "候选标题" in summary
+
+
+def test_tilted_separate_signs_do_not_form_a_title_and_body():
+    entries = [item("ALPHA顶部品牌", [360, 130, 850, 220]),
+               item("BETA远方标识", [90, 175, 280, 325]),
+               item("中心名称", [520, 530, 610, 580]),
+               item("NAME", [520, 580, 600, 605])]
+    summary = build_ocr_summary(entries, (1228, 691))
+    assert "候选标题" not in summary
+    assert "画面偏左" in summary
+    assert "上部" in summary and "下部" in summary
+    assert all(f"“{entry['text']}”" in summary for entry in entries)
+
+
+def test_tilted_menu_row_is_read_from_left_to_right():
+    entries = [item(text, [x, y, x + 28, y + 16]) for text, x, y in
+               [("信号", 430, 750), ("展示", 565, 741), ("应用", 695, 735),
+                ("文档", 820, 728), ("设置", 945, 722)]]
+    summary = build_ocr_summary(entries, (1920, 1080))
+    assert "从左到右" in summary
+    assert "“信号”、“展示”、“应用”、“文档”、“设置”" in summary
+    assert build_ocr_summary(list(reversed(entries)), (1920, 1080)) == summary
+
+
+def test_time_display_is_not_promoted_to_a_heading():
+    entries = [item("16:39", [255, 302, 347, 334]),
+               item("周五", [357, 302, 383, 316]),
+               item("7月24日", [361, 320, 404, 333])]
+    summary = build_ocr_summary(entries, (1920, 1080))
+    assert "候选标题为“16:39”" not in summary
+    assert all(f"“{entry['text']}”" in summary for entry in entries)
+
+
+def test_isolated_lower_text_has_a_vertical_position():
+    summary = build_ocr_summary([item("房间名称", [900, 705, 965, 750])], (1920, 1080))
+    assert "下部" in summary and "“房间名称”" in summary
+
+
+def test_staggered_unaligned_labels_are_not_called_one_row():
+    entries = [item("甲", [100, 100, 130, 120]),
+               item("乙", [300, 230, 330, 250]),
+               item("丙", [500, 120, 530, 140])]
+    assert "从左到右" not in build_ocr_summary(entries, (800, 500))
