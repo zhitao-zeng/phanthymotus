@@ -304,7 +304,7 @@ def test_timestamp_trust_covers_each_vad_segment_including_early_speech(monkeypa
     stop = Stop()
 
     class Input:
-        pcm = b'\0\0' * 10000
+        pcm = b'\x00\x04' * 10000
         chunks = iter([(pcm, 1.0, False),  # idle, outside either utterance
                        (pcm, 2.0, False),  # early speech before VAD reports it
                        (pcm, 3.0, True),
@@ -328,10 +328,10 @@ def test_timestamp_trust_covers_each_vad_segment_including_early_speech(monkeypa
 
         @property
         def front(self):
-            return (SimpleNamespace(start=10000, samples=[0] * 20000)
+            return (SimpleNamespace(start=10000, samples=[0.03125] * 20000)
                     if self.frame == 4 else
                     SimpleNamespace(start=50000 if self.frame == 7 else 70000,
-                                    samples=[0] * 10000))
+                                    samples=[0.03125] * 10000))
 
         def accept_waveform(self, samples):
             self.frame += 1
@@ -371,13 +371,13 @@ def test_vad_first_sample_stamps_align_utterance_and_wake_direction(monkeypatch,
         except StopIteration:
             stop.done = True
             raise
-        item = (b'\0\0' * 512, base + i * 512 / asr.SAMPLE_RATE)
+        item = (b'\x00\x04' * 512, base + i * 512 / asr.SAMPLE_RATE)
         return item if capture_trusted is None else (*item, capture_trusted)
 
     class Vad:
         frame = 0
         popped = False
-        front = SimpleNamespace(start=0, samples=[0] * (20 * 512))
+        front = SimpleNamespace(start=0, samples=[0.03125] * (20 * 512))
         def accept_waveform(self, samples): self.frame += 1
         def is_speech_detected(self): return self.frame <= 20
         def empty(self): return self.frame != 24 or self.popped

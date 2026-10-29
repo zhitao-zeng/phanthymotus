@@ -1577,28 +1577,34 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
 
             # Output the segment as an utterance
             if len(speech_buf) > SAMPLE_RATE:  # >500ms
-                _log.info(
-                    f"[vad-worker] utterance complete, len={len(speech_buf)} bytes, "
-                    f"pre_roll_bytes={len(pre_pcm)}"
-                )
-                if save_vad_segments:
-                    _save_segment_pcm(speech_buf)
-                # 第四项是这一段开头有多少字节是 pre-roll。对 ASR 它是有益的
-                # （不吃字头），对声纹 embedding 它是污染：vad_pre_roll_ms 默认
-                # 500，而一个 1.5 秒的段里 500 毫秒是静音或别人的尾音，占三分之
-                # 一。消费侧用它把 pre-roll 剥掉再算 embedding，transcribe 仍然
-                # 吃完整的 buffer。
-                #
-                # 必须从这里传出去：speech_buf 是 pre_pcm + seg_pcm 拼好的，
-                # 父进程看不出边界在哪。不传的话，调 vad_pre_roll_ms 会改变声纹
-                # 识别率，而没有人会想到去那里找。
-                packet = (speech_buf,
-                          seg_end_ts if start_ts is None else start_ts,
-                          seg_end_ts if end_ts is None else end_ts,
-                          utterance_pre_roll_bytes, utterance_capture_trusted)
-                if forced_endpoint or pending_hearing:
-                    packet += ('quiet_flush' if forced_endpoint else 'quiet_primary',)
-                result_q.put(packet)
+                # Pre-roll is context, not evidence of a new utterance. Keep
+                # legacy short-segment accumulation, but don't emit a buffer
+                # whose VAD cores contain only digital silence.
+                if any(memoryview(speech_buf)[utterance_pre_roll_bytes:]):
+                    _log.info(
+                        f"[vad-worker] utterance complete, len={len(speech_buf)} bytes, "
+                        f"pre_roll_bytes={len(pre_pcm)}"
+                    )
+                    if save_vad_segments:
+                        _save_segment_pcm(speech_buf)
+                    # 第四项是这一段开头有多少字节是 pre-roll。对 ASR 它是有益的
+                    # （不吃字头），对声纹 embedding 它是污染：vad_pre_roll_ms 默认
+                    # 500，而一个 1.5 秒的段里 500 毫秒是静音或别人的尾音，占三分之
+                    # 一。消费侧用它把 pre-roll 剥掉再算 embedding，transcribe 仍然
+                    # 吃完整的 buffer。
+                    #
+                    # 必须从这里传出去：speech_buf 是 pre_pcm + seg_pcm 拼好的，
+                    # 父进程看不出边界在哪。不传的话，调 vad_pre_roll_ms 会改变声纹
+                    # 识别率，而没有人会想到去那里找。
+                    packet = (speech_buf,
+                              seg_end_ts if start_ts is None else start_ts,
+                              seg_end_ts if end_ts is None else end_ts,
+                              utterance_pre_roll_bytes, utterance_capture_trusted)
+                    if forced_endpoint or pending_hearing:
+                        packet += ('quiet_flush' if forced_endpoint else 'quiet_primary',)
+                    result_q.put(packet)
+                else:
+                    _log.debug("[vad-worker] discarded a VAD core with no new PCM signal")
                 pending_hearing = False
                 speech_buf = b''
                 start_ts = None

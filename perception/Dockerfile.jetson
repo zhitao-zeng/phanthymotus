@@ -666,8 +666,8 @@ COPY perception/native/asr_language_id.cc perception/native/build_language_id.sh
 COPY perception/utils/install_icefall_models.py /tmp/install_icefall_models.py
 RUN if [ "${ASR_PROFILE}" = "icefall" ]; then \
       python3 /tmp/install_icefall_models.py \
-        --base-url http://172.28.4.81:34567/zengzhitao/embodied-ai/icefall-multilingual-xasr-v2 \
-        --manifest-sha256 815207919ecd5a79ff56c313bef0731388b2cab62f1173842e0317216adf8364 \
+        --base-url http://172.28.4.81:34567/zengzhitao/embodied-ai/icefall-base-xasr-numeric-v1-20261029 \
+        --manifest-sha256 6a378091d852ed9ab8335b9971ada5ffc8cac646eea77ffd8b160852da4fd879 \
         --destination /opt/asr-models/icefall && \
       if ! command -v cmake >/dev/null || ! command -v c++ >/dev/null; then \
         apt-get update && apt-get install -y --no-install-recommends cmake g++ && \

@@ -173,6 +173,20 @@ class RoutingTests(unittest.TestCase):
         self.adapter.prepare()
         self.assertIsNot(identifier, self.adapter._identifier)
 
+    def test_numeric_output_is_lazy_and_uses_detected_language(self):
+        manifest = json.loads((self.root / "manifest.json").read_text())
+        manifest["numeric_output"] = {"grammar_dir": "numbers", "model_names": ["GPT-4.1"]}
+        (self.root / "manifest.json").write_text(json.dumps(manifest))
+        with mock.patch("plugins.asr_numeric.NumericOutputNormalizer") as factory:
+            factory.return_value.normalize.return_value = "formatted"
+            FakeIdentifier.selected = "ja"
+            factory.assert_not_called()
+            self.assertEqual(self.adapter.transcribe(wav(), "zh-CN"), "formatted")
+            factory.assert_called_once_with(self.root / "numbers", ["GPT-4.1"])
+            factory.return_value.normalize.assert_called_once_with("ja", "ja")
+        self.adapter.close()
+        self.assertIsNone(self.adapter._numeric)
+
     def test_wrong_audio_format_fails_before_language_selection(self):
         output = io.BytesIO()
         with wave.open(output, "wb") as stream:

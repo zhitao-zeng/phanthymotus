@@ -132,6 +132,7 @@ class IcefallMultilingualASRAdapter:
         self._recognizer = None
         self._current_language = None
         self._models = {}
+        self._numeric = None
         self.last_language = None
         self.last_language_probability = None
 
@@ -167,6 +168,16 @@ class IcefallMultilingualASRAdapter:
                     log.warning("[asr] optional language verification model unavailable: %s; "
                                 "using primary language identification", verification_path)
             self._models = models
+            numeric = manifest.get("numeric_output")
+            if numeric:
+                if isinstance(numeric, dict) and isinstance(numeric.get("grammar_dir"), str):
+                    from plugins.asr_numeric import NumericOutputNormalizer
+
+                    self._numeric = NumericOutputNormalizer(
+                        self._root / numeric["grammar_dir"], numeric.get("model_names", ()))
+                else:
+                    log.warning("[asr] invalid optional numeric output configuration; "
+                                "retaining original number rendering")
             self._identifier = _LanguageIdentifier(
                 lid_model, self._num_threads, tuple(models), **identifier_options)
 
@@ -177,6 +188,15 @@ class IcefallMultilingualASRAdapter:
         if spec["type"] == "x-asr":
             from plugins.x_asr import XASRAdapter
 
+            decoder_options = {}
+            if "hotwords_score" in spec:
+                decoder_options["hotwords_score"] = spec["hotwords_score"]
+            if "hotwords_file" in spec:
+                decoder_options["hotwords_file"] = (
+                    str(self._root / spec["hotwords_file"]) if spec["hotwords_file"] else ""
+                )
+            if "head_pad_ms" in spec:
+                decoder_options["head_padding_seconds"] = spec["head_pad_ms"] / 1000.0
             return XASRAdapter(
                 str((self._root / spec["tokens"]).parent), "cpu", self._num_threads,
                 max_active_paths=spec["max_active_paths"],
@@ -184,6 +204,7 @@ class IcefallMultilingualASRAdapter:
                 prefix_lm_path=str(self._root / spec["prefix_lm"]),
                 prefix_lm_scale=spec["prefix_lm_scale"],
                 entity_boost=spec["entity_boost"],
+                **decoder_options,
             )
         options = dict(num_threads=self._num_threads, provider="cpu")
         tokens = str(self._root / spec["tokens"])
@@ -200,6 +221,11 @@ class IcefallMultilingualASRAdapter:
     def transcribe_recovered(self, wav_bytes, language="auto"):
         """Confirm supplementary quiet audio before allocating an ASR expert."""
         return self._transcribe(wav_bytes, language, minimum_probability=0.8)
+
+    def _render(self, text, language):
+        if self._numeric is not None:
+            return self._numeric.normalize(text, language)
+        return normalize_long_numeric_dictation(text, language)
 
     def _transcribe(self, wav_bytes, language, minimum_probability):
         import numpy as np
@@ -234,7 +260,7 @@ class IcefallMultilingualASRAdapter:
                 self._current_language = detected
                 log.info("[asr] active language=%s, provider=cpu", detected)
             if self._models[detected]["type"] == "x-asr":
-                return normalize_long_numeric_dictation(
+                return self._render(
                     self._recognizer.transcribe(wav_bytes, "zh-CN"), detected)
             samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
             padding = int(self._models[detected].get("tail_pad_ms", 300)) * 16
@@ -243,7 +269,7 @@ class IcefallMultilingualASRAdapter:
             stream = self._recognizer.create_stream()
             stream.accept_waveform(16000, samples)
             self._recognizer.decode_stream(stream)
-            return normalize_long_numeric_dictation(stream.result.text.strip(), detected)
+            return self._render(stream.result.text.strip(), detected)
 
     def transcribe_rich(self, wav_bytes, language="auto", include_emotion=False):
         return self.transcribe(wav_bytes, language), {}
@@ -255,6 +281,7 @@ class IcefallMultilingualASRAdapter:
             self._identifier = None
             self._recognizer = None
             self._current_language = None
+            self._numeric = None
 
     def __del__(self):
         if hasattr(self, "_lock"):

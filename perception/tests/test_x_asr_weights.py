@@ -150,3 +150,48 @@ def test_no_boost_leaves_the_hotwords_and_threshold_alone(monkeypatch, tmp_path)
     XASRAdapter(str(root), "cpu", prefix_lm_path=str(root / "lm.onnx"), prefix_lm_scale=0.05)
     assert Path(calls["hotwords_file"]) == root / "hotwords.bpe.txt"
     assert "SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE" not in os.environ
+
+
+def test_zero_hotword_score_omits_explicit_phrase_scores_without_changing_defaults(monkeypatch, tmp_path):
+    calls = _prefix_runtime(monkeypatch, tmp_path)
+    root = _boosted_bundle(tmp_path / "b")
+    XASRAdapter(str(root), "cpu", hotwords_score=0)
+    assert calls["hotwords_file"] == ""
+    assert calls["hotwords_score"] == 0
+    XASRAdapter(str(root), "cpu")
+    assert calls["hotwords_file"] == str(root / "hotwords.bpe.txt")
+    assert calls["hotwords_score"] == 2.5
+
+
+def test_per_adapter_hotword_file_and_score(monkeypatch, tmp_path):
+    calls = _prefix_runtime(monkeypatch, tmp_path)
+    root = _boosted_bundle(tmp_path / "b")
+    vocabulary = tmp_path / "terms.txt"
+    vocabulary.write_text("Cartesia\nPiper\n")
+    XASRAdapter(str(root), "cpu", hotwords_score=0.5, hotwords_file=str(vocabulary))
+    assert calls["hotwords_file"] == str(vocabulary)
+    assert calls["hotwords_score"] == 0.5
+
+
+def test_head_padding_does_not_shift_public_alignment(monkeypatch, tmp_path):
+    import io
+    import wave
+    calls = _prefix_runtime(monkeypatch, tmp_path)
+    root = _boosted_bundle(tmp_path / "b")
+    received = {}
+    stream = types.SimpleNamespace(result=types.SimpleNamespace(text="hello", tokens=["hello"], timestamps=[0.15]))
+    stream.accept_waveform = lambda sr, samples: received.update(rate=sr, samples=samples)
+    recognizer = types.SimpleNamespace(create_stream=lambda: stream, decode_streams=lambda streams: None)
+    monkeypatch.setattr(sys.modules["sherpa_onnx"].OfflineRecognizer, "from_transducer", staticmethod(lambda **kwargs: recognizer))
+    model = XASRAdapter(str(root), "cpu", head_padding_seconds=0.1, tail_padding_seconds=0.3)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as audio:
+        audio.setnchannels(1); audio.setsampwidth(2); audio.setframerate(16000)
+        audio.writeframes(b"\x00\x04" * 1600)
+    text, alignment = model.transcribe_aligned(buf.getvalue(), "en")
+    assert text == "hello"
+    assert len(received["samples"]) == 8000
+    assert received["samples"][:1600] == [0.0] * 1600
+    assert received["samples"][1600:3200] == [0.03125] * 1600
+    assert alignment["timestamps"] == pytest.approx([0.05])
+    assert alignment["duration_s"] == 0.1

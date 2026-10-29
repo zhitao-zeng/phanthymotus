@@ -126,6 +126,9 @@ class XASRAdapter:
         entity_boost: dict = None,
         native_lm_path: str = "",
         native_lm_scale: float = 0.0,
+        hotwords_score: float = None,
+        hotwords_file: str = None,
+        head_padding_seconds: float = 0.0,
     ):
         from utils.onnx_provider import provider_for_device
 
@@ -137,6 +140,10 @@ class XASRAdapter:
             if tail_padding_seconds is None
             else float(tail_padding_seconds)
         )
+        self._hotwords_score = HOTWORDS_SCORE if hotwords_score is None else float(hotwords_score)
+        self._head_padding_seconds = float(head_padding_seconds)
+        if self._hotwords_score < 0 or self._head_padding_seconds < 0:
+            raise ValueError("hotword score and head padding must be nonnegative")
         root = Path(model_dir)
         # The cpu bundle is int8 (encoder+joiner) and the gpu bundle fp32; the
         # decoder is the same fp32 file in both. ASR_MODELS picks the directory.
@@ -189,11 +196,22 @@ class XASRAdapter:
         # has no CUDA provider, so a mismatched device/bundle is reported.
         provider = provider_for_device(device,
                                        (str(encoder), str(decoder), str(joiner)))
-        encoded_hotwords = root / "hotwords.bpe.txt"
-        if not encoded_hotwords.is_file():
-            encoded_hotwords = _prepare_hotwords_file(hotwords)
+        # A file can contain per-phrase scores which override the default score.
+        # Disabling bias must omit the graph, including those explicit scores.
+        if self._hotwords_score == 0:
+            encoded_hotwords = ""
+        elif hotwords_file is not None:
+            encoded_hotwords = hotwords_file
+            if encoded_hotwords and not Path(encoded_hotwords).is_file():
+                raise FileNotFoundError("X-ASR hotword file is missing")
+        else:
+            encoded_hotwords = root / "hotwords.bpe.txt"
+            if not encoded_hotwords.is_file():
+                encoded_hotwords = _prepare_hotwords_file(hotwords, self._hotwords_score)
         early_min = None
         if entity_boost:
+            if not encoded_hotwords:
+                raise ValueError("entity_boost needs enabled hotwords")
             # The patched decoder adds a hotword's next-token score to the pruning
             # rank, not only to the survivors, for hotwords whose per-token score
             # reaches SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE. It reads the variable at
@@ -203,8 +221,8 @@ class XASRAdapter:
             if not lm_options:
                 raise ValueError("entity_boost needs the prefix LM (prefix_lm_scale > 0)")
             early_min = min(float(v) for v in entity_boost.values()) - 0.1
-            if early_min <= HOTWORDS_SCORE:
-                raise ValueError(f"entity_boost scores must exceed {HOTWORDS_SCORE + 0.1}")
+            if early_min <= self._hotwords_score:
+                raise ValueError(f"entity_boost scores must exceed {self._hotwords_score + 0.1}")
             encoded_hotwords = _boost_hotwords(encoded_hotwords, entity_boost)
             os.environ["SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE"] = f"{early_min:g}"
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
@@ -219,7 +237,7 @@ class XASRAdapter:
             decoding_method="modified_beam_search",
             max_active_paths=self._max_active_paths,
             hotwords_file=str(encoded_hotwords),
-            hotwords_score=HOTWORDS_SCORE,
+            hotwords_score=self._hotwords_score,
             modeling_unit="bpe",
             bpe_vocab=str(bpe_vocab),
             **lm_options,
@@ -234,7 +252,7 @@ class XASRAdapter:
             provider,
             self._max_active_paths,
             self._tail_padding_seconds,
-            HOTWORDS_SCORE,
+            self._hotwords_score,
             lm_scale,
             entity_boost or {},
             early_min,
@@ -257,6 +275,8 @@ class XASRAdapter:
             sample / 32768.0
             for sample in struct.unpack(f"<{sample_count}h", pcm)
         ]
+        if self._head_padding_seconds:
+            samples = [0.0] * int(sample_rate * self._head_padding_seconds) + samples
         samples.extend([0.0] * int(sample_rate * self._tail_padding_seconds))
 
         with self._decode_lock:
@@ -264,7 +284,10 @@ class XASRAdapter:
             stream.accept_waveform(sample_rate, samples)
             self._recognizer.decode_streams([stream])
             result = stream.result
+        timestamps = list(getattr(result, 'timestamps', ()) or ())
+        if self._head_padding_seconds:
+            timestamps = [max(0.0, float(t) - self._head_padding_seconds) for t in timestamps]
         alignment = {'tokens': list(getattr(result, 'tokens', ()) or ()),
-                     'timestamps': list(getattr(result, 'timestamps', ()) or ()),
+                     'timestamps': timestamps,
                      'duration_s': sample_count / sample_rate}
         return str(getattr(result, "text", result or "")).strip(), alignment
