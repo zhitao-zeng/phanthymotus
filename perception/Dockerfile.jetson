@@ -683,6 +683,21 @@ RUN if [ "${ASR_PROFILE}" = "icefall" ]; then \
     fi
 ENV LD_LIBRARY_PATH="/opt/asr-language-id/lib:${LD_LIBRARY_PATH}"
 
+# Single-model Whisper Turbo profile, layered on the icefall release above
+# (that release supplies the numeric grammar). The pinned ModelScope release
+# contains the prebuilt CUDA worker/libraries for both JetPack lines and the
+# Q5 GGML model; the runtime image has no nvcc.
+ARG TURBO_Q5=1
+ARG TURBO_RELEASE_REVISION=b6d2d45b57499ca255580ecac5d9c8366f4c1644
+COPY perception/utils/install_whisper_turbo.py /tmp/install_whisper_turbo.py
+RUN if [ "${TURBO_Q5}" = "1" ]; then \
+      python3 /tmp/install_whisper_turbo.py --jp ${JP_VERSION} --revision ${TURBO_RELEASE_REVISION} && \
+      chmod +x /opt/whisper-turbo/bin/whisper_turbo_worker && \
+      python3 -c "import yaml; p='/work/config.yaml'; cfg=yaml.safe_load(open(p)); [v.update(enabled=(k=='asr')) for k,v in cfg['plugins'].items() if isinstance(v,dict)]; a=cfg['plugins']['asr']; a.update(asr_model='whisper-turbo-q5', model_dir='/opt/asr-models/turbo', device='gpu', num_threads=2, language='auto', warmup=False, save_vad_segments=False); a['vad'].update(silence_ms=700, pre_roll_ms=250); a['kws']['trigger_mode']='vad'; yaml.safe_dump(cfg, open(p,'w'), allow_unicode=True, sort_keys=False)"; \
+    fi
+ENV LD_LIBRARY_PATH="/opt/whisper-turbo/lib:${LD_LIBRARY_PATH}"
+
+
 # The existing Chinese recipe needs the prefix-enabled runtime for each ABI.
 RUN if [ "${ASR_PROFILE}" = "icefall" ]; then \
     case "${JP_VERSION}" in \

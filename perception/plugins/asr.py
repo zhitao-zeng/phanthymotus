@@ -31,6 +31,7 @@ from std_msgs.msg import String
 
 from plugins.icefall_asr import IcefallMultilingualASRAdapter
 from plugins.vad_preroll import PcmHistory
+from plugins.whisper_turbo import WhisperTurboAdapter
 
 log = logging.getLogger(__name__)
 
@@ -659,7 +660,7 @@ TOOLS = [
                 # The two paraformers and zipformer-en were dropped for accuracy;
                 # REMOVED_ASR_MODELS maps a card still holding one onto its
                 # replacement rather than letting it fail to resolve.
-                "asr_model":     {"type": "string", "enum": ["icefall-multilingual", "x-asr-zh-en", "parakeet-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, parakeet-en = English offline CTC, noise-robust, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
+                "asr_model":     {"type": "string", "enum": ["icefall-multilingual", "x-asr-zh-en", "parakeet-en", "sensevoice-small", "whisper-turbo-q5"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, parakeet-en = English offline CTC, noise-robust, sensevoice-small = multilingual offline, whisper-turbo-q5 = single-model multilingual GPU with built-in language ID)", "default": "sensevoice-small", "scope": "shared"},
                 # Which weights each device loads is in ASR_MODELS; only models
                 # with a verified gpu entry list one, so x-show-when hides this
                 # field for the rest rather than offering a choice that would be
@@ -676,7 +677,7 @@ TOOLS = [
                                                  "vs ~0.5 GB on cpu, ~1.4 GB of which a CUDA context "
                                                  "never gives back — check headroom before enabling",
                                   "default": "cpu", "scope": "shared",
-                                  "x-show-when": {"asr_model": ["parakeet-en", "sensevoice-small"]}},
+                                  "x-show-when": {"asr_model": ["parakeet-en", "sensevoice-small", "whisper-turbo-q5"]}},
                 # `kws` (a second sherpa KeywordSpotter on the raw audio) was
                 # removed; REMOVED_TRIGGER_MODES migrates cards still set to it.
                 "trigger_mode":  {"type": "string", "enum": ["vad", "asr_kws"], "description": "Trigger mode (vad = always listen, asr_kws = ASR + phoneme matching)", "default": "asr_kws", "scope": "shared"},
@@ -1081,6 +1082,16 @@ ASR_MODELS = {
             "gpu": {"download": "asr_sensevoice_gpu", "dtype": "fp16",
                     "dir": "/models/sherpa-onnx/sensevoice-gpu"},
         },
+    },
+    # Single-model multilingual profile kept separate from the default CPU
+    # registry. whisper.cpp performs language identification itself, so this
+    # entry has no LID companion and no per-language expert switching; the
+    # image-owned model and CUDA worker are installed from a pinned release by
+    # perception/utils/install_whisper_turbo.py.
+    "whisper-turbo-q5": {
+        "label": "Whisper large-v3-turbo Q5 (multilingual, GPU, built-in LID)",
+        "adapter": WhisperTurboAdapter,
+        "devices": {"gpu": {"dir": "/opt/asr-models/turbo", "image_owned": True}},
     },
 }
 

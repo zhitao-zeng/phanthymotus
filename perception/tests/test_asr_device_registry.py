@@ -39,6 +39,8 @@ from plugins import asr  # noqa: E402
 from utils import model_downloader  # noqa: E402
 
 VALID_DTYPES = {"int8", "fp32", "fp16"}
+# CUDA whisper.cpp worker: GGML weights, no ONNX dtype, and no CPU fallback.
+GPU_WORKER_MODELS = {"whisper-turbo-q5"}
 
 
 def _device_specs():
@@ -48,8 +50,13 @@ def _device_specs():
 
 
 def test_every_model_has_a_cpu_entry():
-    """cpu is the fallback for an unsupported device request, so it must exist."""
+    """cpu is the fallback for an unsupported device request, so it must exist.
+    The CUDA whisper.cpp worker is the documented exception: there is no CPU
+    build of that worker, and the config action rejects cpu for it."""
     for model, info in asr.ASR_MODELS.items():
+        if model in GPU_WORKER_MODELS:
+            assert "gpu" in info["devices"], f"{model} has no gpu weights"
+            continue
         assert "cpu" in info["devices"], f"{model} has no cpu weights"
 
 
@@ -60,6 +67,8 @@ def test_device_keys_are_known():
 
 def test_dtypes_are_declared_and_known():
     for model, device, spec in _device_specs():
+        if model in GPU_WORKER_MODELS:
+            continue
         assert spec.get("dtype") in VALID_DTYPES, \
             f"{model}/{device} has dtype {spec.get('dtype')!r}"
 
@@ -70,7 +79,7 @@ def test_gpu_entries_are_never_int8():
     1.25x-3.3x slower than the CPU, and it also perturbs the output (3 of 4
     SenseVoice transcripts changed versus the same model on CPU)."""
     for model, device, spec in _device_specs():
-        if device == "gpu":
+        if device == "gpu" and model not in GPU_WORKER_MODELS:
             assert spec["dtype"] != "int8", \
                 f"{model}/gpu points at int8 weights, which is slower than cpu"
 
@@ -88,7 +97,8 @@ def test_download_keys_resolve():
     """A gpu entry must name a pinned bundle; a cpu entry a legacy archive."""
     for model, device, spec in _device_specs():
         if spec.get("image_owned"):
-            assert model == "icefall-multilingual" and device == "cpu"
+            assert model in ("icefall-multilingual", "whisper-turbo-q5"), \
+                f"{model}/{device} is image_owned but not an expected image release"
             continue
         key = spec["download"]
         if device == "gpu":
@@ -135,7 +145,8 @@ def test_asr_models_supporting():
     assert "parakeet-en" in asr.asr_models_supporting("gpu")
     # Measured 0.80x on CUDA — deliberately absent.
     assert "x-asr-zh-en" not in asr.asr_models_supporting("gpu")
-    assert asr.asr_models_supporting("cpu") == sorted(asr.ASR_MODELS)
+    assert asr.asr_models_supporting("cpu") == sorted(
+        model for model, info in asr.ASR_MODELS.items() if "cpu" in info["devices"])
 
 
 @pytest.mark.parametrize("cfg, expected_dir", [
