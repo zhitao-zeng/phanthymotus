@@ -252,6 +252,9 @@ def build_ocr_payload(
     [x1,y1,x2,y2]), score, height, prominence and line so consumers can
     reason about size and importance; ``image_size`` ([width, height]) is
     the coordinate reference frame for every bbox.
+
+    Empty recognitions and failures send an explicit text acknowledgement
+    because topic consumers discard messages with both text and items empty.
     """
     items = annotate_ocr_items(results)
     lines: dict[int, list[dict]] = {}
@@ -266,7 +269,7 @@ def build_ocr_payload(
         for _line, members in sorted(lines.items())
     )
     payload = {
-        "text": text,
+        "text": text or ("文字识别失败。" if error is not None else "未识别到文字。"),
         "items": items,
         "timestamp": timestamp,
         "language": language,

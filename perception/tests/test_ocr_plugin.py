@@ -26,6 +26,29 @@ from utils.qos import CAMERA_QOS  # noqa: E402
 import plugins.ocr as ocr_plugin  # noqa: E402
 
 
+def test_empty_result_is_an_explicit_topic_reply():
+    from plugins.ocr_runtime import build_ocr_payload
+
+    payload = build_ocr_payload([], 7., "zh", image_size=(640, 480))
+    # The receiving topic client accepts a message only when text or items
+    # is nonempty. A completed empty recognition must not become a timeout.
+    assert payload["text"] or payload["items"]
+    assert payload["text"] == "未识别到文字。"
+    assert payload["items"] == []
+    assert payload["timestamp"] == 7.
+    assert payload["image_size"] == [640, 480]
+
+
+def test_failed_recognition_is_not_reported_as_a_successful_empty_result():
+    from plugins.ocr_runtime import build_ocr_payload
+
+    payload = build_ocr_payload([], 7., "zh", error=RuntimeError("inference failed"))
+    assert payload["text"] or payload["items"]
+    assert "识别失败" in payload["text"]
+    assert payload["error"] == "inference failed"
+    assert payload["items"] == []
+
+
 class _SlowOCRAdapter:
     def __init__(self, delay=0.15):
         self.delay = delay
@@ -454,7 +477,7 @@ def test_ocr_payload_empty_and_error():
     from plugins.ocr_runtime import build_ocr_payload
 
     payload = build_ocr_payload([], 0.0, "zh", error=RuntimeError("boom"))
-    assert payload["text"] == "" and payload["items"] == []
+    assert payload["text"] == "文字识别失败。" and payload["items"] == []
     assert payload["error"] == "boom"
 
 
