@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
             p.n_threads = 2; p.translate = false; p.no_context = true; p.language = "auto";
             p.print_realtime = false; p.print_progress = false;
             p.print_timestamps = false; p.print_special = false;
-            p.no_timestamps = true; p.temperature = 0; p.temperature_inc = 0.2;
+            p.no_timestamps = false; p.temperature = 0; p.temperature_inc = 0.2;
             p.greedy.best_of = 1;
             Deadline deadline{Clock::now()};
             p.abort_callback = Abort; p.abort_callback_user_data = &deadline;
