@@ -1,15 +1,20 @@
 // Persistent CUDA Whisper context; automatic language per independent PCM16 packet.
-// Derived from the preserved whisper_worker_utf8.cc; source model/library unchanged.
+// Optional per-language LoRA adapters: <model_dir>/lora/<lang>.wslr (e.g. ja.wslr,
+// th.wslr, ru.wslr) are loaded at startup; each packet runs a base encoder pass for
+// language ID, then decodes with the adapter whose language matches the detection.
+// Missing or empty lora/ dir keeps the exact base behavior.
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <dirent.h>
 #include "whisper.h"
 #include "json.hpp"
 
@@ -57,18 +62,40 @@ bool Abort(void *opaque) {
     return d->expired;
 }
 
+static std::map<std::string, int> LoadAdapters(whisper_context *ctx, const char *model_path) {
+    std::map<std::string, int> loaded;
+    std::string dir(model_path);
+    auto slash = dir.find_last_of('/');
+    if (slash != std::string::npos) dir.resize(slash);
+    dir += "/lora";
+    DIR *d = opendir(dir.c_str());
+    if (!d) return loaded;
+    while (dirent *e = readdir(d)) {
+        std::string name(e->d_name);
+        if (name.size() != 7 || name.substr(2) != ".wslr") continue;  // <2-letter-lang>.wslr
+        std::string lang = name.substr(0, 2);
+        int idx = whisper_lora_load(ctx, (dir + "/" + name).c_str());
+        if (idx >= 0) loaded[lang] = idx;
+    }
+    closedir(d);
+    return loaded;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
     auto started = Clock::now();
     auto cp = whisper_context_default_params(); cp.use_gpu = true;
     auto *ctx = whisper_init_from_file_with_params(argv[1], cp);
     if (!ctx) return 3;
+    auto adapters = LoadAdapters(ctx, argv[1]);
+    whisper_lora_set(ctx, -1);
     std::cout << Json({{"ready", true}, {"worker_pid", getpid()},
         {"load_s", std::chrono::duration<double>(Clock::now() - started).count()},
         {"language", "auto"}, {"threads", 2}, {"tail_samples", 4800},
         {"no_context", true}, {"translate", false}, {"temperature", 0},
         {"temperature_inc", 0.2},
-        {"sampling", "greedy"}, {"best_of", 1}, {"no_timestamps", true},
+        {"sampling", "greedy"}, {"best_of", 1}, {"no_timestamps", false},
+        {"lora_adapters", adapters.size()},
         {"gpu", true}, {"timeout_s", 120}}).dump() << std::endl;
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -77,8 +104,22 @@ int main(int argc, char **argv) {
             auto x = Wave(q.at("audio"));
             const auto original_samples = x.size();
             x.resize(original_samples + 4800, 0.0f); // Exactly one 300ms tail.
+            // Base encoder pass only for language ID; whisper_full re-encodes below
+            // with the selected adapter, mirroring the validated routing runner.
+            whisper_lora_set(ctx, -1);
+            if (whisper_pcm_to_mel(ctx, x.data(), static_cast<int>(x.size()), 4) != 0)
+                throw std::runtime_error("mel_failed");
+            if (whisper_encode(ctx, 0, 0) != 0)
+                throw std::runtime_error("encode_failed");
+            const int lang_id = whisper_lang_auto_detect(ctx, 0, 0, nullptr);
+            const std::string det = lang_id >= 0 ? whisper_lang_str(lang_id) : "";
+            int adapter = -1;
+            auto it = adapters.find(det);
+            if (it != adapters.end()) adapter = it->second;
+            whisper_lora_set(ctx, adapter);
             auto p = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-            p.n_threads = 2; p.translate = false; p.no_context = true; p.language = "auto";
+            p.n_threads = 2; p.translate = false; p.no_context = true;
+            p.language = det.empty() ? "auto" : det.c_str();
             p.print_realtime = false; p.print_progress = false;
             p.print_timestamps = false; p.print_special = false;
             p.no_timestamps = false; p.temperature = 0; p.temperature_inc = 0.2;
@@ -91,7 +132,8 @@ int main(int argc, char **argv) {
             Json out{{"worker_pid", getpid()}, {"decode_s", decode_s},
                 {"hwm_mib", usage.ru_maxrss / 1024.0}, {"input_samples", original_samples},
                 {"padded_samples", x.size()}, {"tail_samples", 4800}, {"return_code", code},
-                {"timeout", deadline.expired}};
+                {"timeout", deadline.expired}, {"lora", adapter >= 0 ? det : ""},
+                {"lid_s", det}};
             if (code) {
                 out["error"] = deadline.expired ? "packet_timeout" : "whisper_full_failed";
                 out["raw_text"] = ""; out["predicted_language"] = nullptr;
@@ -99,10 +141,10 @@ int main(int argc, char **argv) {
                 std::string text;
                 for (int i = 0; i < whisper_full_n_segments(ctx); ++i)
                     text += whisper_full_get_segment_text(ctx, i);
-                const int lang_id = whisper_full_lang_id(ctx);
+                const int final_lang = whisper_full_lang_id(ctx);
                 out["raw_text"] = text;
-                out["predicted_language_id"] = lang_id;
-                out["predicted_language"] = lang_id >= 0 ? whisper_lang_str(lang_id) : "unknown";
+                out["predicted_language_id"] = final_lang;
+                out["predicted_language"] = final_lang >= 0 ? whisper_lang_str(final_lang) : "unknown";
             }
             std::cout << out.dump(-1, ' ', false, Json::error_handler_t::replace) << std::endl;
         } catch (const std::exception &e) {
@@ -112,4 +154,5 @@ int main(int argc, char **argv) {
         }
     }
     whisper_free(ctx);
+    return 0;
 }

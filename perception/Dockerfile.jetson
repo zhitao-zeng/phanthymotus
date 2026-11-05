@@ -688,7 +688,7 @@ ENV LD_LIBRARY_PATH="/opt/asr-language-id/lib:${LD_LIBRARY_PATH}"
 # contains the prebuilt CUDA worker/libraries for both JetPack lines and the
 # Q5 GGML model; the runtime image has no nvcc.
 ARG TURBO_Q5=1
-ARG TURBO_RELEASE_REVISION=b6d2d45b57499ca255580ecac5d9c8366f4c1644
+ARG TURBO_RELEASE_REVISION=47992aba6d8881df1f587a2f64bc4135e7265885
 COPY perception/utils/install_whisper_turbo.py /tmp/install_whisper_turbo.py
 RUN if [ "${TURBO_Q5}" = "1" ]; then \
       python3 /tmp/install_whisper_turbo.py --jp ${JP_VERSION} --revision ${TURBO_RELEASE_REVISION} && \

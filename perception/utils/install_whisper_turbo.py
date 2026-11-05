@@ -84,12 +84,15 @@ def main() -> int:
     destination = Path(args.destination)
     wanted = [path for path in files if path.startswith(f"jp{args.jp}/")]
     wanted.append("model/ggml-large-v3-turbo-q5_0.bin")
+    wanted += sorted(path for path in files if path.startswith("lora/"))
     for relative in wanted:
         item = files.get(relative)
         if item is None:
             raise RuntimeError(f"release has no {relative}")
         if relative.startswith(f"jp{args.jp}/"):
             target = destination / relative.split("/", 1)[1]
+        elif relative.startswith("lora/"):
+            target = Path(args.model).parent / "lora" / relative.split("/", 1)[1]
         else:
             target = Path(args.model)
         print(f"[whisper-turbo] {relative} -> {target}", flush=True)
