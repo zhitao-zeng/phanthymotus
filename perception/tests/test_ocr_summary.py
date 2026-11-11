@@ -19,9 +19,10 @@ def test_coordinate_only_summary_keeps_each_side_separate():
              item("中央说明", [220, 75, 320, 95]),
              item("右侧标题", [420, 40, 520, 60])]
     summary = build_ocr_summary(items, (600, 300))
-    assert "画面中间：原文为“中央标题”、“中央说明”" in summary
-    assert "画面偏左：原文为“左侧标题”、“左侧说明”" in summary
-    assert "画面偏右：原文为“右侧标题”" in summary
+    assert "从左到右有3组并列文字" in summary
+    assert "“左侧标题”、“左侧说明”" in summary
+    assert "“中央标题”、“中央说明”" in summary
+    assert summary.index("左侧标题") < summary.index("中央标题") < summary.index("右侧标题")
 
 
 def test_singleton_never_needs_a_boundary_or_another_text():
@@ -103,7 +104,10 @@ def test_tilted_long_body_is_not_selected_just_because_bbox_is_tall():
 def test_low_score_fragments_are_preserved_and_marked_for_verification():
     entry = item("识别残片原文", [20, 20, 100, 40])
     entry["score"] = .92
-    assert "“识别残片原文”（OCR 分数较低，待核实）" in build_ocr_summary([entry], (600, 300))
+    summary = build_ocr_summary([entry], (600, 300))
+    assert "“识别残片原文”" in summary
+    assert "识别备注：识别残片原文的 OCR 置信度较低，待核实" in summary
+    assert entry["score"] == .92
 
 
 def test_bare_numbers_do_not_become_titles_because_they_are_large():
