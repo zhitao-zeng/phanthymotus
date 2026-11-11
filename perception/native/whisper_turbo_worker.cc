@@ -104,13 +104,11 @@ int main(int argc, char **argv) {
             auto x = Wave(q.at("audio"));
             const auto original_samples = x.size();
             x.resize(original_samples + 4800, 0.0f); // Exactly one 300ms tail.
-            // Base encoder pass only for language ID; whisper_full re-encodes below
-            // with the selected adapter, mirroring the validated routing runner.
+            // Language detection runs the base encoder internally. whisper_full
+            // re-encodes with the selected adapter for transcription.
             whisper_lora_set(ctx, -1);
             if (whisper_pcm_to_mel(ctx, x.data(), static_cast<int>(x.size()), 4) != 0)
                 throw std::runtime_error("mel_failed");
-            if (whisper_encode(ctx, 0, 0) != 0)
-                throw std::runtime_error("encode_failed");
             const int lang_id = whisper_lang_auto_detect(ctx, 0, 0, nullptr);
             const std::string det = lang_id >= 0 ? whisper_lang_str(lang_id) : "";
             int adapter = -1;

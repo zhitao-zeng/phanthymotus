@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -25,6 +26,14 @@ DEFAULT_BASE = ("https://www.modelscope.cn/models/"
 def fetch(url: str, destination: Path, size: int | None = None,
           sha256: str | None = None, retries: int = 4) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if size is not None and sha256 and destination.is_file() and destination.stat().st_size == size:
+        digest = hashlib.sha256()
+        with destination.open("rb") as existing:
+            for block in iter(lambda: existing.read(1 << 20), b""):
+                digest.update(block)
+        if digest.hexdigest() == sha256:
+            print(f"[whisper-turbo] reusing verified {destination.name}", flush=True)
+            return
     temporary = destination.with_name(destination.name + ".part")
     for attempt in range(1, retries + 1):
         try:
@@ -98,9 +107,18 @@ def main() -> int:
         print(f"[whisper-turbo] {relative} -> {target}", flush=True)
         fetch(base + "/" + urllib.parse.quote(relative), target,
               item["size"], item["sha256"])
-        if relative.endswith("whisper_turbo_worker"):
+        if relative.startswith(f"jp{args.jp}/bin/"):
             target.chmod(0o755)
     make_symlinks(destination / "lib")
+    # JP5's worker-private CUDA runtime enables lazy module loading without
+    # replacing the image's CUDA libraries used by other plugins.
+    packages = manifest.get("cuda_runtime_packages", {}).get(f"jp{args.jp}", [])
+    for package in packages:
+        archive = Path("/tmp/whisper-cuda-runtime") / package["filename"]
+        fetch(package["url"], archive, package["size"], package["sha256"])
+        subprocess.run(["dpkg-deb", "-x", str(archive),
+                        str(destination / "cuda-runtime")], check=True)
+        archive.unlink()
     print("[whisper-turbo] installed", flush=True)
     return 0
 
