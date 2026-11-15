@@ -1613,3 +1613,45 @@ def test_none_class_38_does_not_collide_with_absent_activity_sentinel():
     third = push_one()
     assert third["activity"] == "none"
     assert third["activity_zh"] == "无动作"
+
+
+def test_action_engine_is_shared_across_stop_and_start_cycles(monkeypatch):
+    """Retiring and restarting a topic must reuse the resident ST-GCN++ engine
+    rather than re-deserializing a fresh TensorRTEngine on every start."""
+    import plugins.pose_stgcn as pose_stgcn
+
+    load_calls = []
+
+    class _FakeActionEngine:
+        input_shape = (1, 2, 100, 17, 6)
+        output_shape = (1, 126)
+
+        def infer(self, blob):
+            logits = np.full((1, 126), -10.0, dtype=np.float32)
+            logits[0, 0] = 8.0
+            return [logits]
+
+    def _fake_load(model_dir=None):
+        load_calls.append(model_dir)
+        return _FakeActionEngine()
+
+    monkeypatch.setattr(pose_stgcn, "load_action_engine", _fake_load)
+    plugin, _ = _plugin({
+        "action_backend": "hybrid",
+        "action_modality": "jb",
+        "prenorm_mode": "fix",
+        "min_motion": 0.0,
+        "strict_vocabulary": True,
+        "action_min_score": 0.08,
+        "activity_interval_s": 0.0,
+        "label_hold": 1,
+    })
+
+    for _ in range(3):
+        plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+        node = _feed(plugin, "/cam/rgb", frames=2)
+        last = json.loads(_publisher(node, "/cam/rgb/poses").messages[-1])
+        assert last["persons"][0]["activity"] == "drink water"
+        plugin.dispatch("pose", {"action": "stop", "input_topic": "/cam/rgb"})
+
+    assert len(load_calls) == 1

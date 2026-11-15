@@ -407,6 +407,42 @@ def pre_normalize_2d(keypoints: np.ndarray, image_size, mode: str = "auto") -> n
     return out
 
 
+def load_action_engine(model_dir: Optional[str] = None):
+    """Resolve and deserialize the TensorRT action engine once."""
+    from utils.model_downloader import (
+        ACTION_MODEL_BUNDLES,
+        _bundle_matches,
+        ensure_action_model,
+        select_bundle_family,
+    )
+    from utils.model_progress import fetch_status
+    from utils.tensorrt_runtime import TensorRTEngine
+
+    resolved_dir = model_dir or os.environ.get("ACTION_MODEL_DIR", "/models/action")
+    engine = None
+    if resolved_dir == "/models/action" and not os.environ.get("ACTION_MODEL_DIR"):
+        try:
+            key = select_bundle_family(ACTION_MODEL_BUNDLES)
+            files = ACTION_MODEL_BUNDLES[key]["files"]
+            seed_dir = os.path.join("/opt/vision-action", key)
+            if _bundle_matches(seed_dir, files):
+                engine = next(
+                    os.path.join(seed_dir, name)
+                    for name in files if name.endswith(".engine")
+                )
+        except Exception:  # noqa: BLE001 — fall through to /models
+            engine = None
+
+    if engine is None:
+        progress_cb, _ = fetch_status(lambda text: None, "stgcn++")
+        paths = ensure_action_model(resolved_dir, progress_cb=progress_cb)
+        engine = next(p for name, p in paths.items() if name.endswith(".engine"))
+    log.info("[pose/stgcn] loading action engine: %s", engine)
+    # TensorRTEngine directly, not VisionEngineSession: that class letterboxes
+    # an image, and this engine takes a skeleton tensor.
+    return TensorRTEngine(engine)
+
+
 class SkeletonActionBackend:
     """ST-GCN++ over a person's keypoint history.
 
@@ -421,7 +457,8 @@ class SkeletonActionBackend:
                  min_motion: float = MIN_MOTION,
                  modality: str = "auto",
                  model_dir: Optional[str] = None,
-                 engine=None, thresholds: Optional[dict] = None,
+                 engine=None, engine_loader=None,
+                 thresholds: Optional[dict] = None,
                  action_window_s: Optional[float] = None):
         self.window_s = float(action_window_s or window_s)
         self.min_score = float(min_score)
@@ -437,6 +474,7 @@ class SkeletonActionBackend:
         self._model_dir = model_dir or os.environ.get("ACTION_MODEL_DIR",
                                                       "/models/action")
         self._engine = engine          # injectable, which is what makes this testable
+        self._engine_loader = engine_loader
         self._vocab_size: Optional[int] = None
         self._lock = threading.Lock()
         self._load_error: Optional[str] = None
@@ -475,38 +513,10 @@ class SkeletonActionBackend:
         with self._lock:
             if self._engine is not None:
                 return self._engine
-            from utils.model_downloader import (
-                ACTION_MODEL_BUNDLES,
-                _bundle_matches,
-                ensure_action_model,
-                select_bundle_family,
-            )
-            from utils.model_progress import fetch_status
-
-            engine = None
-            if (self._model_dir == "/models/action"
-                    and not os.environ.get("ACTION_MODEL_DIR")):
-                try:
-                    key = select_bundle_family(ACTION_MODEL_BUNDLES)
-                    files = ACTION_MODEL_BUNDLES[key]["files"]
-                    seed_dir = os.path.join("/opt/vision-action", key)
-                    if _bundle_matches(seed_dir, files):
-                        engine = next(
-                            os.path.join(seed_dir, name)
-                            for name in files if name.endswith(".engine")
-                        )
-                except Exception:  # noqa: BLE001 — fall through to /models
-                    engine = None
-
-            if engine is None:
-                progress_cb, _ = fetch_status(lambda text: None, "stgcn++")
-                paths = ensure_action_model(self._model_dir, progress_cb=progress_cb)
-                engine = next(p for name, p in paths.items() if name.endswith(".engine"))
-            log.info("[pose/stgcn] loading action engine: %s", engine)
-            # TensorRTEngine directly, not VisionEngineSession: that class
-            # letterboxes an image, and this engine takes a skeleton tensor.
-            from utils.tensorrt_runtime import TensorRTEngine
-            self._engine = TensorRTEngine(engine)
+            if self._engine_loader is not None:
+                self._engine = self._engine_loader()
+            else:
+                self._engine = load_action_engine(self._model_dir)
             return self._engine
 
     def _window_frames(self) -> int:

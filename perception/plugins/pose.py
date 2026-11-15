@@ -314,7 +314,7 @@ TOOLS = [
                 "publish_gesture_events": {"type": "boolean", "title": "Send gesture events", "description": "Tell the robot when someone gestures at it. One message when a gesture starts and one when it ends — not every frame.", "default": True, "scope": "instance"},
                 "gesture_whitelist": {"type": "array", "items": {"type": "string"}, "title": "Gestures to report", "description": f"Which actions count as gesturing at the robot. Default: {', '.join(DEFAULT_GESTURES + DEFAULT_HAND_GESTURES)}. The last five need `hands: gesture`. Also available: {', '.join(OPTIONAL_GESTURES)}, thumbs_up.", "default": list(DEFAULT_GESTURES + DEFAULT_HAND_GESTURES), "scope": "instance"},
                 "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Person detection threshold", "description": "Lower finds more people and more false ones.", "default": 0.35, "scope": "instance"},
-                "fps": {"type": "integer", "minimum": 1, "title": "Frames per second", "description": "How often to look. Below 12 the action model gets too few frames to judge movement, and `info` will say so.", "default": 12, "scope": "instance"},
+                "fps": {"type": "integer", "minimum": 1, "title": "Frames per second", "description": "How often to look. Below 12 the action model gets too few frames to judge movement, and `info` will say so.", "default": 8, "scope": "instance"},
                 "max_persons": {"type": "integer", "minimum": 1, "title": "Max people per frame", "description": "Most confident first when there are more.", "default": 5, "scope": "instance"},
                 "publish_overlay": {"type": "boolean", "title": "Draw skeleton on the video", "description": "Publishes a second video stream with the skeleton drawn on it. Costs a draw and a JPEG encode per frame, so it is off unless you want to watch or record it.", "default": False, "scope": "instance"},
 
@@ -339,8 +339,8 @@ TOOLS = [
 
                 # ── advanced: action recognition ────────────────────────────
                 "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "title": "Action recognition", "description": "hybrid uses geometry for posture and a trained model for movement. rules uses geometry only and loads no second model — useful for telling a model mistake apart from a geometry mistake.", "default": "hybrid", "scope": "instance", "advanced": True},
-                "action_window_s": {"type": "number", "minimum": 0.2, "title": "Movement look-back (s)", "description": "How much recent movement is used to judge waving and walking.", "default": 3.5, "scope": "instance", "advanced": True},
-                "activity_interval_s": {"type": "number", "minimum": 0.0, "title": "Action model interval (s)", "description": "The action model judges a clip, so running it every frame re-reads almost the same input. Posture stays frame-rate regardless.", "default": 0.30, "scope": "instance", "advanced": True},
+                "action_window_s": {"type": "number", "minimum": 0.2, "title": "Movement look-back (s)", "description": "How much recent movement is used to judge waving and walking.", "default": 5.0, "scope": "instance", "advanced": True},
+                "activity_interval_s": {"type": "number", "minimum": 0.0, "title": "Action model interval (s)", "description": "The action model judges a clip, so running it every frame re-reads almost the same input. Posture stays frame-rate regardless.", "default": 0.45, "scope": "instance", "advanced": True},
                 "label_hold": {"type": "integer", "minimum": 1, "title": "Label stability (frames)", "description": "How many frames a new label must win before it replaces the current one. A label flickering several times a second is worse than a steady wrong one.", "default": 1, "scope": "instance", "advanced": True},
                 "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Action score threshold", "description": "Falls use a higher bar of their own: a false fall makes the robot drop what it is doing to ask if someone is hurt.", "default": 0.08, "scope": "instance", "advanced": True},
 
@@ -1109,6 +1109,11 @@ class PosePerceptionPlugin:
         self._hand_load_error: Optional[str] = None
         self._hand_model_lock = threading.Lock()
 
+        # Shared resident ST-GCN++ TensorRT engine so stop/start cycles and
+        # multi-topic instances reuse one CUDA context and buffer allocation.
+        self._action_model = None
+        self._action_model_lock = threading.Lock()
+
         self._nodes: dict[str, _PoseNode] = {}
         self._instance_configs: dict[str, dict] = {}
         # What the camera feeding each instance said about its optics. `position`
@@ -1276,6 +1281,18 @@ class PosePerceptionPlugin:
             min_score=merged["gesture_min_score"],
         )
 
+    def _ensure_action_model(self):
+        """Load the skeleton-action TensorRT engine once and reuse it."""
+        if self._action_model is not None:
+            return self._action_model
+        with self._action_model_lock:
+            if self._action_model is not None:
+                return self._action_model
+            from plugins.pose_stgcn import load_action_engine
+
+            self._action_model = load_action_engine()
+            return self._action_model
+
     def _classifier_for(self, merged: dict):
         """Build the configured action backend.
 
@@ -1303,6 +1320,7 @@ class PosePerceptionPlugin:
                 min_motion=merged["min_motion"],
                 modality=merged["action_modality"],
                 strict_vocabulary=merged["strict_vocabulary"],
+                engine_loader=self._ensure_action_model,
             )
         except Exception as error:  # noqa: BLE001 — the card must still work
             self._backend_fallback = (
