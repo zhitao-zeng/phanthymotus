@@ -598,10 +598,14 @@ class STGCNClassifier(nn.Module):
     then the classifier.
     """
 
-    def __init__(self, num_classes: int = 60, in_channels: int = 256):
+    def __init__(self, num_classes: int = 60, in_channels: int = 256,
+                 stem_channels: int = 3):
         super().__init__()
+        self.stem_channels = stem_channels
+        self.num_classes = num_classes
         self.backbone = STGCN(
             graph_cfg=dict(layout="coco", mode="spatial"),
+            in_channels=stem_channels,
             gcn_adaptive="init", gcn_with_res=True, tcn_type="mstcn",
         )
         self.cls_head = nn.Module()
@@ -616,7 +620,8 @@ class STGCNClassifier(nn.Module):
         return self.cls_head.fc_cls(x)
 
 
-def load_model(checkpoint: str) -> STGCNClassifier:
+def load_model(checkpoint: str, num_classes: int | None = None,
+               stem_channels: int | None = None) -> STGCNClassifier:
     """Build and load, insisting on an exact match.
 
     `strict=True` is the whole verification story for the vendored source: if a
@@ -626,7 +631,14 @@ def load_model(checkpoint: str) -> STGCNClassifier:
     """
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     state = state.get("state_dict", state)
-    model = STGCNClassifier()
+    if num_classes is None and "cls_head.fc_cls.weight" in state:
+        num_classes = int(state["cls_head.fc_cls.weight"].shape[0])
+    if stem_channels is None and "backbone.gcn.0.gcn.conv.weight" in state:
+        stem_channels = int(state["backbone.gcn.0.gcn.conv.weight"].shape[1])
+    model = STGCNClassifier(
+        num_classes=num_classes or 60,
+        stem_channels=stem_channels or 3,
+    )
     missing, unexpected = model.load_state_dict(state, strict=False)
     missing = [k for k in missing if "num_batches_tracked" not in k]
     unexpected = [k for k in unexpected if "num_batches_tracked" not in k]
@@ -648,15 +660,22 @@ def main() -> int:
     parser.add_argument("--frames", type=int, default=100,
                         help="T, the clip length the checkpoint was trained "
                              "with (default %(default)s)")
+    parser.add_argument("--num-classes", type=int, default=None,
+                        help="Output class count (inferred from checkpoint if omitted)")
+    parser.add_argument("--stem-channels", type=int, default=None,
+                        help="Input channels per joint, e.g. 3 for j/b or 6 for jb "
+                             "(inferred from checkpoint if omitted)")
     parser.add_argument("--opset", type=int, default=16)
     args = parser.parse_args()
 
-    model = load_model(args.checkpoint)
+    model = load_model(args.checkpoint, num_classes=args.num_classes,
+                       stem_channels=args.stem_channels)
     params = sum(p.numel() for p in model.parameters())
-    print(f"[export] loaded, strict match, {params/1e6:.2f} M parameters",
+    print(f"[export] loaded, strict match, {params/1e6:.2f} M parameters "
+          f"(in_channels={model.stem_channels}, num_classes={model.num_classes})",
           flush=True)
 
-    shape = (1, 2, args.frames, 17, 3)
+    shape = (1, 2, args.frames, 17, model.stem_channels)
     example = torch.zeros(shape, dtype=torch.float32)
     # Not zeros for the check: an all-zero skeleton is a degenerate input and
     # would hide a transposed axis behind a symmetric answer.

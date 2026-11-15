@@ -1563,3 +1563,53 @@ def test_a_global_config_call_keeps_the_fall_thresholds():
     assert merged["fall_settle_s"] == 2.5
     assert merged["fall_drop_ratio"] == 0.4
     assert merged["fall_drop_window_s"] == 1.5
+
+
+def test_none_class_38_does_not_collide_with_absent_activity_sentinel():
+    """Class 38 in OFFICIAL_126_CLASSES is ("无动作", "none"). Passing literal
+    `"none"` to `activity_stabiliser` when `activity is None` previously treated
+    absence and class 38 as the same token."""
+    class _NoneClassClassifier:
+        history_s = 3.0
+        last_error = None
+
+        def __init__(self):
+            self.emit_none_class = False
+
+        def classify(self, frames, want_activity=True):
+            act = (
+                {"name": "none", "name_zh": "无动作", "score": 0.88,
+                 "ntu_class": 38, "action_id": 38, "source": "stgcn"}
+                if self.emit_none_class
+                else None
+            )
+            return {"posture": "standing", "posture_confidence": 0.9,
+                    "activity": act, "evidence": {}}
+
+    plugin, _ = _plugin({"label_hold": 2, "activity_interval_s": 0.0})
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = plugin._nodes["/cam/rgb"]
+    clf = _NoneClassClassifier()
+    node._classifier = clf
+
+    lean = _publisher(node, "/cam/rgb/poses")
+
+    def push_one():
+        before = len(lean.messages)
+        node._last_inference_time -= 0.25
+        node.subscriptions[0].callback(_FakeCompressedImage(frame_bytes(FRAME_W, FRAME_H)))
+        _wait_until(lambda: len(lean.messages) > before, timeout=3.0)
+        return json.loads(lean.messages[-1])["persons"][0]
+
+    # Frame 1: absent activity (None) primes stabiliser with "__absent__", NOT "none".
+    assert "activity" not in push_one()
+
+    # Frame 2: model emits class 38 ("none") — with hold=2 it must still be held back
+    # for 1 frame rather than matching the absent sentinel immediately!
+    clf.emit_none_class = True
+    assert "activity" not in push_one()
+
+    # Frame 3: second consecutive "none" satisfies hold=2 and publishes "none" / "无动作".
+    third = push_one()
+    assert third["activity"] == "none"
+    assert third["activity_zh"] == "无动作"

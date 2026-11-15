@@ -5,6 +5,7 @@ utils/model_downloader.py — Auto-download sherpa-onnx models from COS if missi
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import os
 import tarfile
@@ -12,8 +13,8 @@ import tempfile
 import time
 import zipfile
 from urllib.error import URLError
-from urllib.parse import quote
-from urllib.request import Request, urlopen, urlretrieve
+from urllib.parse import quote, urlparse
+from urllib.request import ProxyHandler, Request, build_opener, urlopen, urlretrieve
 
 try:  # Linux only; the perception images are Linux, dev hosts may not be.
     import fcntl
@@ -285,8 +286,37 @@ def _common_prefix_from_names(names: list[str]) -> str:
 
 MODELS_ROOT = "/models"
 
+_ORIG_URLOPEN = urlopen
+_NO_PROXY_OPENER = None
 
-def require_models_subpath(path: str, root: str = MODELS_ROOT) -> str:
+
+def _is_private_or_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    cleaned = host.strip("[]").lower()
+    if cleaned == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(cleaned)
+        return addr.is_private or addr.is_loopback
+    except ValueError:
+        return False
+
+
+def _open_url(req_or_url, timeout: float = 120):
+    """Open URL directly when targeting RFC1918/loopback hosts, respecting monkeypatched urlopen."""
+    if urlopen is not _ORIG_URLOPEN:
+        return urlopen(req_or_url, timeout=timeout)
+    raw_url = req_or_url.full_url if isinstance(req_or_url, Request) else str(req_or_url)
+    if _is_private_or_loopback_host(urlparse(raw_url).hostname):
+        global _NO_PROXY_OPENER
+        if _NO_PROXY_OPENER is None:
+            _NO_PROXY_OPENER = build_opener(ProxyHandler({}))
+        return _NO_PROXY_OPENER.open(req_or_url, timeout=timeout)
+    return urlopen(req_or_url, timeout=timeout)
+
+
+def require_models_subpath(path: str, root: str | None = None) -> str:
     """Validate that a caller-supplied model_dir stays inside the models tree.
 
     model_dir is accepted over MCP config and the downloader runs as root in
@@ -300,6 +330,8 @@ def require_models_subpath(path: str, root: str = MODELS_ROOT) -> str:
     created later — and compare the resolved paths. Returns the resolved
     absolute path, which callers must use for all filesystem work.
     """
+    if root is None:
+        root = MODELS_ROOT
     candidate = os.path.normpath(os.path.join("/", str(path)))
     root_real = os.path.realpath(root)
 
@@ -469,7 +501,7 @@ def _fetch_pinned_file(
             )
             fetched = 0
             last_pct = 0
-            with urlopen(url, timeout=120) as response, open(destination, "wb") as output:
+            with _open_url(url, timeout=120) as response, open(destination, "wb") as output:
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
@@ -548,7 +580,7 @@ def _probe_source(source: str, filename: str) -> float:
     request = Request(url, headers={"Range": f"bytes=0-{_PROBE_BYTES - 1}"})
     start = time.monotonic()
     try:
-        with urlopen(request, timeout=_PROBE_TIMEOUT) as response:
+        with _open_url(request, timeout=_PROBE_TIMEOUT) as response:
             read = len(response.read(_PROBE_BYTES))
     except Exception as error:      # noqa: BLE001 — an unusable source is a result
         log.info(f"[model_downloader] probe failed for {url}: {error}")
@@ -1453,41 +1485,40 @@ HAND_ONNX_BASE = os.environ.get(
 # dataset terms are academic-research; a model trained on it inherits that
 # question for a commercial deployment. Recorded here as a fact to check, not
 # settled by this file.
+ACTION_BUNDLE_BASE = os.environ.get(
+    "ACTION_BUNDLE_BASE_URL",
+    "http://172.28.4.81:34567/zengzhitao/embodied-ai/action-stgcnpp126-v1-20261116")
+
 ACTION_CHECKPOINT_BASE = os.environ.get(
     "ACTION_CHECKPOINT_BASE_URL",
-    f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/checkpoint")
+    f"{ACTION_BUNDLE_BASE}/checkpoint")
 
 ACTION_CHECKPOINT = {
-    "stgcnpp_ntu60_xsub_hrnet_j.pth": {
-        "size": 5854105,
-        "sha256": "b274888dd5b7bd8552ce4e3c3073973af84fa0fd18fd94363eac25457f225992",
+    "stgcnpp-action126-jb.pth": {
+        "size": 5879010,
+        "sha256": "c1884c5d147c98a1a882113410f7abfe2dec55c97a2d946c06d8e9792354aca4",
     },
 }
 
 
 ACTION_MODEL_BUNDLES = {
     "jp61": {
-        "base_url": f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/tensorrt-jp61-trt10.4-orin-t100",
+        "base_url": f"{ACTION_BUNDLE_BASE}/jp61",
         "files": {
-            "stgcnpp-ntu60-2d.engine": {
-                "size": 4384468,
-                "sha256": "fea60df0ebfa190dd1483705d1e53bd3124480afd6612258c6545e919e6f74f6",
+            "stgcnpp-action126.engine": {
+                "size": 4365668,
+                "sha256": "9c33bf28de7906aab491b9b598fb68000193ff2bdaa86aa309cff3dd3be43485",
             },
         },
     },
-    # Same checkpoint and the same ONNX graph as jp61 — only the TensorRT that
-    # built the plan differs (8.5.2.2), which is why the bytes and the size do.
-    # Measurably slower on the older line: 8.62 ms GPU latency against jp61's
-    # 4.66 ms for an identical (1, 2, 100, 17, 3) input, so a jp5.11 robot has
-    # roughly half the action-inference headroom. The ~3 Hz per-track throttle
-    # in plugins/pose.py was sized with margin and still holds, but anything
-    # that raises activity_interval_s should be checked here first.
+    # Same checkpoint and 6-channel joint+bone ONNX graph (1, 2, 100, 17, 6) as
+    # jp61, built with TensorRT 8.5.2.2 inside the jp5.11 perception image.
     "jp511": {
-        "base_url": f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/tensorrt-jp511-trt8.5-orin-t100",
+        "base_url": f"{ACTION_BUNDLE_BASE}/jp511",
         "files": {
-            "stgcnpp-ntu60-2d.engine": {
-                "size": 3842709,
-                "sha256": "8a627bf92d372ba87eaf81062051ff1da7e2e759543161eb8a5d66c84a871268",
+            "stgcnpp-action126.engine": {
+                "size": 4386029,
+                "sha256": "2e289e84c26e5d55016f0bc67bc6e719a52f09a5d110ee932acc5d1e72d5dd28",
             },
         },
     },

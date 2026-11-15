@@ -67,6 +67,8 @@ from plugins.pose_stgcn import (
     BACKENDS,
     DEFAULT_MIN_SCORE,
     DEFAULT_WINDOW_S,
+    MIN_MOTION,
+    PRENORM_MODE,
     action_vocabulary,
     build_backend,
 )
@@ -311,7 +313,7 @@ TOOLS = [
                 "hands": {"type": "boolean", "title": "Hand keypoints and gestures", "description": "21 points per hand, and the shape they make — open palm, fist, pointing, V, OK. Off by default because it loads a second model; naming the shape on top of the points costs nothing. Near range only: calling the robot from across a room is handled by the body gestures below and does not need this.", "default": False, "scope": "instance"},
                 "publish_gesture_events": {"type": "boolean", "title": "Send gesture events", "description": "Tell the robot when someone gestures at it. One message when a gesture starts and one when it ends — not every frame.", "default": True, "scope": "instance"},
                 "gesture_whitelist": {"type": "array", "items": {"type": "string"}, "title": "Gestures to report", "description": f"Which actions count as gesturing at the robot. Default: {', '.join(DEFAULT_GESTURES + DEFAULT_HAND_GESTURES)}. The last five need `hands: gesture`. Also available: {', '.join(OPTIONAL_GESTURES)}, thumbs_up.", "default": list(DEFAULT_GESTURES + DEFAULT_HAND_GESTURES), "scope": "instance"},
-                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Person detection threshold", "description": "Lower finds more people and more false ones.", "default": 0.4, "scope": "instance"},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Person detection threshold", "description": "Lower finds more people and more false ones.", "default": 0.35, "scope": "instance"},
                 "fps": {"type": "integer", "minimum": 1, "title": "Frames per second", "description": "How often to look. Below 12 the action model gets too few frames to judge movement, and `info` will say so.", "default": 12, "scope": "instance"},
                 "max_persons": {"type": "integer", "minimum": 1, "title": "Max people per frame", "description": "Most confident first when there are more.", "default": 5, "scope": "instance"},
                 "publish_overlay": {"type": "boolean", "title": "Draw skeleton on the video", "description": "Publishes a second video stream with the skeleton drawn on it. Costs a draw and a JPEG encode per frame, so it is off unless you want to watch or record it.", "default": False, "scope": "instance"},
@@ -337,10 +339,10 @@ TOOLS = [
 
                 # ── advanced: action recognition ────────────────────────────
                 "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "title": "Action recognition", "description": "hybrid uses geometry for posture and a trained model for movement. rules uses geometry only and loads no second model — useful for telling a model mistake apart from a geometry mistake.", "default": "hybrid", "scope": "instance", "advanced": True},
-                "action_window_s": {"type": "number", "minimum": 0.2, "title": "Movement look-back (s)", "description": "How much recent movement is used to judge waving and walking.", "default": 1.5, "scope": "instance", "advanced": True},
-                "activity_interval_s": {"type": "number", "minimum": 0.0, "title": "Action model interval (s)", "description": "The action model judges a clip, so running it every frame re-reads almost the same input. Posture stays frame-rate regardless.", "default": 0.35, "scope": "instance", "advanced": True},
-                "label_hold": {"type": "integer", "minimum": 1, "title": "Label stability (frames)", "description": "How many frames a new label must win before it replaces the current one. A label flickering several times a second is worse than a steady wrong one.", "default": 3, "scope": "instance", "advanced": True},
-                "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Action score threshold", "description": "Falls use a higher bar of their own: a false fall makes the robot drop what it is doing to ask if someone is hurt.", "default": DEFAULT_MIN_SCORE, "scope": "instance", "advanced": True},
+                "action_window_s": {"type": "number", "minimum": 0.2, "title": "Movement look-back (s)", "description": "How much recent movement is used to judge waving and walking.", "default": 3.5, "scope": "instance", "advanced": True},
+                "activity_interval_s": {"type": "number", "minimum": 0.0, "title": "Action model interval (s)", "description": "The action model judges a clip, so running it every frame re-reads almost the same input. Posture stays frame-rate regardless.", "default": 0.30, "scope": "instance", "advanced": True},
+                "label_hold": {"type": "integer", "minimum": 1, "title": "Label stability (frames)", "description": "How many frames a new label must win before it replaces the current one. A label flickering several times a second is worse than a steady wrong one.", "default": 1, "scope": "instance", "advanced": True},
+                "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Action score threshold", "description": "Falls use a higher bar of their own: a false fall makes the robot drop what it is doing to ask if someone is hurt.", "default": 0.08, "scope": "instance", "advanced": True},
 
                 # ── advanced: fall detection, camera-dependent ──────────────
                 "fall_drop_ratio": {"type": "number", "minimum": 0.05, "maximum": 1.0, "title": "Fall: hip drop", "description": "How far the hips must drop, as a fraction of standing height. Depends on where the camera is mounted — a lens at 0.4 m and one at 1.2 m measure the same fall differently, so tune this on the robot.", "default": DEFAULT_THRESHOLDS["fall_drop_ratio"], "scope": "instance", "advanced": True},
@@ -370,6 +372,7 @@ class _PoseNode(Node):
                  publish_keypoints: str = "off", publish_bbox: bool = True,
                  publish_overlay: bool = False, label_hold: int = 3,
                  activity_interval_s: float = 0.35,
+                 tracker_timeout_s: float = 1.0,
                  gesture_tracker: Optional[GestureEventTracker] = None,
                  publish_gesture_events: bool = True,
                  hand_channel=None, publish_hand_keypoints: str = "off",
@@ -406,6 +409,7 @@ class _PoseNode(Node):
         # from "the model was never asked" or "nothing cleared the threshold".
         self._last_prediction: dict = {}
         self._tracker = PoseTracker(history_s=classifier.history_s,
+                                   timeout_s=tracker_timeout_s,
                                    min_conf=kpt_confidence,
                                    label_hold=label_hold)
 
@@ -642,12 +646,12 @@ class _PoseNode(Node):
 
             activity = verdict.get("activity")
             name, _ = track.activity_stabiliser.update(
-                activity["name"] if activity else "none")
+                activity["name"] if activity else "__absent__")
             if activity and name != activity["name"]:
                 verdict["evidence"] = {**(verdict.get("evidence") or {}),
                                        "raw_activity": activity["name"]}
                 verdict["activity"] = None
-            elif not activity and name != "none":
+            elif not activity and name != "__absent__":
                 # The stabiliser is still holding the previous activity; do not
                 # resurrect it with a stale score, just say nothing this frame.
                 pass
@@ -1072,6 +1076,15 @@ class PosePerceptionPlugin:
             str(plugin_cfg.get("action_backend", "hybrid")))
         self._action_min_score = float(
             plugin_cfg.get("action_min_score", DEFAULT_MIN_SCORE))
+        self._prenorm_mode = str(plugin_cfg.get("prenorm_mode", PRENORM_MODE))
+        self._min_motion = float(plugin_cfg.get("min_motion", MIN_MOTION))
+        self._action_modality = str(plugin_cfg.get("action_modality", "auto"))
+        self._strict_vocabulary = (
+            bool(plugin_cfg["strict_vocabulary"])
+            if "strict_vocabulary" in plugin_cfg and plugin_cfg["strict_vocabulary"] is not None
+            else None
+        )
+        self._tracker_timeout_s = float(plugin_cfg.get("tracker_timeout_s", 1.0))
         self._label_hold = int(plugin_cfg.get("label_hold", 3))
         self._activity_interval_s = float(
             plugin_cfg.get("activity_interval_s", 0.35))
@@ -1130,6 +1143,16 @@ class PosePerceptionPlugin:
                 str(icfg.get("action_backend", self._action_backend))),
             "action_min_score": float(icfg.get("action_min_score",
                                                self._action_min_score)),
+            "prenorm_mode": str(icfg.get("prenorm_mode", self._prenorm_mode)),
+            "min_motion": float(icfg.get("min_motion", self._min_motion)),
+            "action_modality": str(icfg.get("action_modality", self._action_modality)),
+            "strict_vocabulary": (
+                bool(icfg["strict_vocabulary"])
+                if "strict_vocabulary" in icfg and icfg["strict_vocabulary"] is not None
+                else self._strict_vocabulary
+            ),
+            "tracker_timeout_s": float(icfg.get("tracker_timeout_s",
+                                                self._tracker_timeout_s)),
             "label_hold": int(icfg.get("label_hold", self._label_hold)),
             "activity_interval_s": float(icfg.get(
                 "activity_interval_s", self._activity_interval_s)),
@@ -1276,6 +1299,10 @@ class PosePerceptionPlugin:
                 action_window_s=merged["action_window_s"],
                 window_s=max(merged["action_window_s"], DEFAULT_WINDOW_S),
                 min_score=merged["action_min_score"],
+                prenorm_mode=merged["prenorm_mode"],
+                min_motion=merged["min_motion"],
+                modality=merged["action_modality"],
+                strict_vocabulary=merged["strict_vocabulary"],
             )
         except Exception as error:  # noqa: BLE001 — the card must still work
             self._backend_fallback = (
@@ -1343,8 +1370,26 @@ class PosePerceptionPlugin:
         if configured.endswith(".engine") and os.path.isfile(configured):
             return configured
 
-        from utils.model_downloader import ensure_pose_model
+        from utils.model_downloader import (
+            POSE_MODEL_BUNDLES,
+            _bundle_matches,
+            ensure_pose_model,
+            select_bundle_family,
+        )
         from utils.model_progress import fetch_status
+
+        if not os.environ.get("POSE_MODEL_DIR"):
+            try:
+                key = select_bundle_family(POSE_MODEL_BUNDLES)
+                files = POSE_MODEL_BUNDLES[key]["files"]
+                seed_dir = os.path.join("/opt/vision-pose", key)
+                if _bundle_matches(seed_dir, files):
+                    return next(
+                        os.path.join(seed_dir, name)
+                        for name in files if name.endswith(".engine")
+                    )
+            except Exception:  # noqa: BLE001 — fall through to /models
+                pass
 
         model_dir = os.environ.get("POSE_MODEL_DIR", "/models/pose")
         progress_cb, _ = fetch_status(
@@ -1623,6 +1668,7 @@ class PosePerceptionPlugin:
                 publish_overlay=merged["publish_overlay"],
                 label_hold=merged["label_hold"],
                 activity_interval_s=merged["activity_interval_s"],
+                tracker_timeout_s=merged["tracker_timeout_s"],
                 gesture_tracker=self._gesture_tracker_for(merged),
                 publish_gesture_events=merged["publish_gesture_events"],
                 hand_channel=self._hand_channel_for(merged),
@@ -1707,12 +1753,20 @@ class PosePerceptionPlugin:
 
         elif action == "list_actions":
             effective = self._effective_backend()
+            vocab_size = 126 if self._strict_vocabulary else 60
+            with self._nodes_lock:
+                for node in self._nodes.values():
+                    learned = getattr(node._classifier, "learned", node._classifier)
+                    if getattr(learned, "vocab_size", 60) == 126:
+                        vocab_size = 126
+                        break
             return {
                 "ok": True,
                 "backend": effective,
                 # Two vocabularies, because two questions are being answered.
                 "postures": sorted(POSTURE_LABELS_ZH),
-                "activities": (action_vocabulary() if effective != "rules" else []),
+                "activities": (action_vocabulary(vocab_size)
+                               if effective != "rules" else []),
                 "backend_note": (
                     "hybrid：posture（身体是什么姿势）来自关键点几何，单帧可判；"
                     "activity（人在做什么）来自 ST-GCN++，用它自己的 NTU-60 词表，"
@@ -2112,6 +2166,16 @@ class PosePerceptionPlugin:
             self._action_backend = self._migrate_backend(str(cfg["action_backend"]))
         if "action_min_score" in cfg:
             self._action_min_score = float(cfg["action_min_score"])
+        if "prenorm_mode" in cfg:
+            self._prenorm_mode = str(cfg["prenorm_mode"])
+        if "min_motion" in cfg:
+            self._min_motion = float(cfg["min_motion"])
+        if "action_modality" in cfg:
+            self._action_modality = str(cfg["action_modality"])
+        if "strict_vocabulary" in cfg:
+            self._strict_vocabulary = bool(cfg["strict_vocabulary"])
+        if "tracker_timeout_s" in cfg:
+            self._tracker_timeout_s = float(cfg["tracker_timeout_s"])
         if "label_hold" in cfg:
             self._label_hold = int(cfg["label_hold"])
         if "activity_interval_s" in cfg:

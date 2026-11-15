@@ -56,6 +56,7 @@ from typing import Optional
 
 import numpy as np
 
+from plugins.action_vocab import OFFICIAL_126_CLASSES
 from plugins.pose_action import (
     ACTION_PRIORITY,
     DEFAULT_THRESHOLDS,
@@ -176,13 +177,49 @@ def ntu_name_zh(index: int) -> str:
     return NTU60[index][1] if 0 <= index < len(NTU60) else f"A{index + 1}"
 
 
-def action_vocabulary() -> list:
+def action_vocabulary(vocab_size: int = 60) -> list:
     """What `list_actions` reports for the learned half."""
+    if vocab_size == len(OFFICIAL_126_CLASSES):
+        return [
+            {"action_id": cid, "ntu_class": cid, "name": en, "name_zh": zh,
+             "pose_label": None}
+            for cid, (zh, en) in sorted(OFFICIAL_126_CLASSES.items())
+        ]
     return [
         {"ntu_class": i + 1, "name": NTU60[i][0], "name_zh": NTU60[i][1],
          "pose_label": NTU_TO_POSE_LABEL.get(i)}
         for i in USABLE_CLASSES
     ]
+
+
+# PYSKL GenSkeFeat('b') parent tree for COCO-17 keypoints.
+COCO_BONE_PAIRS = (
+    (0, 0), (1, 0), (2, 0), (3, 1), (4, 2), (5, 0), (6, 0),
+    (7, 5), (8, 6), (9, 7), (10, 8), (11, 0), (12, 0),
+    (13, 11), (14, 12), (15, 13), (16, 14),
+)
+
+
+def compute_bones(joints: np.ndarray) -> np.ndarray:
+    """(..., V=17, 3) normalised joints -> (..., V=17, 3) PYSKL GenSkeFeat bones."""
+    bones = np.zeros_like(joints, dtype=np.float32)
+    for v1, v2 in COCO_BONE_PAIRS:
+        bones[..., v1, :2] = joints[..., v1, :2] - joints[..., v2, :2]
+        bones[..., v1, 2] = 0.5 * (joints[..., v1, 2] + joints[..., v2, 2])
+    return bones
+
+
+def build_ske_modality(normalised: np.ndarray, modality: str) -> np.ndarray:
+    """Construct joint ('j'), bone ('b'), or 6-channel joint+bone ('jb') features."""
+    if modality == "j":
+        return normalised
+    if modality == "b":
+        return compute_bones(normalised)
+    if modality == "jb":
+        return np.concatenate([normalised, compute_bones(normalised)], axis=-1)
+    raise ActionBackendError(
+        f"unknown skeleton modality {modality!r}; expected 'j', 'b' or 'jb'"
+    )
 
 
 PRENORM_MODE = "auto"
@@ -379,27 +416,41 @@ class SkeletonActionBackend:
 
     def __init__(self, *, window_s: float = DEFAULT_WINDOW_S,
                  min_score: float = DEFAULT_MIN_SCORE,
-                 fall_min_score: float = FALL_MIN_SCORE,
+                 fall_min_score: Optional[float] = None,
                  prenorm_mode: str = PRENORM_MODE,
                  min_motion: float = MIN_MOTION,
+                 modality: str = "auto",
                  model_dir: Optional[str] = None,
                  engine=None, thresholds: Optional[dict] = None,
                  action_window_s: Optional[float] = None):
         self.window_s = float(action_window_s or window_s)
         self.min_score = float(min_score)
-        self.fall_min_score = float(fall_min_score)
+        self._explicit_fall_min_score = fall_min_score is not None
+        self.fall_min_score = float(
+            FALL_MIN_SCORE if fall_min_score is None else fall_min_score)
         self.prenorm_mode = str(prenorm_mode)
         self.min_motion = float(min_motion)
+        self.modality = str(modality or "auto")
         self.thresholds = dict(DEFAULT_THRESHOLDS)
         self.thresholds.update({k: v for k, v in (thresholds or {}).items()
                                 if k in DEFAULT_THRESHOLDS and v is not None})
         self._model_dir = model_dir or os.environ.get("ACTION_MODEL_DIR",
                                                       "/models/action")
         self._engine = engine          # injectable, which is what makes this testable
+        self._vocab_size: Optional[int] = None
         self._lock = threading.Lock()
         self._load_error: Optional[str] = None
 
     # ── engine ───────────────────────────────────────────────────────────
+
+    @property
+    def vocab_size(self) -> int:
+        if self._vocab_size is not None:
+            return self._vocab_size
+        out_shape = getattr(self._engine, "output_shape", None)
+        if out_shape is not None and len(out_shape) >= 1 and int(out_shape[-1]) > 0:
+            return int(out_shape[-1])
+        return len(NTU60)
 
     @property
     def last_error(self) -> Optional[str]:
@@ -424,12 +475,33 @@ class SkeletonActionBackend:
         with self._lock:
             if self._engine is not None:
                 return self._engine
-            from utils.model_downloader import ensure_action_model
+            from utils.model_downloader import (
+                ACTION_MODEL_BUNDLES,
+                _bundle_matches,
+                ensure_action_model,
+                select_bundle_family,
+            )
             from utils.model_progress import fetch_status
 
-            progress_cb, _ = fetch_status(lambda text: None, "stgcn++")
-            paths = ensure_action_model(self._model_dir, progress_cb=progress_cb)
-            engine = next(p for name, p in paths.items() if name.endswith(".engine"))
+            engine = None
+            if (self._model_dir == "/models/action"
+                    and not os.environ.get("ACTION_MODEL_DIR")):
+                try:
+                    key = select_bundle_family(ACTION_MODEL_BUNDLES)
+                    files = ACTION_MODEL_BUNDLES[key]["files"]
+                    seed_dir = os.path.join("/opt/vision-action", key)
+                    if _bundle_matches(seed_dir, files):
+                        engine = next(
+                            os.path.join(seed_dir, name)
+                            for name in files if name.endswith(".engine")
+                        )
+                except Exception:  # noqa: BLE001 — fall through to /models
+                    engine = None
+
+            if engine is None:
+                progress_cb, _ = fetch_status(lambda text: None, "stgcn++")
+                paths = ensure_action_model(self._model_dir, progress_cb=progress_cb)
+                engine = next(p for name, p in paths.items() if name.endswith(".engine"))
             log.info("[pose/stgcn] loading action engine: %s", engine)
             # TensorRTEngine directly, not VisionEngineSession: that class
             # letterboxes an image, and this engine takes a skeleton tensor.
@@ -452,21 +524,25 @@ class SkeletonActionBackend:
             return int(shape[2])
         return DEFAULT_WINDOW_FRAMES
 
+    def _effective_modality(self) -> str:
+        if self.modality != "auto":
+            return self.modality
+        engine = self._engine
+        shape = getattr(engine, "input_shape", None) or getattr(
+            engine, "optimization_shape", None)
+        if shape is not None and len(shape) == 5 and int(shape[4]) == 6:
+            return "jb"
+        return "j"
+
     # ── input construction ───────────────────────────────────────────────
 
     def _build_input(self, frames: list, window_frames: int) -> np.ndarray:
-        """PoseFrames → (1, 2, T, 17, 3) float32, PYSKL's FormatGCNInput order.
+        """PoseFrames → (1, 2, T, 17, C) float32, PYSKL's FormatGCNInput order.
 
         One of the two version-sensitive calls in this class. Steps, in PYSKL's
         order: joint stream with the score channel, normalise by the frame,
-        uniform-sample to T, then pad to two person slots.
-
-        The shape is taken from the published config, not chosen:
-        `FormatGCNInput(num_person=2)` means the network was trained on a tensor
-        with room for two skeletons and a single person zero-padded into the
-        second slot. An earlier version of this method built (1, 1, T, 17, 2) —
-        wrong in two dimensions, which is precisely the kind of mistake that
-        loads without complaint and returns confident nonsense.
+        derive bone channels when configured, uniform-sample to T, then pad to
+        two person slots.
         """
         if not frames:
             raise ActionBackendError("no frames to classify")
@@ -487,7 +563,8 @@ class SkeletonActionBackend:
                 f"score; got {sorted(bad)}")
         raw = np.stack([a[:, :NUM_CHANNELS] for a in arrays])   # (T0, V, 3)
         normalised = pre_normalize_2d(raw, image_size, self.prenorm_mode)
-        sampled = resample_clip(normalised, window_frames)      # (T, V, 3)
+        featured = build_ske_modality(normalised, self._effective_modality())
+        sampled = resample_clip(featured, window_frames)        # (T, V, C)
 
         # (M, T, V, C) with the unused person slot zeroed, then the clip axis.
         people = np.zeros((NUM_PERSON_SLOTS,) + sampled.shape, dtype=np.float32)
@@ -550,6 +627,29 @@ class SkeletonActionBackend:
         scores = self._run(blob)
         if not looks_like_probabilities(scores):
             scores = softmax(scores)
+        if scores.size == len(OFFICIAL_126_CLASSES):
+            self._vocab_size = len(OFFICIAL_126_CLASSES)
+            ranked = sorted(
+                ((index, float(scores[index]))
+                 for index in range(len(OFFICIAL_126_CLASSES))),
+                key=lambda item: item[1], reverse=True,
+            )
+            return {
+                "frames_used": len(window),
+                "window_frames": self._window_frames(),
+                "motion": round(motion, 4),
+                "scores": [
+                    {"action_id": index + 1,
+                     "ntu_class": index + 1,
+                     "name": OFFICIAL_126_CLASSES[index + 1][1],
+                     "name_zh": OFFICIAL_126_CLASSES[index + 1][0],
+                     "pose_label": None,
+                     "score": round(score, 3)}
+                    for index, score in ranked[:8]
+                ],
+            }
+
+        self._vocab_size = len(NTU60)
         ranked = sorted(
             ((index, float(scores[index])) for index in USABLE_CLASSES
              if index < scores.size),
@@ -570,6 +670,10 @@ class SkeletonActionBackend:
 
     def _threshold_for(self, entry: dict) -> float:
         """Per-class score bar. Falling is held higher — see FALL_MIN_SCORE."""
+        if "action_id" in entry:
+            if self._explicit_fall_min_score and entry.get("name") == "falling down":
+                return max(self.min_score, self.fall_min_score)
+            return self.min_score
         if entry["ntu_class"] - 1 == FALL_CLASS:
             return max(self.min_score, self.fall_min_score)
         return self.min_score
@@ -624,6 +728,8 @@ class SkeletonActionBackend:
                 "name": best["name"], "name_zh": best["name_zh"],
                 "ntu_class": best["ntu_class"], "score": best["score"],
                 "source": "stgcn",
+                **({"action_id": best["action_id"]}
+                   if "action_id" in best else {}),
             },
             "evidence": {
                 "backend": "stgcn",
@@ -681,11 +787,19 @@ class HybridActionBackend:
     """
 
     def __init__(self, *, rules: Optional[PoseActionClassifier] = None,
-                 learned: Optional["SkeletonActionBackend"] = None, **kwargs):
+                 learned: Optional["SkeletonActionBackend"] = None,
+                 strict_vocabulary: Optional[bool] = None, **kwargs):
+        self._strict_vocabulary = strict_vocabulary
         self.rules = rules or PoseActionClassifier(
             thresholds=kwargs.get("thresholds"),
             action_window_s=kwargs.get("action_window_s", 1.5))
         self.learned = learned or SkeletonActionBackend(**kwargs)
+
+    @property
+    def _is_strict_vocabulary(self) -> bool:
+        if self._strict_vocabulary is not None:
+            return bool(self._strict_vocabulary)
+        return getattr(self.learned, "vocab_size", len(NTU60)) == len(OFFICIAL_126_CLASSES)
 
     @property
     def thresholds(self) -> dict:
@@ -710,31 +824,39 @@ class HybridActionBackend:
         """
         geometry = self.rules.classify(frames)
         if not want_activity:
+            if self._is_strict_vocabulary:
+                return {**geometry, "activity": None}
             return geometry
         model = self.learned.classify(frames)
 
         result = dict(geometry)                 # posture always comes from here
         activity = model.get("activity")
 
-        # `falling down` needs the geometry to agree the body is not upright.
-        # The model returns A43 at 0.62 on pure noise, so a score bar alone is
-        # one guard on the single activity a robot acts on; this is the second,
-        # and the noise case cannot satisfy it.
         withheld = None
-        if activity and activity["name"] == "falling down":
-            if geometry.get("posture") not in ("lying", "crouching", "bending"):
-                withheld = ("the model called it a fall; the geometry still "
-                            "reads the body as upright")
-                activity = None
-
-        if activity is not None:
+        if self._is_strict_vocabulary:
             result["activity"] = activity
-            result["evidence"] = {**(result.get("evidence") or {}),
-                                  **(model.get("evidence") or {})}
-        # else: the geometry's own activity, already in `result`, stands. It is
-        # the best evidence available when the model abstained, scored under the
-        # bar, or could not run — dropping it made the card worse than the
-        # geometry alone.
+            if model.get("evidence"):
+                result["evidence"] = {**(result.get("evidence") or {}),
+                                      **model["evidence"]}
+        else:
+            # `falling down` needs the geometry to agree the body is not upright.
+            # The model returns A43 at 0.62 on pure noise, so a score bar alone is
+            # one guard on the single activity a robot acts on; this is the second,
+            # and the noise case cannot satisfy it.
+            if activity and activity["name"] == "falling down":
+                if geometry.get("posture") not in ("lying", "crouching", "bending"):
+                    withheld = ("the model called it a fall; the geometry still "
+                                "reads the body as upright")
+                    activity = None
+
+            if activity is not None:
+                result["activity"] = activity
+                result["evidence"] = {**(result.get("evidence") or {}),
+                                      **(model.get("evidence") or {})}
+            # else: the geometry's own activity, already in `result`, stands. It is
+            # the best evidence available when the model abstained, scored under the
+            # bar, or could not run — dropping it made the card worse than the
+            # geometry alone.
 
         if model.get("backend_error"):
             result["evidence"] = {**(result.get("evidence") or {}),
