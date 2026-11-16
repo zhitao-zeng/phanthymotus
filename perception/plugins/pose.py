@@ -37,6 +37,8 @@ of perception on jp5.11 (see plugins/kokoro_worker.py).
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import json
 import logging
 import os
@@ -519,6 +521,11 @@ class _PoseNode(Node):
                 self._worker.join(timeout=3.0)
             self._worker = None
             self._running = False
+            while True:
+                try:
+                    self._frame_queue.get_nowait()
+                except queue.Empty:
+                    break
             self._tracker.reset()
             # Drop gesture state with the tracks it belongs to. Keeping it
             # would mean a restart inherits a held gesture and an armed
@@ -801,29 +808,31 @@ class _PoseNode(Node):
         message.data = json.dumps(payload, ensure_ascii=False)
         self._pub.publish(message)
 
-        height, width = ((frame.shape[0], frame.shape[1])
-                         if frame is not None and hasattr(frame, "shape")
-                         else (0, 0))
-        skeleton = {
-            "timestamp": payload["timestamp"],
-            "count": len(persons),
-            # The renderer has no other way to know what the coordinates are
-            # relative to — keypoints are in source-frame pixels.
-            "image_size": [int(width), int(height)],
-            # The payload describes its own layout, which is what lets the
-            # renderer draw 59 keypoints with no frontend change at all —
-            # pose2d.js already prefers a payload-carried table over its copy.
-            "keypoint_names": (merged_keypoint_names(COCO_KEYPOINTS)
-                               if self._hand_channel is not None
-                               else list(COCO_KEYPOINTS)),
-            "skeleton": (merged_skeleton(COCO_SKELETON, N_KEYPOINTS)
-                         if self._hand_channel is not None
-                         else [list(edge) for edge in COCO_SKELETON]),
-            "persons": [self._skeleton_record(p) for p in persons],
-        }
-        skeleton_message = String()
-        skeleton_message.data = json.dumps(skeleton, ensure_ascii=False)
-        self._pub_skeleton.publish(skeleton_message)
+        sub_count_fn = getattr(self._pub_skeleton, "get_subscription_count", None)
+        if sub_count_fn is None or sub_count_fn() > 0:
+            height, width = ((frame.shape[0], frame.shape[1])
+                             if frame is not None and hasattr(frame, "shape")
+                             else (0, 0))
+            skeleton = {
+                "timestamp": payload["timestamp"],
+                "count": len(persons),
+                # The renderer has no other way to know what the coordinates are
+                # relative to — keypoints are in source-frame pixels.
+                "image_size": [int(width), int(height)],
+                # The payload describes its own layout, which is what lets the
+                # renderer draw 59 keypoints with no frontend change at all —
+                # pose2d.js already prefers a payload-carried table over its copy.
+                "keypoint_names": (merged_keypoint_names(COCO_KEYPOINTS)
+                                   if self._hand_channel is not None
+                                   else list(COCO_KEYPOINTS)),
+                "skeleton": (merged_skeleton(COCO_SKELETON, N_KEYPOINTS)
+                             if self._hand_channel is not None
+                             else [list(edge) for edge in COCO_SKELETON]),
+                "persons": [self._skeleton_record(p) for p in persons],
+            }
+            skeleton_message = String()
+            skeleton_message.data = json.dumps(skeleton, ensure_ascii=False)
+            self._pub_skeleton.publish(skeleton_message)
 
         if emit_gestures:
             self._publish_gesture_events_for(persons, payload["timestamp"])
@@ -1031,6 +1040,15 @@ _THRESHOLD_KEYS = ("kpt_confidence", "fall_drop_ratio", "fall_drop_window_s",
                    "fall_settle_s")
 
 
+def _trim_process_heap() -> None:
+    """Ask Python and glibc to release retired heap arenas back to the OS."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 class PosePerceptionPlugin:
     PREFIX = "pose"
 
@@ -1042,6 +1060,7 @@ class PosePerceptionPlugin:
         self._plugin_cfg = dict(plugin_cfg or {})
         self._confidence = float(plugin_cfg.get("confidence", 0.4))
         self._fps = int(plugin_cfg.get("fps", 12))
+        self._max_fps = int(plugin_cfg.get("max_fps") or 0)
         self._kpt_confidence = float(
             plugin_cfg.get("kpt_confidence", DEFAULT_THRESHOLDS["kpt_confidence"]))
         self._max_persons = int(plugin_cfg.get("max_persons", 5))
@@ -1088,6 +1107,10 @@ class PosePerceptionPlugin:
         self._label_hold = int(plugin_cfg.get("label_hold", 3))
         self._activity_interval_s = float(
             plugin_cfg.get("activity_interval_s", 0.35))
+        self._window_maturity_s = float(
+            plugin_cfg.get("window_maturity_s", 0.0))
+        self._min_window_frames = int(
+            plugin_cfg.get("min_window_frames", 1))
         # Why a temporal backend may be unavailable, kept so `info` can say it
         # instead of the card looking like it chose the geometry on purpose.
         self._backend_fallback: Optional[str] = None
@@ -1132,9 +1155,11 @@ class PosePerceptionPlugin:
 
     def _merged_config(self, node_key: str) -> dict:
         icfg = self._instance_configs.get(node_key, {})
+        raw_fps = int(icfg.get("fps", self._fps))
+        fps = min(raw_fps, self._max_fps) if self._max_fps > 0 else raw_fps
         merged = {
             "confidence": float(icfg.get("confidence", self._confidence)),
-            "fps": int(icfg.get("fps", self._fps)),
+            "fps": fps,
             "kpt_confidence": float(icfg.get("kpt_confidence", self._kpt_confidence)),
             "max_persons": int(icfg.get("max_persons", self._max_persons)),
             "publish_keypoints": (_keypoint_level(icfg["publish_keypoints"])
@@ -1161,6 +1186,10 @@ class PosePerceptionPlugin:
             "label_hold": int(icfg.get("label_hold", self._label_hold)),
             "activity_interval_s": float(icfg.get(
                 "activity_interval_s", self._activity_interval_s)),
+            "window_maturity_s": float(icfg.get(
+                "window_maturity_s", self._window_maturity_s)),
+            "min_window_frames": int(icfg.get(
+                "min_window_frames", self._min_window_frames)),
             "publish_gesture_events": bool(icfg.get(
                 "publish_gesture_events", self._publish_gesture_events)),
             "gesture_whitelist": (_gesture_whitelist(icfg["gesture_whitelist"])
@@ -1320,6 +1349,8 @@ class PosePerceptionPlugin:
                 min_motion=merged["min_motion"],
                 modality=merged["action_modality"],
                 strict_vocabulary=merged["strict_vocabulary"],
+                window_maturity_s=merged["window_maturity_s"],
+                min_window_frames=merged["min_window_frames"],
                 engine_loader=self._ensure_action_model,
             )
         except Exception as error:  # noqa: BLE001 — the card must still work
@@ -1366,12 +1397,17 @@ class PosePerceptionPlugin:
                 cv2.imshow = lambda *a, **k: None
                 cv2.waitKey = lambda *a, **k: 0
                 cv2.destroyAllWindows = lambda *a, **k: None
+            if hasattr(cv2, "setNumThreads"):
+                try:
+                    cv2.setNumThreads(1)
+                except Exception:
+                    pass
 
             from plugins.vision_runtime import VisionEngineSession
 
             engine_path = self._resolve_engine()
             log.info(f"[pose] loading engine: {engine_path}")
-            self._model = VisionEngineSession(engine_path)
+            self._model = VisionEngineSession(engine_path, shared_scratch=True)
             log.info(f"[pose] engine loaded: {self._model_name} "
                      f"input={self._model.input_size}, "
                      f"{N_KEYPOINTS} keypoints")
@@ -1717,6 +1753,7 @@ class PosePerceptionPlugin:
         # ROS node name leak and the next start trips "Publisher already
         # registered".
         dispose_node(self._executor, node, label=f"pose/{node_key}")
+        _trim_process_heap()
         return result
 
     def _loading_camera_info(self, args: dict, instance_id: str) -> dict:

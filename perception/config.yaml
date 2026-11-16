@@ -283,7 +283,8 @@ plugins:
     # resampled up to the engine's 100, most of it interpolation — and the
     # frequency of a wave and the speed of a fall live in those frames. Below 12
     # the card's `info` returns an action_fps_note.
-    fps: 8
+    fps: 15
+    max_fps: 20
     # Per-joint visibility threshold. A joint below it takes no part in the
     # rules and is not drawn.
     kpt_confidence: 0.3
@@ -322,6 +323,7 @@ plugins:
     # single /ws/bus/{topic} for the selected port), so a camera feed and a
     # keypoint feed cannot be combined client-side.
     publish_overlay: false
+    publish_gesture_events: false
     hands: false
     # How far back the action window looks.
     action_window_s: 5.0
@@ -330,8 +332,10 @@ plugins:
     prenorm_mode: "fix"
     min_motion: 0.0
     strict_vocabulary: true
-    action_min_score: 0.08
-    activity_interval_s: 0.45
+    window_maturity_s: 2.8
+    min_window_frames: 4
+    action_min_score: 0.04
+    activity_interval_s: 0.28
     tracker_timeout_s: 0.6
     label_hold: 1
     # ── Fall thresholds ──────────────────────────────────────────────────

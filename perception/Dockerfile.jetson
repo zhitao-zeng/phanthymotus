@@ -698,6 +698,12 @@ ENV PYTHONUNBUFFERED=1
 # ANSI colour codes are control bytes; in a non-tty container log they are
 # exactly the "garbage characters" that make `docker logs` unreadable.
 ENV RCUTILS_COLORIZED_OUTPUT=0
+ENV CUDA_MODULE_LOADING=LAZY \
+    MALLOC_ARENA_MAX=2 \
+    MALLOC_MMAP_THRESHOLD_=65536 \
+    MALLOC_TRIM_THRESHOLD_=65536 \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1
 
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \

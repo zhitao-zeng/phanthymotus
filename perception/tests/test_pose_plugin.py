@@ -1655,3 +1655,41 @@ def test_action_engine_is_shared_across_stop_and_start_cycles(monkeypatch):
         plugin.dispatch("pose", {"action": "stop", "input_topic": "/cam/rgb"})
 
     assert len(load_calls) == 1
+
+
+def test_max_fps_caps_instance_fps_only_when_positive():
+    capped, _ = _plugin({"fps": 15, "max_fps": 20})
+    capped.dispatch("pose", {"action": "config", "instance_id": "high", "fps": 30})
+    capped.dispatch("pose", {"action": "config", "instance_id": "low", "fps": 10})
+    assert capped._merged_config("high")["fps"] == 20
+    assert capped._merged_config("low")["fps"] == 10
+    assert capped._merged_config("default")["fps"] == 15
+
+    uncapped, _ = _plugin({"fps": 15})
+    uncapped.dispatch("pose", {"action": "config", "instance_id": "high", "fps": 30})
+    assert uncapped._merged_config("high")["fps"] == 30
+
+
+def test_skeleton_publish_skips_unsubscribed_real_publisher_and_keeps_subscribed():
+    plugin, _ = _plugin({"activity_interval_s": 0.0})
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = plugin._nodes["/cam/rgb"]
+    lean = _publisher(node, "/cam/rgb/poses")
+    skeleton = _publisher(node, "/cam/rgb/poses/skeleton")
+    assert skeleton is not None
+
+    skeleton.subscription_count = 0
+    node.subscriptions[0].callback(_FakeCompressedImage(frame_bytes(FRAME_W, FRAME_H)))
+    _wait_until(lambda: len(lean.messages) >= 1, timeout=3.0)
+    assert len(lean.messages) == 1
+    assert len(skeleton.messages) == 0
+
+    skeleton.subscription_count = 1
+    node._last_inference_time -= 0.25
+    node.subscriptions[0].callback(_FakeCompressedImage(frame_bytes(FRAME_W, FRAME_H)))
+    _wait_until(
+        lambda: len(lean.messages) >= 2 and len(skeleton.messages) >= 1,
+        timeout=3.0,
+    )
+    assert len(lean.messages) == 2
+    assert len(skeleton.messages) == 1

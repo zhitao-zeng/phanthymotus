@@ -19,6 +19,7 @@ lazily so importing this module on a non-Jetson host is harmless.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import ctypes.util
 import json
@@ -30,6 +31,25 @@ from pathlib import Path
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+# Process-wide device scratch pool shared across engines that opt in via
+# `shared_scratch=True`. Serializing execution across sharers lets co-resident
+# models reuse one activation buffer instead of holding separate allocations.
+_SHARED_SCRATCH_LOCK = threading.Lock()
+_SHARED_SCRATCH_BUFFERS: dict[int, tuple[int, int]] = {}
+
+
+def _ensure_shared_scratch(cuda: "CudaRuntime", device_id: int, required: int) -> int:
+    required = max(1, int(required))
+    pointer, capacity = _SHARED_SCRATCH_BUFFERS.get(device_id, (0, 0))
+    if pointer and required <= capacity:
+        return pointer
+    if pointer:
+        cuda.free(pointer)
+        _SHARED_SCRATCH_BUFFERS.pop(device_id, None)
+    pointer = cuda.malloc(required)
+    _SHARED_SCRATCH_BUFFERS[device_id] = (pointer, required)
+    return pointer
 
 __all__ = [
     "TensorRTError",
@@ -360,11 +380,16 @@ class TensorRTEngine:
     """
 
     def __init__(self, path: str | Path, *, device_id: int = 0,
-                 primary_input: str | None = None):
+                 primary_input: str | None = None,
+                 shared_scratch: bool = False):
         import tensorrt as trt
 
         self.path = str(path)
         self._trt = trt
+        self._device_id = int(device_id)
+        self._shared_scratch = bool(shared_scratch)
+        self._uses_shared_scratch = False
+        self._scratch_required = 0
         self._lock = threading.Lock()
         self._cuda: CudaRuntime | None = None
         self._runtime = None
@@ -401,7 +426,22 @@ class TensorRTEngine:
                     f"(see the preceding [TRT] [E] line for the version it "
                     f"expects)."
                 )
-            self._context = self._engine.create_execution_context()
+            if (
+                self._shared_scratch
+                and hasattr(trt, "ExecutionContextAllocationStrategy")
+                and hasattr(trt.ExecutionContextAllocationStrategy, "USER_MANAGED")
+                and hasattr(self._engine, "device_memory_size_v2")
+            ):
+                try:
+                    self._context = self._engine.create_execution_context(
+                        trt.ExecutionContextAllocationStrategy.USER_MANAGED
+                    )
+                    if self._context is not None:
+                        self._uses_shared_scratch = True
+                except (AttributeError, TypeError):
+                    self._context = None
+            if self._context is None:
+                self._context = self._engine.create_execution_context()
             if self._context is None:
                 raise TensorRTError(f"failed to create TensorRT context: {self.path}")
 
@@ -516,7 +556,12 @@ class TensorRTEngine:
                     f"auxiliary input {name} shape {value.shape} must be {self.auxiliary_shapes[name]}"
                 )
             auxiliary[name] = value
-        with self._lock:
+        shared_guard = (
+            _SHARED_SCRATCH_LOCK
+            if self._uses_shared_scratch
+            else contextlib.nullcontext()
+        )
+        with self._lock, shared_guard:
             if self._context is None or self._cuda is None:
                 raise TensorRTError(f"TensorRT engine is closed ({self.path})")
             cuda = self._cuda
@@ -532,6 +577,13 @@ class TensorRTEngine:
                 for name, value in auxiliary.items():
                     if not context.set_input_shape(name, value.shape):
                         raise TensorRTShapeError(f"TensorRT rejected auxiliary shape {name}: {value.shape}")
+                if self._uses_shared_scratch:
+                    update_scratch = getattr(
+                        context, "update_device_memory_size_for_shapes", None
+                    )
+                    dynamic_req = int(update_scratch()) if callable(update_scratch) else 0
+                    engine_req = int(getattr(self._engine, "device_memory_size_v2", 0) or 0)
+                    self._scratch_required = max(engine_req, dynamic_req)
                 self._active_shape = shape
 
             outputs: list[np.ndarray] = []
@@ -553,6 +605,11 @@ class TensorRTEngine:
                 pointer = self._ensure_capacity(name, value.nbytes)
                 context.set_tensor_address(name, pointer)
                 cuda.copy_host_to_device(pointer, value)
+            if self._uses_shared_scratch and self._scratch_required > 0:
+                scratch_pointer = _ensure_shared_scratch(
+                    cuda, self._device_id, self._scratch_required
+                )
+                context.set_device_memory(scratch_pointer, self._scratch_required)
             if not context.execute_async_v3(cuda.stream_handle):
                 raise TensorRTError(f"TensorRT execute_async_v3 failed ({self.path})")
             for name, output in zip(self.output_names, outputs):
@@ -598,6 +655,8 @@ class TensorRTEngine:
             self._device_buffers = {}
             self._device_capacity = {}
             self._active_shape = None
+            self._scratch_required = 0
+            self._uses_shared_scratch = False
             self._context = None
             self._engine = None
             self._runtime = None

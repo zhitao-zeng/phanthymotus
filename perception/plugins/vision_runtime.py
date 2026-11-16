@@ -401,10 +401,13 @@ class VisionEngineSession:
     class adds no mutable state of its own beyond the cached input geometry.
     """
 
-    def __init__(self, engine_path, *, device_id: int = 0):
+    def __init__(self, engine_path, *, device_id: int = 0,
+                 shared_scratch: bool = False):
         from utils.tensorrt_runtime import TensorRTEngine
 
-        self._engine = TensorRTEngine(engine_path, device_id=device_id)
+        self._engine = TensorRTEngine(
+            engine_path, device_id=device_id, shared_scratch=shared_scratch
+        )
         shape = self._engine.input_shape or self._engine.optimization_shape
         if shape is None or len(shape) != 4:
             raise VisionDecodeError(

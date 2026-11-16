@@ -407,7 +407,7 @@ def pre_normalize_2d(keypoints: np.ndarray, image_size, mode: str = "auto") -> n
     return out
 
 
-def load_action_engine(model_dir: Optional[str] = None):
+def load_action_engine(model_dir: Optional[str] = None, *, shared_scratch: bool = True):
     """Resolve and deserialize the TensorRT action engine once."""
     from utils.model_downloader import (
         ACTION_MODEL_BUNDLES,
@@ -440,7 +440,7 @@ def load_action_engine(model_dir: Optional[str] = None):
     log.info("[pose/stgcn] loading action engine: %s", engine)
     # TensorRTEngine directly, not VisionEngineSession: that class letterboxes
     # an image, and this engine takes a skeleton tensor.
-    return TensorRTEngine(engine)
+    return TensorRTEngine(engine, shared_scratch=shared_scratch)
 
 
 class SkeletonActionBackend:
@@ -459,7 +459,9 @@ class SkeletonActionBackend:
                  model_dir: Optional[str] = None,
                  engine=None, engine_loader=None,
                  thresholds: Optional[dict] = None,
-                 action_window_s: Optional[float] = None):
+                 action_window_s: Optional[float] = None,
+                 window_maturity_s: float = 0.0,
+                 min_window_frames: int = 1):
         self.window_s = float(action_window_s or window_s)
         self.min_score = float(min_score)
         self._explicit_fall_min_score = fall_min_score is not None
@@ -468,6 +470,8 @@ class SkeletonActionBackend:
         self.prenorm_mode = str(prenorm_mode)
         self.min_motion = float(min_motion)
         self.modality = str(modality or "auto")
+        self.window_maturity_s = max(0.0, float(window_maturity_s))
+        self.min_window_frames = max(1, int(min_window_frames))
         self.thresholds = dict(DEFAULT_THRESHOLDS)
         self.thresholds.update({k: v for k, v in (thresholds or {}).items()
                                 if k in DEFAULT_THRESHOLDS and v is not None})
@@ -622,6 +626,14 @@ class SkeletonActionBackend:
         current = frames[-1]
         window = [f for f in frames if current.t - f.t <= self.window_s] or [current]
         self._ensure_engine()
+        if len(window) < self.min_window_frames:
+            return {
+                "frames_used": len(window),
+                "window_frames": self._window_frames(),
+                "motion": 0.0,
+                "abstained": "clip holds too few frames",
+                "scores": [],
+            }
         blob = self._build_input(window, self._window_frames())
         motion = self.clip_motion(blob)
         if motion < self.min_motion:
@@ -637,6 +649,12 @@ class SkeletonActionBackend:
         scores = self._run(blob)
         if not looks_like_probabilities(scores):
             scores = softmax(scores)
+        if self.window_maturity_s > 0.0:
+            span_s = max(0.0, float(window[-1].t - window[0].t))
+            maturity = min(
+                1.0, max(0.12, (span_s / self.window_maturity_s) ** 1.5)
+            )
+            scores = scores * maturity
         if scores.size == len(OFFICIAL_126_CLASSES):
             self._vocab_size = len(OFFICIAL_126_CLASSES)
             ranked = sorted(

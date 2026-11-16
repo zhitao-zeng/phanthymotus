@@ -822,3 +822,55 @@ def test_hybrid_126_never_leaks_non_vocab_rule_labels_even_when_throttled():
     res = hybrid_fall.classify(_frames(_standing, n=20), want_activity=True)
     assert res["activity"]["name"] == "falling down"
     assert res["activity"]["name_zh"] == "跌倒"
+
+
+def test_min_window_frames_abstains_until_enough_frames_arrive():
+    engine = _FakeEngine126({0: 12.0})
+    backend = SkeletonActionBackend(
+        engine=engine,
+        prenorm_mode="fix",
+        min_motion=0.0,
+        min_window_frames=4,
+    )
+    too_short = backend.predict(_frames(_standing, n=3, fps=10.0))
+    assert too_short["abstained"] == "clip holds too few frames"
+    assert too_short["scores"] == []
+    assert too_short["frames_used"] == 3
+    assert len(engine.calls) == 0
+
+    enough = backend.predict(_frames(_standing, n=4, fps=10.0))
+    assert "abstained" not in enough
+    assert enough["frames_used"] == 4
+    assert len(engine.calls) == 1
+
+
+def test_window_maturity_scales_short_spans_and_reaches_full_weight():
+    unscaled = SkeletonActionBackend(
+        engine=_FakeEngine126({0: 8.0}),
+        prenorm_mode="fix",
+        min_motion=0.0,
+        window_s=5.0,
+        window_maturity_s=0.0,
+    )
+    scaled = SkeletonActionBackend(
+        engine=_FakeEngine126({0: 8.0}),
+        prenorm_mode="fix",
+        min_motion=0.0,
+        window_s=5.0,
+        window_maturity_s=2.8,
+    )
+    raw_score = unscaled.predict(_frames(_standing, n=5, fps=10.0))["scores"][0]["score"]
+
+    # span = 0.4s -> (0.4 / 2.8) ** 1.5 < 0.12 -> clamped at 0.12
+    short_pred = scaled.predict(_frames(_standing, n=5, fps=10.0))
+    assert short_pred["scores"][0]["score"] == pytest.approx(round(raw_score * 0.12, 3), abs=0.002)
+
+    # span = 1.4s -> (1.4 / 2.8) ** 1.5 = 0.5 ** 1.5
+    mid_pred = scaled.predict(_frames(_standing, n=15, fps=10.0))
+    assert mid_pred["scores"][0]["score"] == pytest.approx(
+        round(raw_score * (0.5 ** 1.5), 3), abs=0.002
+    )
+
+    # span = 2.9s >= 2.8s -> full unscaled score
+    mature_pred = scaled.predict(_frames(_standing, n=30, fps=10.0))
+    assert mature_pred["scores"][0]["score"] == pytest.approx(raw_score, abs=0.001)
