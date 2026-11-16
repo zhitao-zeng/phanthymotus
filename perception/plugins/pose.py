@@ -615,10 +615,12 @@ class _PoseNode(Node):
             return
         started = time.time()
         persons = []
+        updated = False
         for person in self._idle_persons:
             track = person["track"]
             if not track.history or started - track.last_seen > self._tracker.timeout_s:
                 continue
+            persons.append(person)
             try:
                 result = finalize(list(track.history))
             except Exception as error:
@@ -634,15 +636,16 @@ class _PoseNode(Node):
                        "evidence": {**(result.get("evidence") or {}),
                                     "finalized_after_idle_s": round(
                                         time.monotonic() - received_at, 3)}}
-            persons.append({**person, "verdict": verdict})
+            persons[-1] = {**person, "verdict": verdict}
+            updated = True
             track.activity = activity
             self._last_prediction = verdict["evidence"]
             self._last_actions[person["id"]] = activity["name"]
-        if persons:
+        if updated:
             # Keypoints and gestures have not received another image. Only the
             # lean action channel gets this last window's revised judgement.
-            self._publish(persons, started=started, emit_gestures=False,
-                          publish_skeleton=False)
+            self._publish(persons, emit_gestures=False,
+                          publish_skeleton=False, count_frame=False)
 
     # ── payload construction ─────────────────────────────────────────────
 
@@ -852,8 +855,10 @@ class _PoseNode(Node):
     def _publish(self, persons: list, frame=None,
                  started: Optional[float] = None, *,
                  emit_gestures: bool = True,
-                 publish_skeleton: bool = True) -> None:
-        self._detect_count += 1
+                 publish_skeleton: bool = True,
+                 count_frame: bool = True) -> None:
+        if count_frame:
+            self._detect_count += 1
         self._person_count = len(persons)
         payload = {
             "timestamp": time.time(),

@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from test_pose_plugin import _plugin, _feed, _publisher
+from test_pose_plugin import _FakeModel, _standing_row
 from test_pose_stgcn import _FakeEngine, _frames, _standing
 from plugins.pose_stgcn import SkeletonActionBackend, HybridActionBackend
 
@@ -48,6 +49,8 @@ def test_worker_finishes_once_and_does_not_invent_a_skeleton_frame():
         final = json.loads(lean.messages[-1])
         assert final["persons"][0]["activity"] == "brush teeth"
         assert final["persons"][0]["activity_score"] == .81
+        assert "latency_ms" not in final
+        assert node._detect_count == 4
         assert len(skeleton.messages) == 4
         time.sleep(.25)
         assert classifier.calls == 1 and len(lean.messages) == 5
@@ -58,6 +61,7 @@ def test_worker_finishes_once_and_does_not_invent_a_skeleton_frame():
         _wait_until(lambda: len(lean.messages) > _feed_before, timeout=2.)
         _wait_until(lambda: classifier.calls == 2, timeout=2.)
         assert len(skeleton.messages) == 5
+        assert node._detect_count == 5
     finally:
         node.stop()
 
@@ -69,6 +73,37 @@ def test_legacy_default_does_not_finish_on_a_pause():
         node._flush_idle_activity()
         assert classifier.calls == 0
         assert len(_publisher(node, node._output_topic).messages) == 4
+    finally:
+        node.stop()
+
+
+def test_one_action_update_preserves_the_other_person_in_the_snapshot():
+    class Partial(_FinalClassifier):
+        def finalize(self, frames):
+            self.calls += 1
+            if frames[-1].box[0] > 320:
+                return {"activity": None, "evidence": {}}
+            return {"activity": {"name": "brush teeth", "name_zh": "刷牙",
+                                 "action_id": 3, "score": .81,
+                                 "source": "stgcn"}, "evidence": {}}
+
+    plugin, _ = _plugin({"label_hold": 1, "activity_idle_flush_s": .15},
+                        model=_FakeModel([_standing_row(cx=200),
+                                          _standing_row(cx=440)]))
+    classifier = Partial()
+    plugin._classifier_for = lambda merged: classifier
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = _feed(plugin, "/cam/rgb", frames=4)
+    try:
+        from vision_stubs import _wait_until
+        lean = _publisher(node, node._output_topic)
+        _wait_until(lambda: len(lean.messages) == 5, timeout=2.)
+        final = json.loads(lean.messages[-1])
+        assert final["count"] == 2
+        assert {p["id"] for p in final["persons"]} == {1, 2}
+        assert sum(p.get("activity") == "brush teeth"
+                   for p in final["persons"]) == 1
+        assert node._detect_count == 4
     finally:
         node.stop()
 
