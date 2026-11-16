@@ -616,7 +616,7 @@ class SkeletonActionBackend:
             return 0.0
         return float(np.abs(track.max(axis=0) - track.min(axis=0)).max())
 
-    def predict(self, frames: list) -> dict:
+    def predict(self, frames: list, *, finalized: bool = False) -> dict:
         """Raw model view: every mappable label with its score, best first.
 
         Separate from `classify` so the plugin's `info` can show what the model
@@ -649,7 +649,7 @@ class SkeletonActionBackend:
         scores = self._run(blob)
         if not looks_like_probabilities(scores):
             scores = softmax(scores)
-        if self.window_maturity_s > 0.0:
+        if self.window_maturity_s > 0.0 and not finalized:
             span_s = max(0.0, float(window[-1].t - window[0].t))
             maturity = min(
                 1.0, max(0.12, (span_s / self.window_maturity_s) ** 1.5)
@@ -706,11 +706,13 @@ class SkeletonActionBackend:
             return max(self.min_score, self.fall_min_score)
         return self.min_score
 
-    def classify(self, frames: list, want_activity: bool = True) -> dict:
+    def classify(self, frames: list, want_activity: bool = True, *,
+                 finalized: bool = False) -> dict:
         if not frames or not want_activity:
             return _nothing("no frames" if not frames else "activity not requested")
         try:
-            prediction = self.predict(frames)
+            prediction = (self.predict(frames, finalized=True)
+                          if finalized else self.predict(frames))
         except ActionBackendError as error:
             # Not turned into a label: a backend that cannot run must say so,
             # because `unknown` would be indistinguishable from "nobody is
@@ -766,6 +768,14 @@ class SkeletonActionBackend:
                 "runners_up": prediction["scores"][1:3],
             },
         }
+
+    def finalize(self, frames: list) -> dict:
+        """Judge the buffered window after input becomes quiet.
+
+        The observed segment has ended, so the short-window maturity penalty
+        no longer applies. Minimum frames, motion and score gates still apply.
+        """
+        return self.classify(frames, finalized=True)
 
     def classify_frame(self, frame) -> dict:
         """A single image cannot drive a temporal model at all.
@@ -841,7 +851,8 @@ class HybridActionBackend:
     def history_s(self) -> float:
         return max(self.rules.history_s, self.learned.history_s)
 
-    def classify(self, frames: list, want_activity: bool = True) -> dict:
+    def classify(self, frames: list, want_activity: bool = True, *,
+                 finalized: bool = False) -> dict:
         """`want_activity=False` skips the model and returns posture only.
 
         The caller throttles it: the model's window is 2.5 s, so two runs one
@@ -855,7 +866,8 @@ class HybridActionBackend:
             if self._is_strict_vocabulary:
                 return {**geometry, "activity": None}
             return geometry
-        model = self.learned.classify(frames)
+        model = (self.learned.finalize(frames) if finalized
+                 else self.learned.classify(frames))
 
         result = dict(geometry)                 # posture always comes from here
         activity = model.get("activity")
@@ -893,6 +905,9 @@ class HybridActionBackend:
             result["evidence"] = {**(result.get("evidence") or {}),
                                   "fall_withheld": withheld}
         return result
+
+    def finalize(self, frames: list) -> dict:
+        return self.classify(frames, finalized=True)
 
     def classify_frame(self, frame) -> dict:
         """One image: only the geometry can answer, and it says what it cannot."""

@@ -343,6 +343,7 @@ TOOLS = [
                 "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "title": "Action recognition", "description": "hybrid uses geometry for posture and a trained model for movement. rules uses geometry only and loads no second model — useful for telling a model mistake apart from a geometry mistake.", "default": "hybrid", "scope": "instance", "advanced": True},
                 "action_window_s": {"type": "number", "minimum": 0.2, "title": "Movement look-back (s)", "description": "How much recent movement is used to judge waving and walking.", "default": 5.0, "scope": "instance", "advanced": True},
                 "activity_interval_s": {"type": "number", "minimum": 0.0, "title": "Action model interval (s)", "description": "The action model judges a clip, so running it every frame re-reads almost the same input. Posture stays frame-rate regardless.", "default": 0.45, "scope": "instance", "advanced": True},
+                "activity_idle_flush_s": {"type": "number", "minimum": 0.0, "title": "Finish action after input pause (s)", "description": "When the image stream pauses, judge the last buffered action once. Zero disables this.", "default": 0.0, "scope": "instance", "advanced": True},
                 "label_hold": {"type": "integer", "minimum": 1, "title": "Label stability (frames)", "description": "How many frames a new label must win before it replaces the current one. A label flickering several times a second is worse than a steady wrong one.", "default": 1, "scope": "instance", "advanced": True},
                 "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Action score threshold", "description": "Falls use a higher bar of their own: a false fall makes the robot drop what it is doing to ask if someone is hurt.", "default": 0.08, "scope": "instance", "advanced": True},
 
@@ -374,6 +375,7 @@ class _PoseNode(Node):
                  publish_keypoints: str = "off", publish_bbox: bool = True,
                  publish_overlay: bool = False, label_hold: int = 3,
                  activity_interval_s: float = 0.35,
+                 activity_idle_flush_s: float = 0.0,
                  tracker_timeout_s: float = 1.0,
                  gesture_tracker: Optional[GestureEventTracker] = None,
                  publish_gesture_events: bool = True,
@@ -406,6 +408,10 @@ class _PoseNode(Node):
         self._frame_interval = 1.0 / max(fps, 0.1)
 
         self._activity_interval_s = float(activity_interval_s)
+        self._activity_idle_flush_s = max(0.0, float(activity_idle_flush_s))
+        self._last_image_received_at = 0.0
+        self._idle_finalized_at = 0.0
+        self._idle_persons: list = []
         # Most recent raw model output, so `info` can show what it actually
         # scored. "The activity field is empty" is otherwise impossible to tell
         # from "the model was never asked" or "nothing cleared the threshold".
@@ -527,6 +533,9 @@ class _PoseNode(Node):
                 except queue.Empty:
                     break
             self._tracker.reset()
+            self._idle_persons = []
+            self._last_image_received_at = 0.0
+            self._idle_finalized_at = 0.0
             # Drop gesture state with the tracks it belongs to. Keeping it
             # would mean a restart inherits a held gesture and an armed
             # cooldown from before the stop, so the first real gesture after
@@ -543,6 +552,7 @@ class _PoseNode(Node):
 
     def _image_cb(self, msg: CompressedImage):
         now = time.monotonic()
+        self._last_image_received_at = now
         if now - self._last_inference_time < self._frame_interval:
             return
         self._last_inference_time = now
@@ -565,8 +575,13 @@ class _PoseNode(Node):
 
         while not self._stop_event.is_set():
             try:
-                jpeg_bytes = self._frame_queue.get(timeout=1.0)
+                timeout = 0.1 if self._activity_idle_flush_s > 0.0 else 1.0
+                jpeg_bytes = self._frame_queue.get(timeout=timeout)
             except queue.Empty:
+                try:
+                    self._flush_idle_activity()
+                except Exception as error:
+                    log.warning(f"[pose] idle action publication failed: {error}")
                 continue
             started = time.time()
             try:
@@ -581,8 +596,53 @@ class _PoseNode(Node):
                 )
                 persons = self._describe(boxes, scores, keypoints, frame, started)
                 self._publish(persons, frame, started)
+                self._idle_persons = persons
             except Exception as e:
                 log.error(f"[pose] inference error: {e}", exc_info=True)
+
+    def _flush_idle_activity(self) -> None:
+        """Finish one received segment; never create a new camera/detection frame."""
+        if (self._stop_event.is_set() or self._activity_idle_flush_s <= 0.0
+                or not self._idle_persons):
+            return
+        received_at = self._last_image_received_at
+        if (received_at <= self._idle_finalized_at or
+                time.monotonic() - received_at < self._activity_idle_flush_s):
+            return
+        finalize = getattr(self._classifier, "finalize", None)
+        self._idle_finalized_at = received_at
+        if finalize is None:
+            return
+        started = time.time()
+        persons = []
+        for person in self._idle_persons:
+            track = person["track"]
+            if not track.history or started - track.last_seen > self._tracker.timeout_s:
+                continue
+            try:
+                result = finalize(list(track.history))
+            except Exception as error:
+                log.warning(f"[pose] idle action failed: {error}")
+                continue
+            activity = result.get("activity")
+            if activity is None:
+                continue
+            stable, _ = track.activity_stabiliser.update(activity["name"])
+            if stable != activity["name"]:
+                continue
+            verdict = {**person["verdict"], "activity": activity,
+                       "evidence": {**(result.get("evidence") or {}),
+                                    "finalized_after_idle_s": round(
+                                        time.monotonic() - received_at, 3)}}
+            persons.append({**person, "verdict": verdict})
+            track.activity = activity
+            self._last_prediction = verdict["evidence"]
+            self._last_actions[person["id"]] = activity["name"]
+        if persons:
+            # Keypoints and gestures have not received another image. Only the
+            # lean action channel gets this last window's revised judgement.
+            self._publish(persons, started=started, emit_gestures=False,
+                          publish_skeleton=False)
 
     # ── payload construction ─────────────────────────────────────────────
 
@@ -791,7 +851,8 @@ class _PoseNode(Node):
 
     def _publish(self, persons: list, frame=None,
                  started: Optional[float] = None, *,
-                 emit_gestures: bool = True) -> None:
+                 emit_gestures: bool = True,
+                 publish_skeleton: bool = True) -> None:
         self._detect_count += 1
         self._person_count = len(persons)
         payload = {
@@ -809,7 +870,7 @@ class _PoseNode(Node):
         self._pub.publish(message)
 
         sub_count_fn = getattr(self._pub_skeleton, "get_subscription_count", None)
-        if sub_count_fn is None or sub_count_fn() > 0:
+        if publish_skeleton and (sub_count_fn is None or sub_count_fn() > 0):
             height, width = ((frame.shape[0], frame.shape[1])
                              if frame is not None and hasattr(frame, "shape")
                              else (0, 0))
@@ -1107,6 +1168,8 @@ class PosePerceptionPlugin:
         self._label_hold = int(plugin_cfg.get("label_hold", 3))
         self._activity_interval_s = float(
             plugin_cfg.get("activity_interval_s", 0.35))
+        self._activity_idle_flush_s = max(0.0, float(
+            plugin_cfg.get("activity_idle_flush_s") or 0.0))
         self._window_maturity_s = float(
             plugin_cfg.get("window_maturity_s", 0.0))
         self._min_window_frames = int(
@@ -1186,6 +1249,8 @@ class PosePerceptionPlugin:
             "label_hold": int(icfg.get("label_hold", self._label_hold)),
             "activity_interval_s": float(icfg.get(
                 "activity_interval_s", self._activity_interval_s)),
+            "activity_idle_flush_s": max(0.0, float(icfg.get(
+                "activity_idle_flush_s", self._activity_idle_flush_s) or 0.0)),
             "window_maturity_s": float(icfg.get(
                 "window_maturity_s", self._window_maturity_s)),
             "min_window_frames": int(icfg.get(
@@ -1722,6 +1787,7 @@ class PosePerceptionPlugin:
                 publish_overlay=merged["publish_overlay"],
                 label_hold=merged["label_hold"],
                 activity_interval_s=merged["activity_interval_s"],
+                activity_idle_flush_s=merged["activity_idle_flush_s"],
                 tracker_timeout_s=merged["tracker_timeout_s"],
                 gesture_tracker=self._gesture_tracker_for(merged),
                 publish_gesture_events=merged["publish_gesture_events"],
@@ -2235,6 +2301,9 @@ class PosePerceptionPlugin:
             self._label_hold = int(cfg["label_hold"])
         if "activity_interval_s" in cfg:
             self._activity_interval_s = float(cfg["activity_interval_s"])
+        if "activity_idle_flush_s" in cfg:
+            self._activity_idle_flush_s = max(0.0, float(
+                cfg["activity_idle_flush_s"] or 0.0))
         for key in _THRESHOLD_KEYS:
             if key in cfg:
                 self._plugin_cfg[key] = cfg[key]

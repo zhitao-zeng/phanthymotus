@@ -332,10 +332,11 @@ plugins:
     prenorm_mode: "fix"
     min_motion: 0.0
     strict_vocabulary: true
-    window_maturity_s: 2.8
+    window_maturity_s: 4.0
     min_window_frames: 4
-    action_min_score: 0.04
+    action_min_score: 0.02
     activity_interval_s: 0.28
+    activity_idle_flush_s: 0.4
     tracker_timeout_s: 0.6
     label_hold: 1
     # ── Fall thresholds ──────────────────────────────────────────────────
