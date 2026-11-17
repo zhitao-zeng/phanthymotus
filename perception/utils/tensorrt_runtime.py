@@ -583,7 +583,9 @@ class TensorRTEngine:
                     )
                     dynamic_req = int(update_scratch()) if callable(update_scratch) else 0
                     engine_req = int(getattr(self._engine, "device_memory_size_v2", 0) or 0)
-                    self._scratch_required = max(engine_req, dynamic_req)
+                    # The context reports the requirement for the shapes just set;
+                    # the engine-level value covers the maximum permitted shapes.
+                    self._scratch_required = dynamic_req if dynamic_req > 0 else engine_req
                 self._active_shape = shape
 
             outputs: list[np.ndarray] = []
