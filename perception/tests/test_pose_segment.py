@@ -110,6 +110,25 @@ def test_stop_cancels_publication_and_discards_input_from_a_stopped_subscription
         node.stop()
 
 
+@pytest.mark.parametrize('fps,pause,expected', [
+    # Fractional FPS retains the existing integer configuration conversion.
+    (30., 0., .15), (15., 0., .15), (7.15, 0., 2/7), (1., 0., 2.),
+    (30., .4, .4), (1., .4, .4), (1., .12, .12),
+])
+def test_segment_auto_pause_respects_frame_period_and_explicit_config(fps, pause, expected):
+    plugin, _ = _plugin({'fps': fps, 'activity_mode': 'segment',
+                          'activity_idle_flush_s': pause})
+    plugin._segment_backend_for = lambda cfg: _SegmentModel()
+    plugin._classifier_for = lambda cfg: _FinalClassifier()
+    plugin.dispatch('pose', {'action': 'start', 'input_topic': '/cam/auto_pause'})
+    node = plugin._nodes['/cam/auto_pause']
+    try:
+        assert node._activity_idle_flush_s == pytest.approx(expected)
+        assert node._segment_buffer.quiet_s == pytest.approx(expected)
+    finally:
+        node.stop()
+
+
 def test_dynamic_pose_batches_preserve_input_order_and_individual_letterboxes():
     class Engine:
         input_dtype = np.float32
@@ -219,3 +238,50 @@ def test_deployment_environment_keeps_core_instance_overrides(tmp_path, monkeypa
     plugin._instance_configs['core'] = {'fps': 30, 'activity_mode': 'rolling'}
     assert plugin._merged_config('core')['activity_mode'] == 'rolling'
     assert plugin._resolve_engine() == str(engine)
+
+
+def test_lean_segment_frames_preserve_tracking_and_both_head_inputs(monkeypatch):
+    from plugins import pose_segment
+    from plugins.pose_action import PoseFrame
+
+    class Head:
+        def __init__(self, shape):
+            self.input_shape = shape
+            self.inputs = []
+
+        def infer(self, blob):
+            self.inputs.append(blob.copy())
+            p = np.zeros((1, 126), np.float32)
+            p[0, 2], p[0, 37] = .9, .1
+            return [p]
+
+    def run():
+        body = Head((1, 2, 100, 17, 6))
+        rgb = Head((1, 8, 3, 192, 192))
+        backend = SegmentActionBackend(object(), body, rgb)
+        result = backend.recognize(received)
+        return result, body.inputs, rgb.inputs
+
+    row = np.array(_standing_row(), np.float32)
+    received = []
+    # Multiple people, reordered detections, invisible joints, and a gap long
+    # enough to expire tracks exercise both IoU and centroid association.
+    for i in range(12):
+        rows = np.stack([row.copy(), row.copy()])
+        rows[1, [0, 2]] += 180
+        rows[1, 6:].reshape(17, 3)[:, 0] += 180
+        if i == 4:
+            rows = rows[::-1].copy()
+        if i in (5, 6):
+            rows[0, 6:].reshape(17, 3)[:5, 2] = 0
+        pose = (rows[:, :4], rows[:, 4], rows[:, 6:].reshape(2, 17, 3), (480, 640))
+        received.append((i*.1+(3. if i >= 8 else 0.),
+                         frame_bytes(640, 480), pose))
+    lean, lean_body, lean_rgb = run()
+    monkeypatch.setattr(pose_segment, '_SkeletonFrame', PoseFrame)
+    reference, reference_body, reference_rgb = run()
+    assert lean['evidence'] == reference['evidence']
+    assert lean['activity'] == reference['activity']
+    np.testing.assert_array_equal(lean['probabilities'], reference['probabilities'])
+    np.testing.assert_array_equal(lean_body[0], reference_body[0])
+    np.testing.assert_array_equal(lean_rgb[0], reference_rgb[0])

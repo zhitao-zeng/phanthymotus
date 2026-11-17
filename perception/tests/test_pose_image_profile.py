@@ -23,5 +23,6 @@ def test_only_seeded_segment_profile_changes_image_config(tmp_path, monkeypatch,
     if family == 'jp61':
         assert result['plugins']['pose']['activity_mode'] == 'segment'
         assert result['plugins']['pose']['model'] == '/opt/segment/pose.engine'
+        assert result['plugins']['pose']['activity_idle_flush_s'] == 0.0
     else:
         assert result == config

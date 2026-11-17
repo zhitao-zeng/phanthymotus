@@ -343,7 +343,7 @@ TOOLS = [
                 "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "title": "Action recognition", "description": "hybrid uses geometry for posture and a trained model for movement. rules uses geometry only and loads no second model — useful for telling a model mistake apart from a geometry mistake.", "default": "hybrid", "scope": "instance", "advanced": True},
                 "action_window_s": {"type": "number", "minimum": 0.2, "title": "Movement look-back (s)", "description": "How much recent movement is used to judge waving and walking.", "default": 5.0, "scope": "instance", "advanced": True},
                 "activity_interval_s": {"type": "number", "minimum": 0.0, "title": "Action model interval (s)", "description": "The action model judges a clip, so running it every frame re-reads almost the same input. Posture stays frame-rate regardless.", "default": 0.45, "scope": "instance", "advanced": True},
-                "activity_idle_flush_s": {"type": "number", "minimum": 0.0, "title": "Finish action after input pause (s)", "description": "When the image stream pauses, judge the last buffered action once. Zero disables this.", "default": 0.0, "scope": "instance", "advanced": True},
+                "activity_idle_flush_s": {"type": "number", "minimum": 0.0, "title": "Finish action after input pause (s)", "description": "When the image stream pauses, judge the buffered action once. Zero disables this in rolling mode; segment mode automatically waits at least 0.15 seconds and two configured frame intervals.", "default": 0.0, "scope": "instance", "advanced": True},
                 "activity_mode": {"type": "string", "enum": ["rolling", "segment"], "title": "When to recognize an action", "description": "rolling updates actions while video arrives. segment recognizes the received clip once the input pauses, using its complete context.", "default": "rolling", "scope": "instance", "advanced": True},
                 "label_hold": {"type": "integer", "minimum": 1, "title": "Label stability (frames)", "description": "How many frames a new label must win before it replaces the current one. A label flickering several times a second is worse than a steady wrong one.", "default": 1, "scope": "instance", "advanced": True},
                 "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Action score threshold", "description": "Falls use a higher bar of their own: a false fall makes the robot drop what it is doing to ask if someone is hurt.", "default": 0.08, "scope": "instance", "advanced": True},
@@ -416,7 +416,11 @@ class _PoseNode(Node):
         self._segment_count = 0
         if segment_backend is not None:
             from plugins.pose_segment import SegmentBuffer
-            self._activity_idle_flush_s = self._activity_idle_flush_s or .4
+            # Leave time for the real classification, while allowing the next
+            # image to arrive on slower streams. Explicit pauses keep their
+            # configured semantics.
+            self._activity_idle_flush_s = self._activity_idle_flush_s or max(
+                .15, 2*self._frame_interval)
             self._segment_buffer = SegmentBuffer(self._activity_idle_flush_s)
         self._last_image_received_at = 0.0
         self._idle_finalized_at = 0.0

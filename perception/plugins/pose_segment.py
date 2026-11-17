@@ -12,8 +12,26 @@ import threading
 import numpy as np
 
 from plugins.action_vocab import OFFICIAL_126_CLASSES
-from plugins.pose_action import PoseFrame, PoseTracker
+from plugins.pose_action import PoseTracker, body_height
 from plugins.pose_stgcn import SkeletonActionBackend, looks_like_probabilities, softmax
+
+
+class _SkeletonFrame:
+    """Tracker/head fields without posture geometry that neither consumes."""
+
+    __slots__ = ('t', 'box', 'keypoints', 'image_size', 'height')
+
+    def __init__(self, t, box, keypoints, min_conf, image_size=None):
+        shape = getattr(keypoints, 'shape', None)
+        if shape is None or len(shape) != 2 or shape[0] != 17 or shape[1] < 3:
+            raise ValueError(f'keypoints must be (17, 3+); got {shape}')
+        self.t = float(t)
+        self.box = [float(v) for v in box]
+        self.keypoints = keypoints
+        self.image_size = (tuple(int(v) for v in image_size)
+                           if image_size and image_size[0] and image_size[1]
+                           else None)
+        self.height = body_height(box)
 
 
 class SegmentBuffer:
@@ -226,7 +244,8 @@ class SegmentActionBackend:
         samples = [received[i] for i in indices]
         image_indices = list(rgb_frame_indices(len(samples), self.rgb_n_per_view))
         rgb_images, frame_records = {}, []
-        tracker = PoseTracker(timeout_s=2., history_s=30.)
+        tracker = PoseTracker(timeout_s=2., history_s=30.,
+                              frame_factory=_SkeletonFrame)
         track_weights = {}
         base_time = samples[0][0]
         def record_detections(fi, shape, boxes, scores, kps):
@@ -287,7 +306,7 @@ class SegmentActionBackend:
                 chosen = records[0]
             box = chosen[1] if chosen else np.zeros(4, np.float32)
             kp = chosen[3] if chosen else np.zeros((17, 3), np.float32)
-            poses.append(PoseFrame(timestamp, box, kp, .3, image_size=size))
+            poses.append(_SkeletonFrame(timestamp, box, kp, .3, image_size=size))
             primary_records.append(kp)
         if snapshot_index is None:
             return None

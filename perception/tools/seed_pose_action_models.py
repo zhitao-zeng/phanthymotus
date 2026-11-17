@@ -16,7 +16,8 @@ def seed(family, config_path):
         path = Path(config_path)
         config = yaml.safe_load(path.read_text())
         config['plugins']['pose'].update(
-            activity_mode='segment', model=segment['yolo26s-pose-batch4.engine'])
+            activity_mode='segment', model=segment['yolo26s-pose-batch4.engine'],
+            activity_idle_flush_s=0.0)
         path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True))
     return pose, action, segment
 
