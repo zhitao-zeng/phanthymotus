@@ -454,5 +454,22 @@ class VisionEngineSession:
         blob = to_blob(canvas, self._engine.input_dtype)
         return self._engine.infer(blob), meta
 
+    def infer_batch(self, frames: list) -> list:
+        """Run real frames in batches supported by this engine's profiles."""
+        profiles = getattr(self._engine, 'profiles', [])
+        batch_size = max((shape[2][0] for shape in profiles), default=1)
+        results = []
+        for start in range(0, len(frames), batch_size):
+            chunk = frames[start:start+batch_size]
+            inputs, metas = [], []
+            for frame in chunk:
+                canvas, meta = letterbox(frame, self._in_w, self._in_h)
+                inputs.append(to_blob(canvas, self._engine.input_dtype))
+                metas.append(meta)
+            outputs = self._engine.infer(np.concatenate(inputs, axis=0))
+            for i, meta in enumerate(metas):
+                results.append(([output[i:i+1] for output in outputs], meta))
+        return results
+
     def close(self) -> None:
         self._engine.close()
