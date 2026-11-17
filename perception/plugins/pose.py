@@ -1527,7 +1527,8 @@ class PosePerceptionPlugin:
         return SegmentActionBackend(
             self._model, self._segment_model.body._engine,
             self._segment_model.rgb_engine,
-            min_score=merged["action_min_score"], confidence=merged["confidence"])
+            min_score=merged["action_min_score"], confidence=merged["confidence"],
+            ntu_rgb_weight=self._segment_model.ntu_rgb_weight)
 
     # ── engine ───────────────────────────────────────────────────────────
 

@@ -6,6 +6,7 @@ are needed. The frozen action models use the same person and hand crops.
 """
 from collections import deque
 from pathlib import Path
+import json
 import threading
 
 import numpy as np
@@ -110,14 +111,14 @@ def crop_square(rgb, cx, cy, side, out_hw=192):
     return cv2.resize(patch, (out_hw, out_hw), interpolation=cv2.INTER_LINEAR)
 
 
-def rgb_frame_indices(length):
-    # Preserve the saved model's 16-observation cache -> four per view policy.
+def rgb_frame_indices(length, n_per_view=4):
+    # Preserve the saved models' 16-observation cache -> observations per view.
     sixteen = np.linspace(0, length-1, 16).round().astype(int)
-    return sixteen[np.linspace(0, 15, 4).round().astype(int)]
+    return sixteen[np.linspace(0, 15, n_per_view).round().astype(int)]
 
 
 def build_rgb_input(rgb_frames, keypoints):
-    """Four RGB source images plus the whole segment's primary COCO-17 poses."""
+    """RGB source images plus the whole segment's primary COCO-17 poses."""
     p0 = np.asarray(keypoints, np.float32)
     h, w = rgb_frames[0].shape[:2]
     cx, cy, side = w*.5, h*.5, float(min(h, w))
@@ -134,7 +135,7 @@ def build_rgb_input(rgb_frames, keypoints):
         wrist_scores.append(float(-p0[ok, wi, 1].mean()) if ok.any() else -9999.)
     prefer_left = wrist_scores[0] >= wrist_scores[1]
     people, hands = [], []
-    for rgb, fi in zip(rgb_frames, rgb_frame_indices(len(p0))):
+    for rgb, fi in zip(rgb_frames, rgb_frame_indices(len(p0), len(rgb_frames))):
         h, w = rgb.shape[:2]
         people.append(crop_square(rgb, cx, cy, max(side, 120.)).transpose(2, 0, 1))
         hx, hy, hs = cx, cy-.12*side, max(.42*side, 96.)
@@ -166,10 +167,10 @@ def build_rgb_input(rgb_frames, keypoints):
     return ((frames-mean)/std)[None]
 
 
-def fuse_probabilities(body, rgb):
+def fuse_probabilities(body, rgb, ntu_rgb_weight=.08):
     # These model heads share this fixed ontology recipe. Non-NTU classes are
     # the kitchen actions, none, and the traffic/control gesture family.
-    weights = np.full(126, .08, np.float32)
+    weights = np.full(126, ntu_rgb_weight, np.float32)
     weights[np.array([38]+list(range(103, 117)))-1] = .30
     weights[12:28] = .65
     result = (1-weights)*np.asarray(body)+weights*np.asarray(rgb)
@@ -178,11 +179,18 @@ def fuse_probabilities(body, rgb):
 
 class SegmentActionBackend:
     def __init__(self, pose_model, body_engine, rgb_engine, min_score=.02,
-                 confidence=.35, observations=48):
+                 confidence=.35, observations=48, ntu_rgb_weight=.08):
         self.pose_model = pose_model
         self.body = SkeletonActionBackend(engine=body_engine, modality='jb',
                                          prenorm_mode='fix', min_motion=0.)
         self.rgb_engine = rgb_engine
+        shape = getattr(rgb_engine, 'input_shape', None) or getattr(
+            rgb_engine, 'optimization_shape', None)
+        if (shape is None or len(shape) != 5 or tuple(shape[2:]) != (3, 192, 192)
+                or int(shape[1]) <= 0 or int(shape[1]) % 2):
+            raise ValueError('RGB action engine must take (N, 2*K, 3, 192, 192)')
+        self.rgb_n_per_view = int(shape[1])//2
+        self.ntu_rgb_weight = float(ntu_rgb_weight)
         self.min_score = float(min_score)
         self.confidence = float(confidence)
         self.observations = int(observations)
@@ -192,13 +200,21 @@ class SegmentActionBackend:
     def from_directory(cls, pose_model, directory, **kwargs):
         from utils.tensorrt_runtime import TensorRTEngine
         root = Path(directory)
-        body = TensorRTEngine(root/'stgcnpp-action126-v2p.engine', shared_scratch=True)
+        manifest = root/'models.json'
+        files = json.loads(manifest.read_text()) if manifest.exists() else {}
+        body = TensorRTEngine(root/files.get('body_engine', 'stgcnpp-action126-v2p.engine'), shared_scratch=True)
         try:
-            rgb = TensorRTEngine(root/'tsm-mnv2-dual8f-action126.engine', shared_scratch=True)
+            rgb = TensorRTEngine(root/files.get('rgb_engine', 'tsm-mnv2-dual8f-action126.engine'), shared_scratch=True)
         except Exception:
             body.close()
             raise
-        return cls(pose_model, body, rgb, **kwargs)
+        try:
+            kwargs.setdefault('ntu_rgb_weight', files.get('rgb_ntu_weight', .08))
+            return cls(pose_model, body, rgb, **kwargs)
+        except Exception:
+            body.close()
+            rgb.close()
+            raise
 
     def recognize(self, received, stop_event=None):
         import cv2
@@ -208,7 +224,7 @@ class SegmentActionBackend:
         indices = np.linspace(0, len(received)-1,
                               min(self.observations, len(received))).round().astype(int)
         samples = [received[i] for i in indices]
-        image_indices = list(rgb_frame_indices(len(samples)))
+        image_indices = list(rgb_frame_indices(len(samples), self.rgb_n_per_view))
         rgb_images, frame_records = {}, []
         tracker = PoseTracker(timeout_s=2., history_s=30.)
         track_weights = {}
@@ -284,7 +300,7 @@ class SegmentActionBackend:
         rgb = raw_rgb if looks_like_probabilities(raw_rgb) else softmax(raw_rgb)
         if body.shape != (126,) or rgb.shape != (126,):
             raise ValueError('segment action heads must both emit 126 classes')
-        probabilities = fuse_probabilities(body, rgb)
+        probabilities = fuse_probabilities(body, rgb, self.ntu_rgb_weight)
         action_id = int(probabilities.argmax())+1
         score = float(probabilities[action_id-1])
         activity = None
@@ -299,6 +315,8 @@ class SegmentActionBackend:
         return {'activity': activity, 'probabilities': probabilities,
                 'evidence': {'frames_used': len(samples), 'primary_track': primary,
                              'poses_computed_during_reception': cached_poses,
+                             'RGB_frames_per_view': self.rgb_n_per_view,
+                             'RGB_NTU_weight': self.ntu_rgb_weight,
                              'source': 'received-segment', 'best_action_id': action_id,
                              'best_score': round(score, 3)},
                 'image': image, 'boxes': np.array([r[1] for r in records]),

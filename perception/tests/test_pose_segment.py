@@ -3,6 +3,7 @@ import json
 import threading
 
 import numpy as np
+import pytest
 
 from plugins.pose_segment import SegmentBuffer, SegmentActionBackend
 from plugins.vision_runtime import VisionEngineSession
@@ -149,7 +150,8 @@ def test_pose_finishing_after_a_gap_stays_with_its_received_segment():
     assert not buffer._by_time
 
 
-def test_final_classification_reuses_poses_and_never_calls_the_pose_engine():
+@pytest.mark.parametrize('rgb_frames', [8, 24])
+def test_final_classification_reuses_poses_and_never_calls_the_pose_engine(rgb_frames):
     class PoseMustNotRun:
         def infer(self, image):
             raise AssertionError('pose inference after the input pause')
@@ -158,9 +160,11 @@ def test_final_classification_reuses_poses_and_never_calls_the_pose_engine():
             raise AssertionError('pose batch after the input pause')
 
     class Head:
-        input_shape = (1, 2, 100, 17, 6)
+        def __init__(self, shape):
+            self.input_shape = shape
 
         def infer(self, blob):
+            assert blob.shape == self.input_shape
             p = np.zeros((1, 126), np.float32)
             p[0, 2], p[0, 37] = .9, .1
             return [p]
@@ -168,9 +172,38 @@ def test_final_classification_reuses_poses_and_never_calls_the_pose_engine():
     row = np.array(_standing_row(), np.float32)
     decoded = (row[None, :4], row[None, 4], row[6:].reshape(1, 17, 3), (480, 640))
     received = [(i*.1, frame_bytes(640, 480), decoded) for i in range(5)]
-    backend = SegmentActionBackend(PoseMustNotRun(), Head(), Head())
+    backend = SegmentActionBackend(PoseMustNotRun(), Head((1, 2, 100, 17, 6)),
+                                   Head((1, rgb_frames, 3, 192, 192)))
     result = backend.recognize(received)
     assert result['activity']['action_id'] == 3
     assert result['activity']['score'] == .9
     assert result['evidence']['poses_computed_during_reception'] is True
+    assert result['evidence']['RGB_frames_per_view'] == rgb_frames//2
     assert backend.recognize(received[:3]) is None
+
+
+def test_model_bundle_spec_survives_creation_of_an_instance_backend(tmp_path, monkeypatch):
+    from utils import tensorrt_runtime
+
+    loaded = []
+
+    class Engine:
+        def __init__(self, path, **kwargs):
+            loaded.append(path.name)
+            self.input_shape = ((1, 2, 100, 17, 6) if path.name == 'body-new.engine'
+                                else (1, 24, 3, 192, 192))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tensorrt_runtime, 'TensorRTEngine', Engine)
+    (tmp_path/'models.json').write_text(json.dumps({'body_engine': 'body-new.engine',
+        'rgb_engine': 'teacher-new.engine', 'rgb_ntu_weight': .5}))
+    backend = SegmentActionBackend.from_directory(object(), tmp_path)
+    assert loaded == ['body-new.engine', 'teacher-new.engine']
+    plugin, _ = _plugin({'activity_mode': 'segment'})
+    plugin._segment_model = backend
+    monkeypatch.setenv('ACTION_SEGMENT_MODEL_DIR', str(tmp_path))
+    instance = plugin._segment_backend_for(plugin._merged_config('new-instance'))
+    assert instance.rgb_n_per_view == 12
+    assert instance.ntu_rgb_weight == .5
