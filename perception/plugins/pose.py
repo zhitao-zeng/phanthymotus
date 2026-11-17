@@ -571,16 +571,17 @@ class _PoseNode(Node):
         if now - self._last_inference_time < self._frame_interval:
             return
         self._last_inference_time = now
+        item = (now, msg.data) if self._segment_buffer is not None else msg.data
         # Drop the old frame if the queue is full (no backpressure).
         try:
-            self._frame_queue.put_nowait(msg.data)
+            self._frame_queue.put_nowait(item)
         except queue.Full:
             try:
                 self._frame_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._frame_queue.put_nowait(msg.data)
+                self._frame_queue.put_nowait(item)
             except queue.Full:
                 pass
 
@@ -591,7 +592,7 @@ class _PoseNode(Node):
         while not self._stop_event.is_set():
             try:
                 timeout = 0.1 if self._activity_idle_flush_s > 0.0 else 1.0
-                jpeg_bytes = self._frame_queue.get(timeout=timeout)
+                item = self._frame_queue.get(timeout=timeout)
             except queue.Empty:
                 try:
                     self._flush_idle_activity()
@@ -600,6 +601,10 @@ class _PoseNode(Node):
                 continue
             started = time.time()
             try:
+                if self._segment_buffer is not None:
+                    received_at, jpeg_bytes = item
+                else:
+                    jpeg_bytes = item
                 frame = cv2.imdecode(
                     np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR
                 )
@@ -609,6 +614,9 @@ class _PoseNode(Node):
                 boxes, scores, keypoints = decode_poses(
                     outputs, meta, self._confidence
                 )
+                if self._segment_buffer is not None:
+                    self._segment_buffer.record_pose(
+                        received_at, boxes, scores, keypoints, frame.shape)
                 persons = self._describe(boxes, scores, keypoints, frame, started)
                 self._publish(persons, frame, started)
                 self._idle_persons = persons
@@ -668,12 +676,14 @@ class _PoseNode(Node):
                           publish_skeleton=False, count_frame=False)
 
     def _flush_received_segment(self) -> None:
-        if self._stop_event.is_set():
+        if self._stop_event.is_set() or not self._frame_queue.empty():
             return
         ready = self._segment_buffer.pop_ready(time.monotonic())
         if ready is None:
             return
         received, stats = ready
+        received = [record for record in received if record[2] is not None]
+        stats['processed_observations'] = len(received)
         started = time.perf_counter()
         try:
             result = self._segment_backend.recognize(received, self._stop_event)
@@ -682,6 +692,7 @@ class _PoseNode(Node):
             self._last_prediction = {**stats, "segment_error": str(error)}
             raise
         if result is None or self._stop_event.is_set():
+            self._last_prediction = {**stats, "reason": "no segment decision"}
             return
         persons = self._describe(result["boxes"], result["scores"],
                                  result["keypoints"], result["image"], time.time(),

@@ -4,7 +4,7 @@ import threading
 
 import numpy as np
 
-from plugins.pose_segment import SegmentBuffer
+from plugins.pose_segment import SegmentBuffer, SegmentActionBackend
 from plugins.vision_runtime import VisionEngineSession
 from test_pose_plugin import _plugin, _publisher, _standing_row
 from test_pose_idle_finalize import _FinalClassifier
@@ -82,11 +82,13 @@ def test_real_node_buffers_all_received_images_before_its_fps_gate():
                    for p in json.loads(msg)['persons'])
         _wait_until(lambda: node._segment_count == 1)
         _wait_until(lambda: len(lean.messages) == 2)
-        assert len(backend.clips) == 1 and len(backend.clips[0]) == 6
+        assert len(backend.clips) == 1 and len(backend.clips[0]) == 1
+        assert backend.clips[0][0][2] is not None
         assert json.loads(lean.messages[-1])['persons'][0]['activity_score'] == .81
         assert node._detect_count == 1
         assert len(_publisher(node, node._skeleton_topic).messages) == 1
         assert node._last_prediction['received_frames'] == 6
+        assert node._last_prediction['processed_observations'] == 1
     finally:
         node.stop()
 
@@ -131,3 +133,44 @@ def test_dynamic_pose_batches_preserve_input_order_and_individual_letterboxes():
     assert session._engine.calls == [(3, 3, 32, 32), (2, 3, 32, 32)]
     assert [int(output[0].item()) for output, _ in results] == list(range(5))
     assert [(meta.orig_h, meta.orig_w) for _, meta in results] == [(20+i, 30+i) for i in range(5)]
+
+
+def test_pose_finishing_after_a_gap_stays_with_its_received_segment():
+    buffer = SegmentBuffer(quiet_s=.2)
+    buffer.append(b'old', 0.)
+    buffer.append(b'new', 1.)
+    boxes = np.array([[1., 2., 3., 4.]])
+    buffer.record_pose(0., boxes, np.array([.9]), np.zeros((1, 17, 3)), (480, 640, 3))
+    boxes[0, 0] = 999.
+    frames, _ = buffer.pop_ready(1.01)
+    assert len(frames) == 1 and frames[0][1] == b'old'
+    assert frames[0][2][0][0, 0] == 1.
+    buffer.reset()
+    assert not buffer._by_time
+
+
+def test_final_classification_reuses_poses_and_never_calls_the_pose_engine():
+    class PoseMustNotRun:
+        def infer(self, image):
+            raise AssertionError('pose inference after the input pause')
+
+        def infer_batch(self, images):
+            raise AssertionError('pose batch after the input pause')
+
+    class Head:
+        input_shape = (1, 2, 100, 17, 6)
+
+        def infer(self, blob):
+            p = np.zeros((1, 126), np.float32)
+            p[0, 2], p[0, 37] = .9, .1
+            return [p]
+
+    row = np.array(_standing_row(), np.float32)
+    decoded = (row[None, :4], row[None, 4], row[6:].reshape(1, 17, 3), (480, 640))
+    received = [(i*.1, frame_bytes(640, 480), decoded) for i in range(5)]
+    backend = SegmentActionBackend(PoseMustNotRun(), Head(), Head())
+    result = backend.recognize(received)
+    assert result['activity']['action_id'] == 3
+    assert result['activity']['score'] == .9
+    assert result['evidence']['poses_computed_during_reception'] is True
+    assert backend.recognize(received[:3]) is None

@@ -23,6 +23,7 @@ class SegmentBuffer:
         self._lock = threading.Lock()
         self._frames = deque()
         self._ready = deque(maxlen=2)
+        self._by_time = {}
         self._bytes = 0
         self._received = 0
         self.dropped_segments = 0
@@ -40,27 +41,49 @@ class SegmentBuffer:
             if self._frames and now-self._frames[-1][0] >= self.quiet_s:
                 if len(self._ready) == self._ready.maxlen:
                     self.dropped_segments += 1
+                    self._forget(self._ready.popleft()[0])
                 self._ready.append(self._take())
             data = bytes(payload)
-            self._frames.append((float(now), data))
+            record = [float(now), data, None]
+            self._frames.append(record)
+            self._by_time[float(now)] = record
             self._bytes += len(data)
             self._received += 1
             while self._frames and (self._bytes > self.max_bytes or
                                     now-self._frames[0][0] > self.max_s):
-                self._bytes -= len(self._frames.popleft()[1])
+                removed = self._frames.popleft()
+                self._bytes -= len(removed[1])
+                self._by_time.pop(removed[0], None)
+
+    def record_pose(self, now, boxes, scores, keypoints, image_shape):
+        """Attach the real worker result to its received JPEG, even after a gap."""
+        with self._lock:
+            record = self._by_time.get(float(now))
+            if record is not None:
+                record[2] = (np.array(boxes, copy=True), np.array(scores, copy=True),
+                             np.array(keypoints, copy=True), tuple(image_shape[:2]))
+
+    def _forget(self, frames):
+        for record in frames:
+            self._by_time.pop(record[0], None)
 
     def pop_ready(self, now):
         with self._lock:
             if self._ready:
-                return self._ready.popleft()
+                result = self._ready.popleft()
+                self._forget(result[0])
+                return result
             if self._frames and now-self._frames[-1][0] >= self.quiet_s:
-                return self._take()
+                result = self._take()
+                self._forget(result[0])
+                return result
         return None
 
     def reset(self):
         with self._lock:
             self._frames.clear()
             self._ready.clear()
+            self._by_time.clear()
             self._bytes = self._received = 0
             self.dropped_segments = 0
 
@@ -190,7 +213,34 @@ class SegmentActionBackend:
         tracker = PoseTracker(timeout_s=2., history_s=30.)
         track_weights = {}
         base_time = samples[0][0]
-        for start in range(0, len(samples), 8):
+        def record_detections(fi, shape, boxes, scores, kps):
+            h, w = shape
+            order = np.argsort(np.asarray(scores, np.float32))[::-1][:4]
+            boxes, scores, kps = boxes[order], scores[order], kps[order]
+            timestamp = samples[fi][0]-base_time
+            tracks = tracker.update(boxes, kps, timestamp, image_size=(w, h))
+            records = []
+            for track, box, score, kp in zip(tracks, boxes, scores, kps):
+                area = max(1., float(box[2]-box[0])*float(box[3]-box[1]))/max(1., float(w*h))
+                track_weights[track.id] = track_weights.get(track.id, 0.)+float(score)*(.5+area)
+                records.append((track.id, box, float(score), kp))
+            frame_records.append((timestamp, (w, h), records))
+
+        cached_poses = len(samples[0]) == 3
+        if cached_poses:
+            for fi, (_, data, pose) in enumerate(samples):
+                if stop_event is not None and stop_event.is_set():
+                    return None
+                if pose is None:
+                    raise ValueError('segment observation has no processed pose')
+                boxes, scores, kps, shape = pose
+                record_detections(fi, shape, boxes, scores, kps)
+                if fi in image_indices:
+                    image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+                    if image is None:
+                        raise ValueError('segment contains an undecodable JPEG')
+                    rgb_images[fi] = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        for start in ([] if cached_poses else range(0, len(samples), 8)):
             if stop_event is not None and stop_event.is_set():
                 return None
             images = [cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
@@ -206,16 +256,7 @@ class SegmentActionBackend:
                 if fi in image_indices:
                     rgb_images[fi] = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 boxes, scores, kps = decode_poses(raw, meta, self.confidence)
-                order = np.argsort(np.asarray(scores, np.float32))[::-1][:4]
-                boxes, scores, kps = boxes[order], scores[order], kps[order]
-                timestamp = samples[fi][0]-base_time
-                tracks = tracker.update(boxes, kps, timestamp, image_size=(w, h))
-                records = []
-                for track, box, score, kp in zip(tracks, boxes, scores, kps):
-                    area = max(1., float(box[2]-box[0])*float(box[3]-box[1]))/max(1., float(w*h))
-                    track_weights[track.id] = track_weights.get(track.id, 0.)+float(score)*(.5+area)
-                    records.append((track.id, box, float(score), kp))
-                frame_records.append((timestamp, (w, h), records))
+                record_detections(fi, (h, w), boxes, scores, kps)
             del images, outputs
         if not track_weights:
             return None
@@ -257,6 +298,7 @@ class SegmentActionBackend:
         self.last_error = None
         return {'activity': activity, 'probabilities': probabilities,
                 'evidence': {'frames_used': len(samples), 'primary_track': primary,
+                             'poses_computed_during_reception': cached_poses,
                              'source': 'received-segment', 'best_action_id': action_id,
                              'best_score': round(score, 3)},
                 'image': image, 'boxes': np.array([r[1] for r in records]),
