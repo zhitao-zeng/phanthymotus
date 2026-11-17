@@ -1,11 +1,14 @@
 """Received-segment boundaries, real node ingress, and batched frame order."""
 import json
 import threading
+import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from plugins.pose_segment import SegmentBuffer, SegmentActionBackend
+from plugins import pose
+from plugins.pose_segment import SegmentBuffer, SegmentActionBackend, rgb_frame_indices
 from plugins.vision_runtime import VisionEngineSession
 from test_pose_plugin import _plugin, _publisher, _standing_row
 from test_pose_idle_finalize import _FinalClassifier
@@ -124,8 +127,114 @@ def test_segment_auto_pause_respects_frame_period_and_explicit_config(fps, pause
     node = plugin._nodes['/cam/auto_pause']
     try:
         assert node._activity_idle_flush_s == pytest.approx(expected)
-        assert node._segment_buffer.quiet_s == pytest.approx(expected)
+        assert node._segment_buffer.quiet_s == pytest.approx(pause or max(.4, expected))
     finally:
+        node.stop()
+
+
+def test_auto_segment_retains_frames_across_short_pause_and_publishes_once(monkeypatch):
+    now = 10.
+    monkeypatch.setattr(pose, 'time', SimpleNamespace(
+        monotonic=lambda: now, perf_counter=time.perf_counter, time=time.time))
+    backend = _SegmentModel()
+    node = pose._PoseNode('/cam/segment', None, .35, 30., 'quiet',
+                          classifier=_FinalClassifier(), segment_backend=backend)
+    messages = _publisher(node, node._output_topic).messages
+    row = np.array(_standing_row(), np.float32)
+    buffer = node._segment_buffer
+
+    def record_frames(start):
+        for i in range(4):
+            timestamp = start+i*.03
+            buffer.append(bytes([i]), timestamp)
+            buffer.record_pose(timestamp, row[None, :4], row[None, 4],
+                               row[6:].reshape(1, 17, 3), (480, 640, 3))
+
+    record_frames(10.)
+    now = 10.26
+    node._flush_received_segment()
+    assert [len(clip) for clip in backend.clips] == [4]
+    assert messages == []
+
+    record_frames(10.34)
+    now = 10.60
+    node._flush_received_segment()
+    assert [len(clip) for clip in backend.clips] == [4, 8]
+    assert messages == []
+
+    now = 10.84
+    node._flush_received_segment()
+    node._flush_received_segment()
+    assert [len(clip) for clip in backend.clips] == [4, 8]
+    assert len(messages) == 1
+    evidence = node._last_prediction
+    assert evidence['received_frames'] == evidence['processed_observations'] == 8
+
+
+def test_resume_during_preview_reclassifies_full_segment_in_real_worker(monkeypatch):
+    now = 10.
+    monkeypatch.setattr(pose, 'time', SimpleNamespace(
+        monotonic=lambda: now, perf_counter=time.perf_counter, time=time.time))
+    release_first = threading.Event()
+
+    class BlockedPreview(_SegmentModel):
+        def recognize(self, received, stop_event):
+            result = super().recognize(received, stop_event)
+            if len(self.clips) == 1:
+                if not release_first.wait(2.):
+                    raise RuntimeError('Test did not release the first forward')
+                result['activity'] = {**result['activity'], 'name': 'drink water'}
+            return result
+
+    backend = BlockedPreview()
+    plugin, _ = _plugin({'activity_mode': 'segment', 'label_hold': 1})
+    plugin._segment_backend_for = lambda cfg: backend
+    plugin._classifier_for = lambda cfg: _FinalClassifier()
+    topic = '/cam/segment'
+    plugin.dispatch('pose', {'action': 'config', 'instance_id': topic, 'fps': 30})
+    plugin.dispatch('pose', {'action': 'start', 'input_topic': topic})
+    node = plugin._nodes[topic]
+    callback = node.subscriptions[0].callback
+    lean = _publisher(node, node._output_topic)
+    frame = _FakeCompressedImage(frame_bytes(640, 480))
+
+    def feed(when, expected):
+        nonlocal now
+        now = when
+        callback(frame)
+        assert _wait_until(lambda: node._detect_count == expected)
+
+    def activities():
+        return [person['activity'] for raw in lean.messages
+                for person in json.loads(raw)['persons'] if 'activity' in person]
+
+    try:
+        for index in range(4):
+            feed(10. + index*.05, index+1)
+        now = 10.32
+        assert backend.entered.wait(2.)
+        assert [len(x) for x in backend.clips] == [4]
+        assert activities() == []
+
+        # Deliver a frame while the first inference is still in flight.
+        now = 10.40
+        callback(frame)
+        release_first.set()
+        assert _wait_until(lambda: node._detect_count == 5)
+        for index in range(1, 4):
+            feed(10.40 + index*.05, index+5)
+        now = 10.73
+        assert _wait_until(lambda: len(backend.clips) == 2)
+        assert [len(x) for x in backend.clips] == [4, 8]
+        assert activities() == []
+
+        now = 11.0
+        assert _wait_until(lambda: activities() == ['brush teeth'])
+        assert len(backend.clips) == 2  # Publishing reused the complete preview.
+        assert node._detect_count == 8
+        assert node._last_prediction['processed_observations'] == 8
+    finally:
+        release_first.set()
         node.stop()
 
 
@@ -170,7 +279,9 @@ def test_pose_finishing_after_a_gap_stays_with_its_received_segment():
 
 
 @pytest.mark.parametrize('rgb_frames', [8, 24])
-def test_final_classification_reuses_poses_and_never_calls_the_pose_engine(rgb_frames):
+def test_final_classification_reuses_poses_and_never_calls_the_pose_engine(rgb_frames, monkeypatch):
+    import cv2
+
     class PoseMustNotRun:
         def infer(self, image):
             raise AssertionError('pose inference after the input pause')
@@ -193,7 +304,19 @@ def test_final_classification_reuses_poses_and_never_calls_the_pose_engine(rgb_f
     received = [(i*.1, frame_bytes(640, 480), decoded) for i in range(5)]
     backend = SegmentActionBackend(PoseMustNotRun(), Head((1, 2, 100, 17, 6)),
                                    Head((1, rgb_frames, 3, 192, 192)))
+    original_decode = cv2.imdecode
+    calls = []
+
+    def count_decode(data, flags):
+        calls.append(1)
+        return original_decode(data, flags)
+
+    monkeypatch.setattr(cv2, 'imdecode', count_decode)
     result = backend.recognize(received)
+    # The last primary frame is already one of the RGB classifier's inputs.
+    assert len(calls) == len(set(rgb_frame_indices(5, rgb_frames//2)))
+    assert np.array_equal(result['image'], original_decode(
+        np.frombuffer(received[-1][1], np.uint8), cv2.IMREAD_COLOR))
     assert result['activity']['action_id'] == 3
     assert result['activity']['score'] == .9
     assert result['evidence']['poses_computed_during_reception'] is True

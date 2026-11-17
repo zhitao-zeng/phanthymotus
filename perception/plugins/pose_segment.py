@@ -47,10 +47,13 @@ class SegmentBuffer:
         self._received = 0
         self.dropped_segments = 0
 
+    def _snapshot(self):
+        return (list(self._frames), {'received_frames': self._received,
+                'retained_frames': len(self._frames),
+                'truncated_frames': self._received-len(self._frames)})
+
     def _take(self):
-        result = (list(self._frames), {'received_frames': self._received,
-                  'retained_frames': len(self._frames),
-                  'truncated_frames': self._received-len(self._frames)})
+        result = self._snapshot()
         self._frames.clear()
         self._bytes = self._received = 0
         return result
@@ -85,6 +88,13 @@ class SegmentBuffer:
     def _forget(self, frames):
         for record in frames:
             self._by_time.pop(record[0], None)
+
+    def snapshot_if_quiet(self, now, quiet_s):
+        """Read a provisional segment without closing it on a brief pause."""
+        with self._lock:
+            if self._frames and now-self._frames[-1][0] >= quiet_s:
+                return self._snapshot()
+        return None
 
     def pop_ready(self, now):
         with self._lock:
@@ -328,7 +338,10 @@ class SegmentActionBackend:
             activity = {'action_id': action_id, 'name': name, 'name_zh': zh,
                         'score': round(score, 3), 'source': 'segment-dual'}
         _, size, records = frame_records[snapshot_index]
-        image = cv2.imdecode(np.frombuffer(samples[snapshot_index][1], np.uint8), cv2.IMREAD_COLOR)
+        if snapshot_index in rgb_images:
+            image = cv2.cvtColor(rgb_images[snapshot_index], cv2.COLOR_RGB2BGR)
+        else:
+            image = cv2.imdecode(np.frombuffer(samples[snapshot_index][1], np.uint8), cv2.IMREAD_COLOR)
         primary_box = next(r[1] for r in records if r[0] == primary)
         self.last_error = None
         return {'activity': activity, 'probabilities': probabilities,

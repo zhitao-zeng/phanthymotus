@@ -343,7 +343,7 @@ TOOLS = [
                 "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "title": "Action recognition", "description": "hybrid uses geometry for posture and a trained model for movement. rules uses geometry only and loads no second model — useful for telling a model mistake apart from a geometry mistake.", "default": "hybrid", "scope": "instance", "advanced": True},
                 "action_window_s": {"type": "number", "minimum": 0.2, "title": "Movement look-back (s)", "description": "How much recent movement is used to judge waving and walking.", "default": 5.0, "scope": "instance", "advanced": True},
                 "activity_interval_s": {"type": "number", "minimum": 0.0, "title": "Action model interval (s)", "description": "The action model judges a clip, so running it every frame re-reads almost the same input. Posture stays frame-rate regardless.", "default": 0.45, "scope": "instance", "advanced": True},
-                "activity_idle_flush_s": {"type": "number", "minimum": 0.0, "title": "Finish action after input pause (s)", "description": "When the image stream pauses, judge the buffered action once. Zero disables this in rolling mode; segment mode automatically waits at least 0.15 seconds and two configured frame intervals.", "default": 0.0, "scope": "instance", "advanced": True},
+                "activity_idle_flush_s": {"type": "number", "minimum": 0.0, "title": "Finish action after input pause (s)", "description": "When the image stream pauses, judge the buffered action once. Zero disables this in rolling mode. In segment mode zero starts inference early and confirms the end after at least 0.4 seconds and two configured frame intervals.", "default": 0.0, "scope": "instance", "advanced": True},
                 "activity_mode": {"type": "string", "enum": ["rolling", "segment"], "title": "When to recognize an action", "description": "rolling updates actions while video arrives. segment recognizes the received clip once the input pauses, using its complete context.", "default": "rolling", "scope": "instance", "advanced": True},
                 "label_hold": {"type": "integer", "minimum": 1, "title": "Label stability (frames)", "description": "How many frames a new label must win before it replaces the current one. A label flickering several times a second is worse than a steady wrong one.", "default": 1, "scope": "instance", "advanced": True},
                 "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Action score threshold", "description": "Falls use a higher bar of their own: a false fall makes the robot drop what it is doing to ask if someone is hurt.", "default": 0.08, "scope": "instance", "advanced": True},
@@ -413,15 +413,17 @@ class _PoseNode(Node):
         self._activity_idle_flush_s = max(0.0, float(activity_idle_flush_s))
         self._segment_backend = segment_backend
         self._segment_buffer = None
+        self._segment_preview = None
         self._segment_count = 0
         if segment_backend is not None:
             from plugins.pose_segment import SegmentBuffer
-            # Leave time for the real classification, while allowing the next
-            # image to arrive on slower streams. Explicit pauses keep their
-            # configured semantics.
-            self._activity_idle_flush_s = self._activity_idle_flush_s or max(
-                .15, 2*self._frame_interval)
-            self._segment_buffer = SegmentBuffer(self._activity_idle_flush_s)
+            pause = self._activity_idle_flush_s
+            if not pause:
+                # Let classification overlap the remainder of the quiet period.
+                # A transient pause must not discard the start of a segment.
+                self._activity_idle_flush_s = max(.15, 2*self._frame_interval)
+                pause = max(.4, self._activity_idle_flush_s)
+            self._segment_buffer = SegmentBuffer(pause)
         self._last_image_received_at = 0.0
         self._idle_finalized_at = 0.0
         self._idle_persons: list = []
@@ -551,6 +553,7 @@ class _PoseNode(Node):
             self._idle_finalized_at = 0.0
             if self._segment_buffer is not None:
                 self._segment_buffer.reset()
+                self._segment_preview = None
             # Drop gesture state with the tracks it belongs to. Keeping it
             # would mean a restart inherits a held gesture and an armed
             # cooldown from before the stop, so the first real gesture after
@@ -596,6 +599,13 @@ class _PoseNode(Node):
         while not self._stop_event.is_set():
             try:
                 timeout = 0.1 if self._activity_idle_flush_s > 0.0 else 1.0
+                if (self._segment_preview is not None
+                        and self._segment_preview[0][0] == self._last_image_received_at):
+                    # Wake at the confirmation boundary even if the preview
+                    # finished very close to it.
+                    remaining = (self._last_image_received_at + self._segment_buffer.quiet_s
+                                 - time.monotonic())
+                    timeout = max(.001, min(timeout, remaining))
                 item = self._frame_queue.get(timeout=timeout)
             except queue.Empty:
                 try:
@@ -682,19 +692,33 @@ class _PoseNode(Node):
     def _flush_received_segment(self) -> None:
         if self._stop_event.is_set() or not self._frame_queue.empty():
             return
-        ready = self._segment_buffer.pop_ready(time.monotonic())
+        now = time.monotonic()
+        ready = self._segment_buffer.pop_ready(now)
+        confirmed = ready is not None
+        if not confirmed and self._activity_idle_flush_s < self._segment_buffer.quiet_s:
+            ready = self._segment_buffer.snapshot_if_quiet(now, self._activity_idle_flush_s)
         if ready is None:
             return
-        received, stats = ready
-        received = [record for record in received if record[2] is not None]
+        records, stats = ready
+        received = [record for record in records if record[2] is not None]
         stats['processed_observations'] = len(received)
-        started = time.perf_counter()
-        try:
-            result = self._segment_backend.recognize(received, self._stop_event)
-        except Exception as error:
-            self._segment_backend.last_error = str(error)
-            self._last_prediction = {**stats, "segment_error": str(error)}
-            raise
+        key = (records[-1][0], len(received))
+        if self._segment_preview is not None and self._segment_preview[0] == key:
+            _, result, inference_ms = self._segment_preview
+        else:
+            started = time.perf_counter()
+            try:
+                result = self._segment_backend.recognize(received, self._stop_event)
+            except Exception as error:
+                self._segment_backend.last_error = str(error)
+                self._last_prediction = {**stats, "segment_error": str(error)}
+                raise
+            inference_ms = round((time.perf_counter()-started)*1000, 2)
+        if not confirmed:
+            self._segment_preview = (key, result, inference_ms)
+            return
+        if self._segment_preview is not None and self._segment_preview[0][0] <= key[0]:
+            self._segment_preview = None
         if result is None or self._stop_event.is_set():
             self._last_prediction = {**stats, "reason": "no segment decision"}
             return
@@ -702,7 +726,7 @@ class _PoseNode(Node):
                                  result["keypoints"], result["image"], time.time(),
                                  primary_box=result["primary_box"])
         evidence = {**result["evidence"], **stats,
-                    "inference_ms": round((time.perf_counter()-started)*1000, 2),
+                    "inference_ms": inference_ms,
                     "dropped_segments": self._segment_buffer.dropped_segments}
         self._last_prediction = evidence
         self._segment_count += 1
