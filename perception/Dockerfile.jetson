@@ -686,7 +686,7 @@ RUN . /etc/jetpack.env; \
 # Pre-seed verified pose and skeleton-action TensorRT bundles for this JetPack
 # family so cold container starts need no network round-trip.
 RUN . /etc/jetpack.env; \
-    cd /work && python3 -c 'import sys; from utils import model_downloader as md; md.MODELS_ROOT = "/opt"; fam = "jp61" if sys.argv[1] == "61" else "jp511"; p1 = md.ensure_pose_model(f"/opt/vision-pose/{fam}", family=fam); p2 = md.ensure_action_model(f"/opt/vision-action/{fam}", family=fam); print("[build] pre-seeded pose+action for", fam, list(p1), list(p2))' "${JP_VERSION}"
+    cd /work && python3 -c 'import sys; from utils import model_downloader as md; md.MODELS_ROOT = "/opt"; fam = "jp61" if sys.argv[1] == "61" else "jp511"; p1 = md.ensure_pose_model(f"/opt/vision-pose/{fam}", family=fam); p2 = md.ensure_action_model(f"/opt/vision-action/{fam}", family=fam); p3 = md.ensure_segment_action_model(f"/opt/vision-action-segment/{fam}", family=fam) if fam in md.SEGMENT_ACTION_MODEL_BUNDLES else {}; print("[build] pre-seeded pose+action for", fam, list(p1), list(p2), list(p3))' "${JP_VERSION}"
 
 # ROS2 shared libraries（audio_msgs .so 等）
 ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"

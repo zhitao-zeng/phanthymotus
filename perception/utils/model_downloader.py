@@ -1525,6 +1525,29 @@ ACTION_MODEL_BUNDLES = {
 }
 
 
+SEGMENT_ACTION_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": os.environ.get(
+            "SEGMENT_ACTION_BUNDLE_BASE_URL",
+            "http://172.28.4.81:34567/zengzhitao/embodied-ai/action-segment-mnv2-20261117-r01/jp61"),
+        "files": {
+            "yolo26s-pose-batch4.engine": {
+                "size": 25027882,
+                "sha256": "dc41416d27fcc50efb540cf87c95c953fac58047e4e82aec5a7758baba40c161",
+            },
+            "stgcnpp-action126-v2p.engine": {
+                "size": 7347349,
+                "sha256": "980ddef9a41de46fab50b478a43c0a27b8f86cd9d0fd04e5054b5748a899bed0",
+            },
+            "tsm-mnv2-dual8f-action126.engine": {
+                "size": 11085069,
+                "sha256": "6b1616fdfce3e0d84638cd3ad2d2857344818ded21ca6e228fd7d1d3a233c1ba",
+            },
+        },
+    },
+}
+
+
 def _ensure_vision_bundle(
     kind: str, bundles: dict, model_dir: str, family: str | None = None,
     progress_cb=None,
@@ -1630,6 +1653,13 @@ def ensure_action_model(model_dir: str, family: str | None = None,
     """Ensure the skeleton-action engine matching the runtime TensorRT is present."""
     return _ensure_vision_bundle("action", ACTION_MODEL_BUNDLES, model_dir, family,
                                  progress_cb=progress_cb)
+
+
+def ensure_segment_action_model(model_dir: str, family: str | None = None,
+                                progress_cb=None) -> dict[str, str]:
+    """Ensure the pinned pose/body/RGB bundle for optional segment recognition."""
+    return _ensure_vision_bundle("action-segment", SEGMENT_ACTION_MODEL_BUNDLES,
+                                 model_dir, family, progress_cb=progress_cb)
 
 
 def ensure_hand_model(model_dir: str, family: str | None = None,

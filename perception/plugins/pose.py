@@ -1249,7 +1249,8 @@ class PosePerceptionPlugin:
             plugin_cfg.get("activity_interval_s", 0.35))
         self._activity_idle_flush_s = max(0.0, float(
             plugin_cfg.get("activity_idle_flush_s") or 0.0))
-        self._activity_mode = str(plugin_cfg.get("activity_mode", "rolling"))
+        self._activity_mode = str(os.environ.get("POSE_ACTIVITY_MODE") or
+                                  plugin_cfg.get("activity_mode", "rolling"))
         self._window_maturity_s = float(
             plugin_cfg.get("window_maturity_s", 0.0))
         self._min_window_frames = int(
@@ -1589,7 +1590,8 @@ class PosePerceptionPlugin:
         dropping back to PyTorch silently would cost ~8x per frame and look like
         nothing was wrong (measured for vop on an Orin NX).
         """
-        configured = (self._model_name or "").strip()
+        configured = (os.environ.get("POSE_ENGINE_PATH") or
+                      self._model_name or "").strip()
         if configured.endswith(".engine") and os.path.isfile(configured):
             return configured
 

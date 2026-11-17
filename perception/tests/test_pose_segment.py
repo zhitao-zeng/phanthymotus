@@ -207,3 +207,15 @@ def test_model_bundle_spec_survives_creation_of_an_instance_backend(tmp_path, mo
     instance = plugin._segment_backend_for(plugin._merged_config('new-instance'))
     assert instance.rgb_n_per_view == 12
     assert instance.ntu_rgb_weight == .5
+
+
+def test_deployment_environment_keeps_core_instance_overrides(tmp_path, monkeypatch):
+    engine = tmp_path/'pose.engine'
+    engine.write_bytes(b'path-resolution-only')
+    monkeypatch.setenv('POSE_ACTIVITY_MODE', 'segment')
+    monkeypatch.setenv('POSE_ENGINE_PATH', str(engine))
+    plugin, _ = _plugin()
+    assert plugin._merged_config('fresh')['activity_mode'] == 'segment'
+    plugin._instance_configs['core'] = {'fps': 30, 'activity_mode': 'rolling'}
+    assert plugin._merged_config('core')['activity_mode'] == 'rolling'
+    assert plugin._resolve_engine() == str(engine)
