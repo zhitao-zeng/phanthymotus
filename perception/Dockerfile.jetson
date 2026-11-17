@@ -585,6 +585,7 @@ WORKDIR /work
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
+COPY perception/tools/seed_pose_action_models.py /work/tools/seed_pose_action_models.py
 COPY perception/config.yaml /work/config.yaml
 COPY perception/deploy/    /deploy/
 
