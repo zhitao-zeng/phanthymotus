@@ -681,6 +681,39 @@ def test_resampling_an_empty_clip_raises():
         resample_clip(np.zeros((0, N_KEYPOINTS, 3), dtype=np.float32), 100)
 
 
+def test_timestamp_resampling_preserves_physical_velocity_across_stall_gaps():
+    """Opt #1: An irregular GPU stall gap must not stretch or compress speed."""
+    # Motion x(t) = 100 * t sampled at t = [0.0, 0.1, 0.2, 0.8, 0.9, 1.0].
+    times = np.array([0.0, 0.1, 0.2, 0.8, 0.9, 1.0], dtype=np.float64)
+    clip = (times.astype(np.float32) * 100.0)[:, None, None] * np.ones((1, N_KEYPOINTS, 3), dtype=np.float32)
+    out = resample_clip(clip, 11, timestamps=times)
+    expected = (np.linspace(0.0, 100.0, 11, dtype=np.float32))[:, None, None] * np.ones((1, N_KEYPOINTS, 3), dtype=np.float32)
+    assert np.allclose(out, expected, atol=1e-4)
+
+    # _build_input uses frame timestamps `f.t` when timestamps are irregular.
+    engine = _FakeEngine126({0: 9.0})
+    backend = SkeletonActionBackend(engine=engine, modality="j", prenorm_mode="fix", min_motion=0.0)
+    frames = []
+    for t in times:
+        joints = {k: (v[0] + 100.0 * float(t), v[1]) for k, v in _body().items()}
+        frames.append(PoseFrame(float(t), _standing_box(), _kp(**joints), 0.3, image_size=FRAME))
+    backend.classify(frames)
+    assert len(engine.calls) == 1
+    sampled_nose_x = engine.calls[0][0, 0, :, 0, 0]
+    diffs = np.diff(sampled_nose_x)
+    assert np.allclose(diffs, diffs[0], atol=1e-4)
+
+
+def test_timestamp_resampling_downsamples_by_time_and_rejects_bad_shape():
+    times = np.array([0.0, 0.05, 0.10, 0.80, 0.90, 1.0], dtype=np.float64)
+    clip = (times.astype(np.float32) * 10.0)[:, None, None] * np.ones((1, N_KEYPOINTS, 3), dtype=np.float32)
+    out = resample_clip(clip, 3, timestamps=times)
+    # Closest physical times to [0.0, 0.5, 1.0] are indices 0 (0.0), 3 (0.8, |0.3|<|0.4|), 5 (1.0).
+    assert [round(float(v), 1) for v in out[:, 0, 0]] == [0.0, 8.0, 10.0]
+    with pytest.raises(ActionBackendError, match="timestamps must have length"):
+        resample_clip(clip, 3, timestamps=times[:4])
+
+
 # ── a frozen clip must not reach the model ──────────────────────────────────
 
 def test_a_motionless_clip_is_not_sent_to_the_model():

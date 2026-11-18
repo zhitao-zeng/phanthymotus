@@ -591,21 +591,33 @@ class _PoseNode(Node):
             except queue.Full:
                 pass
 
+    def _next_worker_timeout(self) -> float:
+        timeout = 0.1 if self._activity_idle_flush_s > 0.0 else 1.0
+        if self._segment_buffer is not None:
+            preview_done = (
+                self._segment_preview is not None
+                and self._segment_preview[0][0] == self._last_image_received_at
+            )
+            wait_s = self._segment_buffer.next_wait_s(
+                time.monotonic(),
+                None if preview_done else self._activity_idle_flush_s,
+            )
+            if wait_s is not None:
+                return max(.001, min(timeout, wait_s))
+        elif (self._activity_idle_flush_s > 0.0 and self._idle_persons
+              and self._last_image_received_at > self._idle_finalized_at):
+            remaining = (self._last_image_received_at + self._activity_idle_flush_s
+                         - time.monotonic())
+            return max(.001, min(timeout, remaining))
+        return timeout
+
     def _inference_worker(self):
         import cv2
         from plugins.vision_runtime import decode_poses
 
         while not self._stop_event.is_set():
             try:
-                timeout = 0.1 if self._activity_idle_flush_s > 0.0 else 1.0
-                if (self._segment_preview is not None
-                        and self._segment_preview[0][0] == self._last_image_received_at):
-                    # Wake at the confirmation boundary even if the preview
-                    # finished very close to it.
-                    remaining = (self._last_image_received_at + self._segment_buffer.quiet_s
-                                 - time.monotonic())
-                    timeout = max(.001, min(timeout, remaining))
-                item = self._frame_queue.get(timeout=timeout)
+                item = self._frame_queue.get(timeout=self._next_worker_timeout())
             except queue.Empty:
                 try:
                     self._flush_idle_activity()
@@ -704,10 +716,19 @@ class _PoseNode(Node):
         key = (records[-1][0], len(received))
         if self._segment_preview is not None and self._segment_preview[0] == key:
             _, result, inference_ms = self._segment_preview
+            if confirmed and result is not None and '_handface_pending' in result:
+                started = time.perf_counter()
+                result = self._segment_backend.complete_handface(result, self._stop_event)
+                inference_ms += round((time.perf_counter()-started)*1000, 2)
         else:
             started = time.perf_counter()
             try:
-                result = self._segment_backend.recognize(received, self._stop_event)
+                kwargs = {}
+                if getattr(self._segment_backend, "supports_raw_received", False):
+                    kwargs["raw_received"] = records
+                if not confirmed and getattr(self._segment_backend, "handface", None) is not None:
+                    kwargs["defer_handface"] = True
+                result = self._segment_backend.recognize(received, self._stop_event, **kwargs)
             except Exception as error:
                 self._segment_backend.last_error = str(error)
                 self._last_prediction = {**stats, "segment_error": str(error)}
@@ -1547,7 +1568,8 @@ class PosePerceptionPlugin:
             self._model, self._segment_model.body._engine,
             self._segment_model.rgb_engine,
             min_score=merged["action_min_score"], confidence=merged["confidence"],
-            ntu_rgb_weight=self._segment_model.ntu_rgb_weight)
+            ntu_rgb_weight=self._segment_model.ntu_rgb_weight,
+            handface=self._segment_model.handface)
 
     # ── engine ───────────────────────────────────────────────────────────
 

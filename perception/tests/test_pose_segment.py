@@ -279,7 +279,11 @@ def test_pose_finishing_after_a_gap_stays_with_its_received_segment():
 
 
 @pytest.mark.parametrize('rgb_frames', [8, 24])
-def test_final_classification_reuses_poses_and_never_calls_the_pose_engine(rgb_frames, monkeypatch):
+@pytest.mark.parametrize('handface_state', ['disabled', 'skipped', 'applied', 'fallback'])
+@pytest.mark.parametrize('defer_handface', [False, True])
+@pytest.mark.parametrize('handface_frames', [4, 8])
+def test_final_classification_reuses_poses_and_never_calls_the_pose_engine(
+        rgb_frames, handface_state, defer_handface, handface_frames, monkeypatch):
     import cv2
 
     class PoseMustNotRun:
@@ -299,11 +303,38 @@ def test_final_classification_reuses_poses_and_never_calls_the_pose_engine(rgb_f
             p[0, 2], p[0, 37] = .9, .1
             return [p]
 
+    class HandFace:
+        FRAME_COUNT = 8
+        wholebody_frame_count = handface_frames
+
+        def should_run(self, probabilities, fps):
+            assert probabilities.argmax() == 2
+            assert fps == pytest.approx(10)
+            return handface_state != 'skipped'
+
+        def predict(self, poses, images, reconstruction):
+            assert len(poses) == 5 and len(images) == handface_frames
+            if handface_frames == 4:
+                assert reconstruction.shape == (8,)
+                assert reconstruction.max() < 4
+            else:
+                assert reconstruction is None
+            if handface_state == 'fallback':
+                raise RuntimeError('HandFace engine stopped')
+            return np.ones(126, dtype=np.float32) / 126, .5
+
+        def fuse(self, body, rgb, handface, quality, fps):
+            assert fps == pytest.approx(10)
+            p = np.zeros(126, dtype=np.float32)
+            p[8] = 1.
+            return p
+
     row = np.array(_standing_row(), np.float32)
     decoded = (row[None, :4], row[None, 4], row[6:].reshape(1, 17, 3), (480, 640))
     received = [(i*.1, frame_bytes(640, 480), decoded) for i in range(5)]
     backend = SegmentActionBackend(PoseMustNotRun(), Head((1, 2, 100, 17, 6)),
-                                   Head((1, rgb_frames, 3, 192, 192)))
+                                   Head((1, rgb_frames, 3, 192, 192)),
+                                   handface=None if handface_state == 'disabled' else HandFace())
     original_decode = cv2.imdecode
     calls = []
 
@@ -312,19 +343,48 @@ def test_final_classification_reuses_poses_and_never_calls_the_pose_engine(rgb_f
         return original_decode(data, flags)
 
     monkeypatch.setattr(cv2, 'imdecode', count_decode)
-    result = backend.recognize(received)
+    result = backend.recognize(received, defer_handface=defer_handface)
     # The last primary frame is already one of the RGB classifier's inputs.
-    assert len(calls) == len(set(rgb_frame_indices(5, rgb_frames//2)))
+    expected_decodes = set(rgb_frame_indices(5, rgb_frames//2))
+    if defer_handface and handface_state in ('applied', 'fallback'):
+        assert result['activity']['action_id'] == 3
+        assert result['evidence']['handface_state'] == 'pending'
+        assert len(calls) == len(expected_decodes)
+        result = backend.complete_handface(result)
+    if handface_state in ('applied', 'fallback') and handface_frames == 8:
+        expected_decodes.update(np.linspace(0, 4, 8).round().astype(int))
+    assert len(calls) == len(expected_decodes)
+    assert '_handface_pending' not in result
     assert np.array_equal(result['image'], original_decode(
         np.frombuffer(received[-1][1], np.uint8), cv2.IMREAD_COLOR))
-    assert result['activity']['action_id'] == 3
-    assert result['activity']['score'] == .9
+    assert result['activity']['action_id'] == (9 if handface_state == 'applied' else 3)
+    assert result['activity']['score'] == (1. if handface_state == 'applied' else .9)
+    if handface_state != 'disabled':
+        assert result['evidence']['handface_state'] == handface_state
+    else:
+        assert 'handface_state' not in result['evidence']
     assert result['evidence']['poses_computed_during_reception'] is True
     assert result['evidence']['RGB_frames_per_view'] == rgb_frames//2
     assert backend.recognize(received[:3]) is None
 
 
-def test_model_bundle_spec_survives_creation_of_an_instance_backend(tmp_path, monkeypatch):
+def test_handface_uses_sparse_observations_with_a_relevant_candidate():
+    from plugins.pose_handface import HandFaceActionBackend
+
+    clusters = np.zeros(126, dtype=np.int64)
+    clusters[8] = 1
+    backend = HandFaceActionBackend(None, None, clusters, np.ones(17))
+    probabilities = np.zeros(126, dtype=np.float32)
+    probabilities[2], probabilities[8] = .66, .34
+    assert backend.should_run(probabilities, 8)
+    assert backend.should_run(probabilities, 10)
+    assert not backend.should_run(probabilities, 15)
+    probabilities[3], probabilities[8] = .34, 0.
+    assert not backend.should_run(probabilities, 8)
+
+
+@pytest.mark.parametrize('with_handface', [False, True])
+def test_model_bundle_spec_survives_creation_of_an_instance_backend(tmp_path, monkeypatch, with_handface):
     from utils import tensorrt_runtime
 
     loaded = []
@@ -332,23 +392,201 @@ def test_model_bundle_spec_survives_creation_of_an_instance_backend(tmp_path, mo
     class Engine:
         def __init__(self, path, **kwargs):
             loaded.append(path.name)
-            self.input_shape = ((1, 2, 100, 17, 6) if path.name == 'body-new.engine'
-                                else (1, 24, 3, 192, 192))
+            self.input_shape = {
+                'body-new.engine': (1, 2, 100, 17, 6),
+                'teacher-new.engine': (1, 24, 3, 192, 192),
+                'wholebody.engine': (8, 3, 256, 192),
+                'handface.engine': (1, 8, 894),
+            }[path.name]
 
         def close(self):
             pass
 
     monkeypatch.setattr(tensorrt_runtime, 'TensorRTEngine', Engine)
-    (tmp_path/'models.json').write_text(json.dumps({'body_engine': 'body-new.engine',
-        'rgb_engine': 'teacher-new.engine', 'rgb_ntu_weight': .5}))
+    bundle = {'body_engine': 'body-new.engine', 'rgb_engine': 'teacher-new.engine', 'rgb_ntu_weight': .5}
+    expected_models = ['body-new.engine', 'teacher-new.engine']
+    if with_handface:
+        bundle['handface'] = {
+            'wholebody_engine': 'wholebody.engine', 'action_engine': 'handface.engine', 'gate': 'gate.json',
+        }
+        (tmp_path/'gate.json').write_text(json.dumps({'cluster_ids': [3] * 126, 'theta_3way_8f': [1.] * 17}))
+        expected_models.extend(['wholebody.engine', 'handface.engine'])
+    (tmp_path/'models.json').write_text(json.dumps(bundle))
     backend = SegmentActionBackend.from_directory(object(), tmp_path)
-    assert loaded == ['body-new.engine', 'teacher-new.engine']
+    assert loaded == expected_models
     plugin, _ = _plugin({'activity_mode': 'segment'})
     plugin._segment_model = backend
     monkeypatch.setenv('ACTION_SEGMENT_MODEL_DIR', str(tmp_path))
     instance = plugin._segment_backend_for(plugin._merged_config('new-instance'))
     assert instance.rgb_n_per_view == 12
     assert instance.ntu_rgb_weight == .5
+    assert (instance.handface is not None) == with_handface
+    assert instance.handface is backend.handface
+
+
+def test_raw_buffer_unlocks_full_fps_rgb_and_handface_while_gating_on_posed_fps():
+    """Opt #2 + Opt #3: un-posed buffered JPEGs feed RGB and HandFace cleanly."""
+    import cv2
+    from plugins.pose_segment import interpolate_keypoints_at_times, time_uniform_pick_indices
+
+    def make_colored_jpeg(marker: int):
+        img = np.full((120, 160, 3), marker, dtype=np.uint8)
+        ok, enc = cv2.imencode('.jpg', img)
+        assert ok
+        return bytes(enc)
+
+    # 21 raw frames at 20 Hz (markers 10..210), but YOLO only posed 6 (~5 Hz)
+    # leaving a mid-clip stall between t=0.2 and t=0.8.
+    raw_received = []
+    posed_indices = {0, 2, 4, 16, 18, 20}
+    row = np.array(_standing_row(), np.float32)
+    for i in range(21):
+        t = i * 0.05
+        jpg = make_colored_jpeg(10 + i * 10)
+        pose_tuple = None
+        if i in posed_indices:
+            kps = row[6:].reshape(1, 17, 3).copy()
+            kps[0, 9, :2] = [80.0 + 40.0 * t, 60.0]  # wrist moves linearly with t
+            kps[0, 9, 2] = 0.9
+            pose_tuple = (row[None, :4].copy(), row[None, 4].copy(), kps, (120, 160))
+        raw_received.append([t, jpg, pose_tuple])
+    received = [r for r in raw_received if r[2] is not None]
+
+    # Verify timestamp pick & linear keypoint interpolation directly.
+    picked = time_uniform_pick_indices([r[0] for r in raw_received], 4)
+    assert picked.tolist() == [0, 7, 13, 20]
+    interp = interpolate_keypoints_at_times(
+        np.stack([r[2][2][0] for r in received]),
+        np.array([r[0] for r in received]),
+        np.array([0.0, 0.5, 1.0]),
+    )
+    assert interp[1, 9, 0] == pytest.approx(100.0, abs=1e-4)
+
+    class Head:
+        def __init__(self, shape):
+            self.input_shape = shape
+            self.seen_blobs = []
+
+        def infer(self, blob):
+            self.seen_blobs.append(blob.copy())
+            p = np.zeros((1, 126), np.float32)
+            p[0, 2], p[0, 37] = .9, .1
+            return [p]
+
+    seen_hf_markers = []
+
+    class HandFace:
+        FRAME_COUNT = 8
+        wholebody_frame_count = 8
+
+        def should_run(self, probabilities, fps):
+            # Posed FPS = (6 - 1) / 1.0 = 5 Hz (<= 10 Hz), NOT 20 Hz raw!
+            assert fps == pytest.approx(5.0)
+            return True
+
+        def predict(self, poses, images, reconstruction):
+            assert len(images) == 8 and reconstruction is None
+            # Each image is solid marker color (before JPEG loss ~+-2); assert distinct un-posed mid frames included!
+            markers = [int(round(float(img[:, :, 0].mean()))) for img in images]
+            seen_hf_markers.extend(markers)
+            return np.ones(126, dtype=np.float32) / 126, .8
+
+        def fuse(self, body, rgb, handface, quality, fps):
+            assert fps == pytest.approx(5.0)
+            p = np.zeros(126, dtype=np.float32)
+            p[8] = 1.
+            return p
+
+    rgb_head = Head((1, 8, 3, 192, 192))
+    backend = SegmentActionBackend(object(), Head((1, 2, 100, 17, 6)), rgb_head, handface=HandFace())
+    result = backend.recognize(received, raw_received=raw_received)
+    assert result['evidence']['rgb_source'] == 'raw-buffer'
+    assert result['evidence']['raw_frames_available'] == 21
+    assert result['evidence']['handface_state'] == 'applied'
+    assert result['evidence']['handface_input_fps'] == pytest.approx(5.0)
+    # 8 HandFace frames span 0..20 uniformly -> middle frames (e.g., idx 6~11 => marker ~70..120) must NOT all come from posed edges!
+    assert any(55 <= m <= 165 for m in seen_hf_markers)
+
+
+def test_worker_next_timeout_wakes_at_exact_preview_and_confirm_deadlines(monkeypatch):
+    """Opt #4b + #4a: exact wakeup deadlines avoid 0.1s polling tail lag."""
+    from pathlib import Path
+
+    now = 10.0
+    monkeypatch.setattr(pose, 'time', SimpleNamespace(
+        monotonic=lambda: now, perf_counter=time.perf_counter, time=time.time))
+    node = pose._PoseNode('/cam/exact', None, .35, 30., 'quiet',
+                          classifier=_FinalClassifier(), segment_backend=_SegmentModel())
+    node._activity_idle_flush_s = 0.15
+    assert node._next_worker_timeout() == pytest.approx(0.1)
+
+    node._last_image_received_at = 10.0
+    node._segment_buffer.append(b'x', 10.0)
+    # 0.12s elapsed -> only 0.03s left before 0.15s preview deadline
+    now = 10.12
+    assert node._next_worker_timeout() == pytest.approx(0.03)
+    # Preview computed for last_t=10.0 -> wait exact remaining to quiet_s=0.40s
+    node._segment_preview = ((10.0, 1), None, 10.0)
+    now = 10.34
+    assert node._next_worker_timeout() == pytest.approx(0.06)
+
+    dockerfile = Path(__file__).resolve().parents[1] / 'Dockerfile.jetson'
+    assert 'FASTDDS_BUILTIN_TRANSPORTS=UDPv4' in dockerfile.read_text()
+
+
+def test_pose_node_flush_passes_raw_received_and_defers_handface_past_preview(monkeypatch):
+    """End-to-end _PoseNode check: preview defers HandFace, confirm runs it cleanly."""
+    now = 10.0
+    monkeypatch.setattr(pose, 'time', SimpleNamespace(
+        monotonic=lambda: now, perf_counter=time.perf_counter, time=time.time))
+
+    events = []
+
+    class NodeBackend:
+        supports_raw_received = True
+        handface = object()
+        last_error = None
+
+        def recognize(self, received, stop_event, *, defer_handface=False, raw_received=None):
+            events.append(('recognize', len(received), len(raw_received), defer_handface))
+            row = np.array(_standing_row(), np.float32)
+            result = {
+                'image': np.zeros((480, 640, 3), np.uint8),
+                'boxes': row[None, :4], 'scores': row[None, 4],
+                'keypoints': row[6:].reshape(1, 17, 3), 'primary_box': row[:4],
+                'activity': {'name': 'drink water', 'name_zh': '喝水', 'score': .81, 'action_id': 1},
+                'evidence': {'frames_used': len(received), 'handface_state': 'pending'},
+                '_handface_pending': ('token',),
+            }
+            return result if defer_handface else self.complete_handface(result, stop_event)
+
+        def complete_handface(self, result, stop_event=None):
+            events.append(('complete', result.pop('_handface_pending', None)))
+            result['activity'] = {'name': 'brush teeth', 'name_zh': '刷牙', 'score': .92, 'action_id': 3}
+            result['evidence']['handface_state'] = 'applied'
+            return result
+
+    node = pose._PoseNode('/cam/node_hf', None, .35, 30., 'quiet',
+                          classifier=_FinalClassifier(), segment_backend=NodeBackend())
+    messages = _publisher(node, node._output_topic).messages
+    row = np.array(_standing_row(), np.float32)
+    for i in range(6):
+        ts = 10.0 + i * 0.03
+        node._segment_buffer.append(bytes([i]), ts)
+        if i % 2 == 0:
+            node._segment_buffer.record_pose(
+                ts, row[None, :4], row[None, 4], row[6:].reshape(1, 17, 3), (480, 640, 3))
+    # Preview at 0.25s (< 0.40s quiet_s): defers HandFace, no publish yet.
+    now = 10.40
+    node._flush_received_segment()
+    assert events == [('recognize', 3, 6, True)]
+    assert messages == []
+    # Confirm at 0.60s (> 0.40s quiet_s): completes HandFace without re-running recognize.
+    now = 10.75
+    node._flush_received_segment()
+    assert events == [('recognize', 3, 6, True), ('complete', ('token',))]
+    assert len(messages) == 1
+    assert json.loads(messages[0])['persons'][0]['activity'] == 'brush teeth'
 
 
 def test_deployment_environment_keeps_core_instance_overrides(tmp_path, monkeypatch):

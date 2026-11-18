@@ -293,11 +293,21 @@ def uniform_sample_indices(available: int, wanted: int) -> np.ndarray:
     return np.clip(centres.astype(np.int64), 0, available - 1)
 
 
-def resample_clip(clip: np.ndarray, wanted: int) -> np.ndarray:
+def resample_clip(
+    clip: np.ndarray,
+    wanted: int,
+    timestamps: Optional[np.ndarray] = None,
+) -> np.ndarray:
     """Fit a (T0, V, C) clip to exactly `wanted` frames.
 
     **Downsampling repeats upstream's index selection; upsampling interpolates,
     and that difference is measured, not stylistic.**
+
+    When monotonically non-decreasing physical `timestamps` with a positive
+    time span are provided, resampling is performed uniformly in physical time
+    rather than in observation index space. That keeps joint velocities true
+    to wall-clock motion when inference stalls or frame gaps make the incoming
+    skeleton stream irregularly spaced.
 
     NTU clips run 2-5 s at 30 fps, so upstream is almost always *reducing* a
     clip to 100 frames and index selection is what the weights were fitted on.
@@ -326,6 +336,27 @@ def resample_clip(clip: np.ndarray, wanted: int) -> np.ndarray:
         raise ActionBackendError("cannot resample an empty keypoint sequence")
     if available == wanted:
         return clip.astype(np.float32, copy=True)
+
+    if timestamps is not None and available > 1:
+        times = np.asarray(timestamps, dtype=np.float64)
+        if times.shape != (available,):
+            raise ActionBackendError(
+                f"timestamps must have length {available}; got shape {times.shape}"
+            )
+        span = float(times[-1] - times[0])
+        if span > 1e-6 and bool(np.all(np.diff(times) >= -1e-9)):
+            grid = np.linspace(float(times[0]), float(times[-1]), wanted, dtype=np.float64)
+            if available > wanted:
+                idx = np.clip(np.searchsorted(times, grid, side="left"), 0, available - 1)
+                prev = np.maximum(idx - 1, 0)
+                choose_prev = np.abs(times[prev] - grid) < np.abs(times[idx] - grid)
+                return clip[np.where(choose_prev, prev, idx)].astype(np.float32)
+            upper = np.clip(np.searchsorted(times, grid, side="right"), 1, available - 1)
+            lower = upper - 1
+            denom = np.maximum(times[upper] - times[lower], 1e-6)
+            weight = np.clip((grid - times[lower]) / denom, 0.0, 1.0).astype(np.float32)[:, None, None]
+            return (clip[lower] * (1.0 - weight) + clip[upper] * weight).astype(np.float32)
+
     if available > wanted:
         return clip[uniform_sample_indices(available, wanted)].astype(np.float32)
 
@@ -578,7 +609,8 @@ class SkeletonActionBackend:
         raw = np.stack([a[:, :NUM_CHANNELS] for a in arrays])   # (T0, V, 3)
         normalised = pre_normalize_2d(raw, image_size, self.prenorm_mode)
         featured = build_ske_modality(normalised, self._effective_modality())
-        sampled = resample_clip(featured, window_frames)        # (T, V, C)
+        timestamps = np.array([float(f.t) for f in frames], dtype=np.float64)
+        sampled = resample_clip(featured, window_frames, timestamps=timestamps)        # (T, V, C)
 
         # (M, T, V, C) with the unused person slot zeroed, then the clip axis.
         people = np.zeros((NUM_PERSON_SLOTS,) + sampled.shape, dtype=np.float32)
