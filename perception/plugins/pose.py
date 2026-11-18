@@ -37,7 +37,6 @@ of perception on jp5.11 (see plugins/kokoro_worker.py).
 
 from __future__ import annotations
 
-import ctypes
 import gc
 import json
 import logging
@@ -1208,15 +1207,6 @@ _THRESHOLD_KEYS = ("kpt_confidence", "fall_drop_ratio", "fall_drop_window_s",
                    "fall_settle_s")
 
 
-def _trim_process_heap() -> None:
-    """Ask Python and glibc to release retired heap arenas back to the OS."""
-    gc.collect()
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass
-
-
 class PosePerceptionPlugin:
     PREFIX = "pose"
 
@@ -1954,7 +1944,9 @@ class PosePerceptionPlugin:
         # ROS node name leak and the next start trips "Publisher already
         # registered".
         dispose_node(self._executor, node, label=f"pose/{node_key}")
-        _trim_process_heap()
+        # Drop the last local reference before collecting retired ROS node cycles.
+        del node
+        gc.collect()
         return result
 
     def _loading_camera_info(self, args: dict, instance_id: str) -> dict:
