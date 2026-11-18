@@ -221,7 +221,7 @@ class HandFaceActionBackend:
         temperatures = np.clip(params[:3], .5, 2.2)
         streams = np.stack([temp_sharpen(p, temperature) for p, temperature in
                             zip((body, rgb, handface), temperatures)])
-        sharp = 1. - norm_entropy(streams)
+        sharpness = 1. - norm_entropy(streams)
         low_fps = float(observation_fps <= self.LOW_OBSERVATION_FPS)
         body_logit = np.full(126, params[11] * sharpness[0, 0], dtype=np.float32)
         rgb_logit = params[3:7][self.cluster_ids] + params[12] * sharpness[1, 0] + params[14] * low_fps

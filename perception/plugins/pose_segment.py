@@ -299,6 +299,25 @@ class SegmentActionBackend:
         self.handface = handface
         self.last_error = None
 
+    def warmup(self):
+        """Run one dummy pass per segment TensorRT engine so case 1 sees warm latency."""
+        engines = [self.body._engine, self.rgb_engine]
+        if self.handface is not None:
+            engines.extend([self.handface.wholebody_engine, self.handface.handface_engine])
+        for engine in engines:
+            infer = getattr(engine, 'infer', None)
+            shape = getattr(engine, 'optimization_shape', None) or getattr(engine, 'input_shape', None)
+            if not callable(infer) or not shape:
+                continue
+            try:
+                dims = tuple(int(d) for d in shape)
+                if any(d <= 0 for d in dims):
+                    continue
+                dtype = getattr(engine, 'input_dtype', None) or np.float32
+                infer(np.zeros(dims, dtype=dtype))
+            except Exception as error:
+                log.warning('Segment engine warmup skipped: %s', error)
+
     @classmethod
     def from_directory(cls, pose_model, directory, **kwargs):
         from utils.tensorrt_runtime import TensorRTEngine

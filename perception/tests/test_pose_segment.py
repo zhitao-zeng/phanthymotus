@@ -589,6 +589,71 @@ def test_pose_node_flush_passes_raw_received_and_defers_handface_past_preview(mo
     assert json.loads(messages[0])['persons'][0]['activity'] == 'brush teeth'
 
 
+def test_real_handface_predict_fuse_and_segment_warmup():
+    """Exercise real HandFaceActionBackend.predict/fuse & warmup against mock TRT."""
+    from plugins.pose_handface import HandFaceActionBackend
+
+    class WholeBodyMock:
+        optimization_shape = (8, 3, 256, 192)
+        input_dtype = np.float32
+        calls = 0
+
+        def infer(self, blob):
+            assert blob.shape == (8, 3, 256, 192)
+            self.calls += 1
+            x_scores = np.zeros((8, 133, 384), dtype=np.float32)
+            y_scores = np.zeros((8, 133, 512), dtype=np.float32)
+            x_scores[:, :, 200] = 0.9
+            y_scores[:, :, 250] = 0.85
+            return [x_scores, y_scores]
+
+    class ActionMock:
+        input_shape = (1, 8, 894)
+        input_dtype = np.float32
+        calls = 0
+
+        def infer(self, blob):
+            assert blob.shape == (1, 8, 894)
+            self.calls += 1
+            logits = np.zeros((1, 126), dtype=np.float32)
+            logits[0, 8] = 8.0
+            return [logits]
+
+    class SimpleHead:
+        def __init__(self, shape):
+            self.input_shape = shape
+            self.calls = 0
+
+        def infer(self, blob):
+            self.calls += 1
+            return [np.zeros((1, 126), dtype=np.float32)]
+
+    clusters = [0] * 126
+    clusters[8] = 1
+    params = [1.0, 1.0, 1.0, 0.5, -1.0, -0.5, -1.5, -0.5, 1.2, -0.8, -1.2, 1.0, 0.8, 1.2, 0.2, 0.5, 0.3]
+    wb, act = WholeBodyMock(), ActionMock()
+    hf = HandFaceActionBackend(wb, act, clusters, params)
+    row = np.array(_standing_row(), np.float32)
+    poses = [row[6:].reshape(17, 3) for _ in range(4)]
+    frames = [np.zeros((120, 160, 3), dtype=np.uint8) for _ in range(8)]
+    hf_prob, qual = hf.predict(poses, frames)
+    assert hf_prob.shape == (126,) and np.isfinite(hf_prob).all() and hf_prob.argmax() == 8
+    assert qual == pytest.approx(0.85, abs=0.02)
+
+    body = np.full(126, 1.0 / 126.0, dtype=np.float32)
+    rgb = np.full(126, 1.0 / 126.0, dtype=np.float32)
+    fused = hf.fuse(body, rgb, hf_prob, qual, observation_fps=8.0)
+    assert fused.shape == (126,) and np.isfinite(fused).all()
+    assert fused.sum() == pytest.approx(1.0, abs=1e-5)
+    assert fused.argmax() == 8
+
+    body_head = SimpleHead((1, 2, 100, 17, 6))
+    rgb_head = SimpleHead((1, 8, 3, 192, 192))
+    seg = SegmentActionBackend(object(), body_head, rgb_head, handface=hf)
+    seg.warmup()
+    assert body_head.calls == 1 and rgb_head.calls == 1 and wb.calls == 2 and act.calls == 2
+
+
 def test_deployment_environment_keeps_core_instance_overrides(tmp_path, monkeypatch):
     engine = tmp_path/'pose.engine'
     engine.write_bytes(b'path-resolution-only')

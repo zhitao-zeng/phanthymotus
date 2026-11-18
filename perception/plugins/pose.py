@@ -1562,8 +1562,9 @@ class PosePerceptionPlugin:
             directory = seed if os.path.isdir(seed) else "/models/action-segment"
         with self._segment_model_lock:
             if self._segment_model is None:
-                self._segment_model = SegmentActionBackend.from_directory(
-                    self._model, directory)
+                model = SegmentActionBackend.from_directory(self._model, directory)
+                model.warmup()
+                self._segment_model = model
         return SegmentActionBackend(
             self._model, self._segment_model.body._engine,
             self._segment_model.rgb_engine,
