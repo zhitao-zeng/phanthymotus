@@ -1529,7 +1529,7 @@ SEGMENT_ACTION_MODEL_BUNDLES = {
     "jp61": {
         "base_url": os.environ.get(
             "SEGMENT_ACTION_BUNDLE_BASE_URL",
-            "http://172.28.4.81:34567/zengzhitao/embodied-ai/action-opt1234-20261118-r01/jp61"),
+            "http://172.28.4.81:34567/zengzhitao/embodied-ai/action-opt123-crope-20261118-r01/jp61"),
         "files": {
             "yolo26s-pose-batch4.engine": {
                 "size": 25027882,
@@ -1539,25 +1539,13 @@ SEGMENT_ACTION_MODEL_BUNDLES = {
                 "size": 7288461,
                 "sha256": "3cd3327d9a20e21937fbccbcc3d557c1e3d9cf903f1ac3b0cc0a7dd9b22ed516",
             },
-            "tsm-mnv2-dual8f-action126.engine": {
-                "size": 11136957,
-                "sha256": "b1f06fa495937bbdf900fe23624e1096f2a1f750890d0daea5ad05728336c1ac",
-            },
-            "dwpose-s-133-batch8.engine": {
-                "size": 37720765,
-                "sha256": "0d20a67ea11837d431fb7df58edcf8160dd280743d553d8b4f171c6f0d44d129",
-            },
-            "handface-dwp133-8f.engine": {
-                "size": 10118861,
-                "sha256": "99a248033264f745a071a97910d47edd8f3579e4ed3a7eec1ce385b4e359b492",
-            },
-            "handface-gate.json": {
-                "size": 1298,
-                "sha256": "735bf6426db5f530fd16fa3d815c21792dcf5af3e902d10668f252b1eb26480b",
+            "tsm-mnv2-dual16f-crope-action126.engine": {
+                "size": 9949677,
+                "sha256": "90cce5fa62e5bc261e9e15e682251dcee1c955cfbb87952a809bd4bfa85c77e6",
             },
             "models.json": {
-                "size": 161,
-                "sha256": "5fafd741228fe3316de424c360bba4d030c5c388582e4b01f79553faae650e42",
+                "size": 137,
+                "sha256": "3a3851a78cae4eed5c4dc737a92b26694a2de17e92eea4a214fff440cad18417",
             },
         },
     },

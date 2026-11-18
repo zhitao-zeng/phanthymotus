@@ -711,3 +711,48 @@ def test_lean_segment_frames_preserve_tracking_and_both_head_inputs(monkeypatch)
     np.testing.assert_array_equal(lean['probabilities'], reference['probabilities'])
     np.testing.assert_array_equal(lean_body[0], reference_body[0])
     np.testing.assert_array_equal(lean_rgb[0], reference_rgb[0])
+
+
+def test_build_rgb_input_selects_clip_constant_crop_e_modes():
+    from plugins.pose_segment import _clip_crop_mode, build_rgb_input
+
+    def make_person_kps(lw_xy, rw_xy):
+        kp = np.zeros((17, 3), dtype=np.float32)
+        kp[0] = [320., 90., .9]
+        kp[5] = [270., 150., .9]
+        kp[6] = [370., 150., .9]
+        kp[7] = [260., 220., .9]
+        kp[8] = [380., 220., .9]
+        kp[9] = [lw_xy[0], lw_xy[1], .9]
+        kp[10] = [rw_xy[0], rw_xy[1], .9]
+        kp[11] = [285., 290., .9]
+        kp[12] = [355., 290., .9]
+        kp[15] = [290., 430., .9]
+        kp[16] = [350., 430., .9]
+        return kp
+
+    close_kps = np.stack([make_person_kps((305., 240.), (335., 242.)) for _ in range(8)])
+    wide_kps = np.stack([make_person_kps((220., 160.), (420., 240.)) for _ in range(8)])
+    frames = [np.zeros((480, 640, 3), dtype=np.uint8) for _ in range(8)]
+    for img in frames:
+        img[130:170, 260:380] = (200, 40, 40)  # shoulder/chest marker
+
+    assert _clip_crop_mode(close_kps, 640, 480, side=442.) == 'B'
+    assert _clip_crop_mode(wide_kps, 640, 480, side=442.) == 'C'
+
+    blob_b = build_rgb_input(frames, close_kps, frame_keypoints=close_kps)
+    blob_c = build_rgb_input(frames, wide_kps, frame_keypoints=wide_kps)
+    assert blob_b.shape == (1, 16, 3, 192, 192)
+    assert blob_c.shape == (1, 16, 3, 192, 192)
+    assert np.isfinite(blob_b).all() and np.isfinite(blob_c).all()
+    assert not np.allclose(blob_b[:, 8:], blob_c[:, 8:])
+
+
+def test_segment_bundle_declaration_stays_strictly_three_engines():
+    from utils import model_downloader as md
+
+    files = md.SEGMENT_ACTION_MODEL_BUNDLES['jp61']['files']
+    engines = [name for name in files if name.endswith('.engine')]
+    assert len(engines) == 3
+    assert 'models.json' in files
+    assert not any('handface' in name or 'dwpose' in name for name in files)

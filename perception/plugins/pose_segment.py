@@ -213,6 +213,62 @@ def _decode_rgb_jpeg(data, error_message='segment contains an undecodable JPEG')
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
+def _extended_wrists(kp, width, height, extension=.35):
+    points = []
+    for wi, ei in [(9, 7), (10, 8)]:
+        if kp[wi, 2] > .20:
+            x, y = float(kp[wi, 0]), float(kp[wi, 1])
+            if kp[ei, 2] > .20:
+                x += extension*(x-float(kp[ei, 0]))
+                y += extension*(y-float(kp[ei, 1]))
+            points.append((wi, float(np.clip(x, 0, width-1)), float(np.clip(y, 0, height-1))))
+    return points
+
+
+def _clip_crop_mode(p0, width, height, side, dist_thresh=.12):
+    """Choose a clip-constant hand crop mode: tight dual-wrist B vs upper-body C."""
+    dists = []
+    two_frames = 0
+    for kp in p0:
+        pts = _extended_wrists(kp, width, height, extension=.35)
+        if len(pts) == 2:
+            two_frames += 1
+            dists.append(float(np.hypot(pts[0][1]-pts[1][1], pts[0][2]-pts[1][2]))/max(side, 1.))
+    if two_frames >= max(1, int(.6*len(p0))) and dists and float(np.median(dists)) <= dist_thresh:
+        return 'B'
+    return 'C'
+
+
+def _hand_crop_for_frame(mode, kp, cx, cy, side, width, height):
+    pts = _extended_wrists(kp, width, height, extension=.35)
+    if mode == 'B':
+        if len(pts) == 2:
+            (_, x1, y1), (_, x2, y2) = pts
+            dx, dy = abs(x1-x2), abs(y1-y2)
+            hx, hy = .5*(x1+x2), .5*(y1+y2)
+            hs = min(max(max(dx, dy)+.28*side, .32*side, 96.), 1.15*side)
+            return hx, hy, hs
+        if len(pts) == 1:
+            return pts[0][1], pts[0][2], max(.32*side, 96.)
+        return cx, cy-.12*side, max(.42*side, 96.)
+
+    anchors = [(x, y) for _, x, y in pts]
+    sh_pts = [(float(kp[i, 0]), float(kp[i, 1])) for i in (5, 6) if kp[i, 2] > .20]
+    if len(sh_pts) == 2:
+        sx, sy = .5*(sh_pts[0][0]+sh_pts[1][0]), .5*(sh_pts[0][1]+sh_pts[1][1])
+        anchors.append((sx, sy+.16*side))
+    elif sh_pts:
+        anchors.append((sh_pts[0][0], sh_pts[0][1]+.16*side))
+    if anchors:
+        ax = [p[0] for p in anchors]
+        ay = [p[1] for p in anchors]
+        hx, hy = .5*(min(ax)+max(ax)), .5*(min(ay)+max(ay))
+        span = max(max(ax)-min(ax), max(ay)-min(ay))
+        hs = min(max(span+.24*side, .52*side, 128.), 1.15*side)
+        return hx, hy, hs
+    return cx, cy-.08*side, max(.55*side, 128.)
+
+
 def build_rgb_input(rgb_frames, keypoints, frame_keypoints=None):
     """RGB source images plus whole-segment (or aligned per-frame) COCO-17 poses."""
     p0 = np.asarray(keypoints, np.float32)
@@ -225,11 +281,8 @@ def build_rgb_input(rgb_frames, keypoints, frame_keypoints=None):
         cy = .5*(float(np.percentile(ys, 3))+float(np.percentile(ys, 97)))
         side = max(float(np.percentile(xs, 97)-np.percentile(xs, 3)),
                    float(np.percentile(ys, 98)-np.percentile(ys, 2)))*1.30
-    wrist_scores = []
-    for wi in [9, 10]:
-        ok = p0[:, wi, 2] > .25
-        wrist_scores.append(float(-p0[ok, wi, 1].mean()) if ok.any() else -9999.)
-    prefer_left = wrist_scores[0] >= wrist_scores[1]
+    side = max(side, 120.)
+    crop_mode = _clip_crop_mode(p0, w, h, side)
     per_frame_kps = (
         [np.asarray(kp, np.float32) for kp in frame_keypoints]
         if frame_keypoints is not None
@@ -237,29 +290,9 @@ def build_rgb_input(rgb_frames, keypoints, frame_keypoints=None):
     )
     people, hands = [], []
     for rgb, kp in zip(rgb_frames, per_frame_kps):
-        h, w = rgb.shape[:2]
-        people.append(crop_square(rgb, cx, cy, max(side, 120.)).transpose(2, 0, 1))
-        hx, hy, hs = cx, cy-.12*side, max(.42*side, 96.)
-        points = []
-        for wi, ei in [(9, 7), (10, 8)]:
-            if kp[wi, 2] > .20:
-                x, y = float(kp[wi, 0]), float(kp[wi, 1])
-                if kp[ei, 2] > .20:
-                    x += .30*(x-float(kp[ei, 0]))
-                    y += .30*(y-float(kp[ei, 1]))
-                points.append((np.clip(x, 0, w-1), np.clip(y, 0, h-1)))
-        if len(points) == 2:
-            (x1, y1), (x2, y2) = points
-            distance = float(np.hypot(x1-x2, y1-y2))
-            if distance <= .50*side:
-                hx, hy = .5*(x1+x2), .5*(y1+y2)
-                hs = max(distance+.34*side, .38*side, 96.)
-            else:
-                hx, hy = points[0 if prefer_left else 1]
-                hs = max(.38*side, 96.)
-        elif points:
-            hx, hy = points[0]
-            hs = max(.38*side, 96.)
+        ch, cw = rgb.shape[:2]
+        people.append(crop_square(rgb, cx, cy, side).transpose(2, 0, 1))
+        hx, hy, hs = _hand_crop_for_frame(crop_mode, kp, cx, cy, side, cw, ch)
         hands.append(crop_square(rgb, hx, hy, hs).transpose(2, 0, 1))
     frames = np.concatenate([people, hands]).astype(np.float32)
     mean = np.array([123.675, 116.28, 103.53], np.float32)[None, :, None, None]
