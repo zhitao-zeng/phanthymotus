@@ -414,6 +414,7 @@ class _PoseNode(Node):
         self._segment_buffer = None
         self._segment_preview = None
         self._segment_count = 0
+        self._last_segment_confirmed_at = 0.0
         if segment_backend is not None:
             from plugins.pose_segment import SegmentBuffer
             pause = self._activity_idle_flush_s
@@ -553,6 +554,7 @@ class _PoseNode(Node):
             if self._segment_buffer is not None:
                 self._segment_buffer.reset()
                 self._segment_preview = None
+                self._last_segment_confirmed_at = 0.0
             # Drop gesture state with the tracks it belongs to. Keeping it
             # would mean a restart inherits a held gesture and an armed
             # cooldown from before the stop, so the first real gesture after
@@ -574,7 +576,10 @@ class _PoseNode(Node):
         self._last_image_received_at = now
         will_infer = (now - self._last_inference_time) >= self._frame_interval
         if self._segment_buffer is not None:
-            self._segment_buffer.append(msg.data if will_infer else b"", now)
+            # Pre-cropped PersonROI patches carry all RGB pixels needed for segment
+            # classification; retain raw JPEG bytes only when hand_channel needs full BGR.
+            keep_jpeg = will_infer and self._hand_channel is not None
+            self._segment_buffer.append(msg.data if keep_jpeg else b"", now)
         if not will_infer:
             return
         self._last_inference_time = now
@@ -598,12 +603,19 @@ class _PoseNode(Node):
 
     def _next_worker_timeout(self) -> float:
         timeout = 0.1 if self._activity_idle_flush_s > 0.0 else 1.0
-        if (self._segment_buffer is not None
-                and self._segment_preview is not None
-                and self._segment_preview[0][0] == self._last_image_received_at):
-            remaining = (self._last_image_received_at + self._segment_buffer.quiet_s
-                         - time.monotonic())
-            return max(.001, min(timeout, remaining))
+        if self._segment_buffer is not None:
+            next_wait = getattr(self._segment_buffer, "next_wait_s", None)
+            if callable(next_wait):
+                previewed_t = (self._segment_preview[0][0]
+                               if self._segment_preview is not None else None)
+                wait_s = next_wait(time.monotonic(), self._activity_idle_flush_s, previewed_t)
+                if wait_s is not None:
+                    return max(.001, min(timeout, wait_s))
+            elif (self._segment_preview is not None
+                    and self._segment_preview[0][0] == self._last_image_received_at):
+                remaining = (self._last_image_received_at + self._segment_buffer.quiet_s
+                             - time.monotonic())
+                return max(.001, min(timeout, remaining))
         if (self._segment_buffer is None
                 and self._activity_idle_flush_s > 0.0 and self._idle_persons
                 and self._last_image_received_at > self._idle_finalized_at):
@@ -614,6 +626,7 @@ class _PoseNode(Node):
 
     def _inference_worker(self):
         import cv2
+        from plugins.pose_segment import make_person_roi_patch
         from plugins.vision_runtime import decode_poses
 
         while not self._stop_event.is_set():
@@ -637,12 +650,16 @@ class _PoseNode(Node):
                 if frame is None:
                     continue
                 outputs, meta = self._model.infer(frame)
+                if self._stop_event.is_set():
+                    break
                 boxes, scores, keypoints = decode_poses(
                     outputs, meta, self._confidence
                 )
                 if self._segment_buffer is not None:
+                    rgb_patch = make_person_roi_patch(frame, boxes, scores, keypoints)
                     self._segment_buffer.record_pose(
-                        received_at, boxes, scores, keypoints, frame.shape)
+                        received_at, boxes, scores, keypoints, frame.shape,
+                        rgb_patch=rgb_patch)
                 persons = self._describe(boxes, scores, keypoints, frame, started)
                 self._publish(persons, frame, started)
                 self._idle_persons = persons
@@ -748,6 +765,18 @@ class _PoseNode(Node):
         if result is None or self._stop_event.is_set():
             self._last_prediction = {**stats, "reason": "no segment decision"}
             return
+        act = result.get("activity")
+        if (self._segment_count >= 1
+                and self._last_segment_confirmed_at > 0.0
+                and (now - self._last_segment_confirmed_at) < 2.5
+                and act is not None
+                and (float(act.get("score") or 0.0) < 0.38
+                     or act.get("name") == "none")):
+            self._last_prediction = {**result["evidence"], **stats,
+                                     "inference_ms": inference_ms,
+                                     "reason": "low-confidence follow-up fragment suppressed"}
+            return
+        self._last_segment_confirmed_at = now
         persons = self._describe(result["boxes"], result["scores"],
                                  result["keypoints"], result["image"], time.time(),
                                  primary_box=result["primary_box"])

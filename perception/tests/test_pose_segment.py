@@ -625,3 +625,147 @@ def test_single_view_rgb_head_and_streaming_crop_parity(tmp_path, monkeypatch):
     assert not isinstance(res_lean['image'], np.ndarray)
 
 
+def test_person_roi_patch_zero_jpeg_decode_and_stride_thinning(monkeypatch):
+    import cv2
+    from plugins.pose_segment import make_person_roi_patch
+
+    class MustNotRunPose:
+        def infer(self, image):
+            raise AssertionError('unexpected pose infer')
+
+    class SVHead:
+        input_dtype = np.float32
+
+        def __init__(self, shape, is_body=False):
+            self.input_shape = shape
+            self.is_body = is_body
+
+        def infer(self, blob):
+            assert blob.shape == self.input_shape
+            if self.is_body:
+                out = np.zeros((1, 126), np.float32)
+                out[0, 12] = 4.0
+                return [out]
+            return [np.ones((1, 16, 8), np.float32) * 0.2]
+
+    head_cfg = {
+        'att_f_w': np.zeros((4, 16), np.float32),
+        'att_d_w': np.zeros((4, 16), np.float32),
+        'att_e_w': np.zeros((4, 1), np.float32),
+        'att_e_b': np.zeros((4,), np.float32),
+        'att_out_w': np.zeros((1, 4), np.float32),
+        'att_out_b': np.zeros((1,), np.float32),
+        'gamma_ev': np.zeros((1, 16), np.float32),
+        'gamma_dv': np.zeros((1, 16), np.float32),
+        'fc_w': np.zeros((126, 16), np.float32),
+        'fc_b': np.linspace(0., 5., 126, dtype=np.float32),
+    }
+    backend = SegmentActionBackend(
+        MustNotRunPose(),
+        SVHead((1, 2, 100, 17, 6), is_body=True),
+        SVHead((1, 16, 3, 192, 192), is_body=False),
+        crop_mode='E',
+        rgb_head=head_cfg,
+    )
+
+    buffer = SegmentBuffer(quiet_s=.4, max_patches=32)
+    row = np.array(_standing_row(), np.float32)
+    boxes = row[None, :4] * 2.0
+    scores = row[None, 4]
+    kps = row[6:].reshape(1, 17, 3) * np.array([2., 2., 1.], np.float32)
+    bgr = np.full((1080, 1920, 3), 120, dtype=np.uint8)
+    bgr[200:800, 300:900] = (40, 150, 220)
+
+    # Stream 110 posed HD frames with ZERO raw JPEG bytes buffered.
+    for i in range(110):
+        ts = 100.0 + i * 0.05
+        buffer.append(b'', ts)
+        patch = make_person_roi_patch(bgr, boxes, scores, kps, roi_hw=320)
+        assert max(patch[0].shape[:2]) <= 320
+        buffer.record_pose(ts, boxes, scores, kps, bgr.shape, rgb_patch=patch)
+        live_patches = sum(
+            1 for r in buffer._frames
+            if r[2] is not None and len(r[2]) > 4 and r[2][4] is not None
+        )
+        assert live_patches <= 32
+        assert buffer._bytes == 0
+
+    records, stats = buffer.pop_ready(200.0)
+    assert len(records) == 110 and stats['received_frames'] == 110
+    # Every single skeleton observation stays intact despite patch stride-thinning.
+    assert all(r[2] is not None and len(r[2]) >= 4 for r in records)
+    # Endpoints retain exact patches.
+    assert len(records[0][2]) == 5 and len(records[-1][2]) == 5
+
+    monkeypatch.setattr(
+        cv2, 'imdecode',
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError('imdecode must not run')),
+    )
+    res_lean = backend.recognize(records, need_image=False)
+    assert res_lean is not None
+    assert res_lean['image'].shape == (1080, 1920, 3)
+    assert not isinstance(res_lean['image'], np.ndarray)
+    assert np.isclose(res_lean['probabilities'].sum(), 1.0, atol=1e-5)
+
+    res_img = backend.recognize(records, need_image=True)
+    assert res_img is not None
+    assert isinstance(res_img['image'], np.ndarray)
+    assert res_img['image'].shape == (1080, 1920, 3)
+
+
+def test_low_confidence_followup_bounce_fragment_is_suppressed(monkeypatch):
+    now = 50.0
+    monkeypatch.setattr(pose, 'time', SimpleNamespace(
+        monotonic=lambda: now, perf_counter=time.perf_counter, time=time.time))
+
+    class TwoSegModel(_SegmentModel):
+        def recognize(self, received, stop_event):
+            result = super().recognize(received, stop_event)
+            if len(self.clips) == 2:
+                result['activity'] = {**result['activity'], 'name': 'phone call', 'score': .19}
+            elif len(self.clips) == 3:
+                result['activity'] = {**result['activity'], 'name': 'none', 'score': .67}
+            elif len(self.clips) == 4:
+                result['activity'] = {**result['activity'], 'name': 'hand waving', 'score': .72}
+            return result
+
+    backend = TwoSegModel()
+    node = pose._PoseNode('/cam/segment', None, .35, 30., 'bounce_guard',
+                          classifier=_FinalClassifier(), segment_backend=backend)
+    messages = _publisher(node, node._output_topic).messages
+    row = np.array(_standing_row(), np.float32)
+    buf = node._segment_buffer
+
+    def push_seg(t0):
+        for i in range(4):
+            ts = t0 + i * .03
+            buf.append(b'', ts)
+            buf.record_pose(ts, row[None, :4], row[None, 4],
+                            row[6:].reshape(1, 17, 3), (480, 640, 3))
+
+    push_seg(50.0)
+    now = 50.60
+    node._flush_received_segment()
+    assert len(messages) == 1
+
+    # Immediate (<2.5s) low-confidence (0.19 < 0.38) tail bounce is suppressed.
+    push_seg(50.70)
+    now = 51.30
+    node._flush_received_segment()
+    assert len(messages) == 1
+
+    # Immediate (<2.5s) trailing 'none' fragment after a confirmed action is also suppressed.
+    push_seg(51.40)
+    now = 52.00
+    node._flush_received_segment()
+    assert len(messages) == 1
+
+    # Confident follow-up action (0.72 >= 0.38) still publishes immediately.
+    push_seg(52.10)
+    now = 52.70
+    node._flush_received_segment()
+    assert len(messages) == 2
+
+    # Action id 66 ('none') belongs to Other group rather than Kitchen.
+    from plugins.pose_segment import _KITCHEN_IDS
+    assert 66 not in _KITCHEN_IDS and 13 in _KITCHEN_IDS and 28 in _KITCHEN_IDS

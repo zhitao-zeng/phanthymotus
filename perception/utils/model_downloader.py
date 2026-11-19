@@ -1529,7 +1529,7 @@ SEGMENT_ACTION_MODEL_BUNDLES = {
     "jp61": {
         "base_url": os.environ.get(
             "SEGMENT_ACTION_BUNDLE_BASE_URL",
-            "http://172.28.4.81:34567/zengzhitao/embodied-ai/action-v4-mnv2-sv-20261119-r05/jp61"),
+            "http://172.28.4.81:34567/zengzhitao/embodied-ai/action-v4-mnv2-sv-20261119-r06/jp61"),
         "files": {
             "yolo26s-pose-batch4.engine": {
                 "size": 25027882,
@@ -1548,8 +1548,8 @@ SEGMENT_ACTION_MODEL_BUNDLES = {
                 "sha256": "c908636b5e595cfa3070150026141b0b252a13985eb67ed9324fba40757189d6",
             },
             "models.json": {
-                "size": 375,
-                "sha256": "73a2b2227807d48324c6cc4e3f44bb0e6b59ca62a0192db02bf3ac388077e732",
+                "size": 372,
+                "sha256": "1ebcf69c464e301c397f07fb84d4105e50d88b5b98189e8aeae99288557e71fc",
             },
         },
     },

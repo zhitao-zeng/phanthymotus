@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 
 _FINGER_IDS = frozenset({84, 85, 86, 87, 88, 89, 90, 95})
 _DESKTOP_IDS = frozenset({29, 32, 35, 40, 48, 49, 54, 55, 56, 57, 58, 60})
-_KITCHEN_IDS = frozenset(range(13, 29)) | frozenset({66})
+_KITCHEN_IDS = frozenset(range(13, 29))
 _CONTROL_IDS = frozenset({38}) | frozenset(range(103, 117))
 
 
@@ -73,10 +73,11 @@ class _ImageShape:
 
 
 class SegmentBuffer:
-    def __init__(self, quiet_s=.4, max_s=30., max_bytes=12*1024**2):
+    def __init__(self, quiet_s=.4, max_s=30., max_bytes=12*1024**2, max_patches=32):
         self.quiet_s = float(quiet_s)
         self.max_s = float(max_s)
         self.max_bytes = int(max_bytes)
+        self.max_patches = int(max_patches)
         self._lock = threading.Lock()
         self._frames = deque()
         self._ready = deque(maxlen=2)
@@ -115,13 +116,21 @@ class SegmentBuffer:
                 self._bytes -= len(removed[1])
                 self._by_time.pop(removed[0], None)
 
-    def record_pose(self, now, boxes, scores, keypoints, image_shape):
-        """Attach the real worker result to its received JPEG, even after a gap."""
+    def record_pose(self, now, boxes, scores, keypoints, image_shape, rgb_patch=None):
+        """Attach the real worker result (and optional pre-cropped RGB patch) to its record."""
         with self._lock:
             record = self._by_time.get(float(now))
             if record is not None:
-                record[2] = (np.array(boxes, copy=True), np.array(scores, copy=True),
-                             np.array(keypoints, copy=True), tuple(image_shape[:2]))
+                base = (np.array(boxes, copy=True), np.array(scores, copy=True),
+                        np.array(keypoints, copy=True), tuple(image_shape[:2]))
+                record[2] = (*base, rgb_patch) if rgb_patch is not None else base
+                if rgb_patch is not None and self.max_patches > 0:
+                    patched = [r for r in self._frames
+                               if r[2] is not None and len(r[2]) > 4 and r[2][4] is not None]
+                    if len(patched) > self.max_patches:
+                        # Drop every other interior patch while preserving endpoints and all poses.
+                        for r in patched[1:-1:2]:
+                            r[2] = r[2][:4]
 
     def drop_payload(self, now):
         """Release JPEG bytes for a frame evicted from the pose queue before inference."""
@@ -146,17 +155,19 @@ class SegmentBuffer:
         for record in frames:
             self._by_time.pop(record[0], None)
 
-    def next_wait_s(self, now, preview_s=None):
+    def next_wait_s(self, now, preview_s=None, previewed_last_t=None):
         """Return seconds until the active segment reaches preview or quiet confirm."""
         with self._lock:
             if self._ready:
                 return 0.0
             if not self._frames:
                 return None
+            last_t = self._frames[-1][0]
             target_s = self.quiet_s
-            if preview_s is not None and 0.0 < float(preview_s) < self.quiet_s:
+            if (preview_s is not None and 0.0 < float(preview_s) < self.quiet_s
+                    and (previewed_last_t is None or last_t != float(previewed_last_t))):
                 target_s = float(preview_s)
-            return max(0.0, self._frames[-1][0] + target_s - float(now))
+            return max(0.0, last_t + target_s - float(now))
 
     def snapshot_if_quiet(self, now, quiet_s):
         """Read a provisional segment without closing it on a brief pause."""
@@ -393,6 +404,101 @@ def crop_rgb_pair_for_frame(rgb, fi, geom):
     return p_crop, h_crop
 
 
+def make_person_roi_patch(bgr, boxes, scores, keypoints, roi_hw=320):
+    """Pre-crop a 1.55x RGB square ROI at <=roi_hw while frame is already decoded."""
+    import cv2
+    h, w = bgr.shape[:2]
+    boxes_arr = np.asarray(boxes, np.float32)
+    scores_arr = np.asarray(scores, np.float32)
+    kps_arr = np.asarray(keypoints, np.float32)
+    if len(boxes_arr) > 0:
+        areas = (np.maximum(1., (boxes_arr[:, 2]-boxes_arr[:, 0])
+                            * (boxes_arr[:, 3]-boxes_arr[:, 1]))
+                 / max(1., float(w*h)))
+        best = int((scores_arr*(.5+areas)).argmax())
+        b0 = boxes_arr[best]
+        x0, y0, x1, y1 = float(b0[0]), float(b0[1]), float(b0[2]), float(b0[3])
+        if len(kps_arr) > best:
+            kp = kps_arr[best]
+            valid = kp[:, 2] > .20
+            if valid.any():
+                x0 = min(x0, float(kp[valid, 0].min()))
+                x1 = max(x1, float(kp[valid, 0].max()))
+                y0 = min(y0, float(kp[valid, 1].min()))
+                y1 = max(y1, float(kp[valid, 1].max()))
+        cx, cy = .5*(x0+x1), .5*(y0+y1)
+        side = max(x1-x0, y1-y0, 160.)*1.55
+    else:
+        cx, cy, side = .5*w, .5*h, float(max(h, w))
+    half = .5*side
+    if side >= max(h, w):
+        rx0, ry0, rx1, ry1 = 0, 0, w, h
+    else:
+        rx0, ry0 = int(round(cx-half)), int(round(cy-half))
+        s_int = int(round(side))
+        rx1, ry1 = rx0+s_int, ry0+s_int
+        if rx0 < 0:
+            rx1, rx0 = min(w, rx1-rx0), 0
+        if ry0 < 0:
+            ry1, ry0 = min(h, ry1-ry0), 0
+        if rx1 > w:
+            rx0, rx1 = max(0, rx0-(rx1-w)), w
+        if ry1 > h:
+            ry0, ry1 = max(0, ry0-(ry1-h)), h
+    sub = bgr[ry0:ry1, rx0:rx1]
+    if sub.size == 0:
+        rx0, ry0, sub = 0, 0, bgr
+    sh, sw = sub.shape[:2]
+    if max(sh, sw) > roi_hw:
+        scale = roi_hw/float(max(sh, sw))
+        nw = max(1, int(round(sw*scale)))
+        nh = max(1, int(round(sh*scale)))
+        sub = cv2.resize(sub, (nw, nh), interpolation=cv2.INTER_AREA)
+    else:
+        nw, nh = sw, sh
+    rgb = cv2.cvtColor(sub, cv2.COLOR_BGR2RGB)
+    return rgb, (rx0, ry0, nw/float(max(sw, 1)), nh/float(max(sh, 1)))
+
+
+def crop_from_roi_patch(rgb_patch, roi_meta, cx, cy, side, out_hw=192):
+    rx0, ry0, sx, sy = roi_meta
+    return crop_square(rgb_patch, (cx-rx0)*sx, (cy-ry0)*sy,
+                       side*.5*(sx+sy), out_hw=out_hw)
+
+
+def crop_rgb_pair_from_patch(rgb_patch, roi_meta, fi, geom, frame_hw):
+    p0, cx, cy, side, p_side, use_crop_e, sub_mode, prefer_left = geom
+    ch, cw = int(frame_hw[0]), int(frame_hw[1])
+    p_crop = crop_from_roi_patch(rgb_patch, roi_meta, cx, cy, p_side).transpose(2, 0, 1)
+    if use_crop_e:
+        hx, hy, hs = _hand_crop_for_frame_e(sub_mode, p0[fi], cx, cy, p_side, cw, ch)
+    else:
+        hx, hy, hs = cx, cy-.12*side, max(.42*side, 96.)
+        kp = p0[fi]
+        points = []
+        for wi, ei in [(9, 7), (10, 8)]:
+            if kp[wi, 2] > .20:
+                x, y = float(kp[wi, 0]), float(kp[wi, 1])
+                if kp[ei, 2] > .20:
+                    x += .30*(x-float(kp[ei, 0]))
+                    y += .30*(y-float(kp[ei, 1]))
+                points.append((np.clip(x, 0, cw-1), np.clip(y, 0, ch-1)))
+        if len(points) == 2:
+            (x1, y1), (x2, y2) = points
+            distance = float(np.hypot(x1-x2, y1-y2))
+            if distance <= .50*side:
+                hx, hy = .5*(x1+x2), .5*(y1+y2)
+                hs = max(distance+.34*side, .38*side, 96.)
+            else:
+                hx, hy = points[0 if prefer_left else 1]
+                hs = max(.38*side, 96.)
+        elif points:
+            hx, hy = points[0]
+            hs = max(.38*side, 96.)
+    h_crop = crop_from_roi_patch(rgb_patch, roi_meta, hx, hy, hs).transpose(2, 0, 1)
+    return p_crop, h_crop
+
+
 _ERF_VEC = np.vectorize(math.erf, otypes=[np.float64])
 
 
@@ -594,13 +700,16 @@ class SegmentActionBackend:
             frame_records.append((timestamp, (w, h), records))
 
         cached_poses = len(samples[0]) == 3
+        sample_patches = {}
         if cached_poses:
             for fi, (_, _data, pose) in enumerate(samples):
                 if stop_event is not None and stop_event.is_set():
                     return None
                 if pose is None:
                     raise ValueError('segment observation has no processed pose')
-                boxes, scores, kps, shape = pose
+                boxes, scores, kps, shape = pose[:4]
+                if len(pose) > 4 and pose[4] is not None:
+                    sample_patches[fi] = pose[4]
                 record_detections(fi, shape, boxes, scores, kps)
         for start in ([] if cached_poses else range(0, len(samples), 8)):
             if stop_event is not None and stop_event.is_set():
@@ -635,7 +744,7 @@ class SegmentActionBackend:
             kp = chosen[3] if chosen else np.zeros((17, 3), np.float32)
             poses.append(_SkeletonFrame(timestamp, box, kp, .3, image_size=size))
             primary_records.append(kp)
-        if snapshot_index is None:
+        if snapshot_index is None or (stop_event is not None and stop_event.is_set()):
             return None
         blob = self.body._build_input(poses, self.body._window_frames())
         body = self.body._run(blob)
@@ -646,62 +755,112 @@ class SegmentActionBackend:
         orig_w, orig_h = int(snap_wh[0]), int(snap_wh[1])
         snapshot_bgr = None
         if cached_poses:
-            # Stream-decode one frame at a time; use 1/2 DCT decode on >=720p clips
-            # to cut ARM CPU decode latency ~1.8x and transient buffer size 4x.
-            crop_flag = (cv2.IMREAD_REDUCED_COLOR_2
-                         if min(orig_h, orig_w) >= 720 else cv2.IMREAD_COLOR)
-            crops = {}
-            geom = None
-            target_indices = (sorted(image_index_set | {snapshot_index})
-                              if need_image else sorted(image_index_set))
-            for fi in target_indices:
-                if stop_event is not None and stop_event.is_set():
-                    return None
-                raw_buf = np.frombuffer(samples[fi][1], np.uint8)
-                if need_image and fi == snapshot_index and crop_flag != cv2.IMREAD_COLOR:
-                    snapshot_bgr = cv2.imdecode(raw_buf, cv2.IMREAD_COLOR)
-                    if snapshot_bgr is None:
-                        raise ValueError('segment contains an undecodable JPEG')
-                if fi in image_index_set:
-                    bgr = cv2.imdecode(raw_buf, crop_flag)
-                    if bgr is None:
-                        raise ValueError('segment contains an undecodable JPEG')
-                    if need_image and fi == snapshot_index and snapshot_bgr is None:
-                        snapshot_bgr = bgr
-                    rgb_img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                    if geom is None:
-                        hr, wr = rgb_img.shape[:2]
-                        if (hr, wr) != (orig_h, orig_w) and orig_w > 0 and orig_h > 0:
-                            sx, sy = wr / float(orig_w), hr / float(orig_h)
-                            scaled_records = [
-                                np.column_stack([kp[:, 0]*sx, kp[:, 1]*sy, kp[:, 2]])
-                                for kp in primary_records
-                            ]
-                        else:
-                            scaled_records = primary_records
-                        geom = prepare_rgb_crop_geometry(
-                            scaled_records, (hr, wr), crop_mode=self.crop_mode)
-                    crops[fi] = crop_rgb_pair_for_frame(rgb_img, fi, geom)
-                    del rgb_img
-                    if snapshot_bgr is not bgr:
-                        del bgr
-                elif need_image and fi == snapshot_index and snapshot_bgr is None:
-                    snapshot_bgr = cv2.imdecode(raw_buf, cv2.IMREAD_COLOR)
-                    if snapshot_bgr is None:
-                        raise ValueError('segment contains an undecodable JPEG')
-            vp_blob, vh_blob = build_rgb_views_from_crops(
-                [crops[i][0] for i in image_indices],
-                [crops[i][1] for i in image_indices],
-            )
-            del crops
+            patched_received = [
+                (ri, rec[2][4]) for ri, rec in enumerate(received)
+                if len(rec) == 3 and rec[2] is not None and len(rec[2]) > 4 and rec[2][4] is not None
+            ]
+            if patched_received:
+                geom_orig = prepare_rgb_crop_geometry(
+                    primary_records, (orig_h, orig_w), crop_mode=self.crop_mode)
+                crops = {}
+                for fi in sorted(image_index_set):
+                    if stop_event is not None and stop_event.is_set():
+                        return None
+                    patch_entry = sample_patches.get(fi)
+                    if patch_entry is None:
+                        orig_ri = int(indices[fi])
+                        _, patch_entry = min(
+                            patched_received, key=lambda item: abs(item[0] - orig_ri))
+                    rgb_patch, roi_meta = patch_entry
+                    crops[fi] = crop_rgb_pair_from_patch(
+                        rgb_patch, roi_meta, fi, geom_orig, (orig_h, orig_w))
+                if need_image:
+                    snap_bytes = samples[snapshot_index][1]
+                    if snap_bytes:
+                        snapshot_bgr = cv2.imdecode(
+                            np.frombuffer(snap_bytes, np.uint8), cv2.IMREAD_COLOR)
+                        if snapshot_bgr is None:
+                            raise ValueError('segment contains an undecodable JPEG')
+                    else:
+                        snap_entry = sample_patches.get(snapshot_index)
+                        if snap_entry is None:
+                            orig_ri = int(indices[snapshot_index])
+                            _, snap_entry = min(
+                                patched_received, key=lambda item: abs(item[0] - orig_ri))
+                        sp_rgb, (rx0, ry0, sx, sy) = snap_entry
+                        snapshot_bgr = np.zeros((orig_h, orig_w, 3), np.uint8)
+                        tw = min(orig_w - rx0, max(1, int(round(sp_rgb.shape[1] / max(sx, 1e-6)))))
+                        th = min(orig_h - ry0, max(1, int(round(sp_rgb.shape[0] / max(sy, 1e-6)))))
+                        if tw > 0 and th > 0:
+                            sp_bgr = cv2.cvtColor(sp_rgb, cv2.COLOR_RGB2BGR)
+                            if (sp_bgr.shape[1], sp_bgr.shape[0]) != (tw, th):
+                                sp_bgr = cv2.resize(sp_bgr, (tw, th), interpolation=cv2.INTER_LINEAR)
+                            snapshot_bgr[ry0:ry0+th, rx0:rx0+tw] = sp_bgr
+                vp_blob, vh_blob = build_rgb_views_from_crops(
+                    [crops[i][0] for i in image_indices],
+                    [crops[i][1] for i in image_indices],
+                )
+                del crops
+            else:
+                # Legacy cached-pose path when records carry raw JPEG bytes without rgb_patch.
+                crop_flag = (cv2.IMREAD_REDUCED_COLOR_2
+                             if min(orig_h, orig_w) >= 720 else cv2.IMREAD_COLOR)
+                crops = {}
+                geom = None
+                target_indices = (sorted(image_index_set | {snapshot_index})
+                                  if need_image else sorted(image_index_set))
+                for fi in target_indices:
+                    if stop_event is not None and stop_event.is_set():
+                        return None
+                    raw_buf = np.frombuffer(samples[fi][1], np.uint8)
+                    if need_image and fi == snapshot_index and crop_flag != cv2.IMREAD_COLOR:
+                        snapshot_bgr = cv2.imdecode(raw_buf, cv2.IMREAD_COLOR)
+                        if snapshot_bgr is None:
+                            raise ValueError('segment contains an undecodable JPEG')
+                    if fi in image_index_set:
+                        bgr = cv2.imdecode(raw_buf, crop_flag)
+                        if bgr is None:
+                            raise ValueError('segment contains an undecodable JPEG')
+                        if need_image and fi == snapshot_index and snapshot_bgr is None:
+                            snapshot_bgr = bgr
+                        rgb_img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                        if geom is None:
+                            hr, wr = rgb_img.shape[:2]
+                            if (hr, wr) != (orig_h, orig_w) and orig_w > 0 and orig_h > 0:
+                                sx, sy = wr / float(orig_w), hr / float(orig_h)
+                                scaled_records = [
+                                    np.column_stack([kp[:, 0]*sx, kp[:, 1]*sy, kp[:, 2]])
+                                    for kp in primary_records
+                                ]
+                            else:
+                                scaled_records = primary_records
+                            geom = prepare_rgb_crop_geometry(
+                                scaled_records, (hr, wr), crop_mode=self.crop_mode)
+                        crops[fi] = crop_rgb_pair_for_frame(rgb_img, fi, geom)
+                        del rgb_img
+                        if snapshot_bgr is not bgr:
+                            del bgr
+                    elif need_image and fi == snapshot_index and snapshot_bgr is None:
+                        snapshot_bgr = cv2.imdecode(raw_buf, cv2.IMREAD_COLOR)
+                        if snapshot_bgr is None:
+                            raise ValueError('segment contains an undecodable JPEG')
+                vp_blob, vh_blob = build_rgb_views_from_crops(
+                    [crops[i][0] for i in image_indices],
+                    [crops[i][1] for i in image_indices],
+                )
+                del crops
         else:
             rgb_blob_full = build_rgb_input([rgb_images[i] for i in image_indices],
                                             primary_records, crop_mode=self.crop_mode)
             vp_blob = rgb_blob_full[:, :self.rgb_n_per_view]
             vh_blob = rgb_blob_full[:, self.rgb_n_per_view:]
 
+        if stop_event is not None and stop_event.is_set():
+            return None
         if self.rgb_single_view:
             fp = np.asarray(self.rgb_engine.infer(vp_blob)[0], np.float32)
+            if stop_event is not None and stop_event.is_set():
+                return None
             fh = np.asarray(self.rgb_engine.infer(vh_blob)[0], np.float32)
             raw_rgb = fuse_dual_event_head(fp, fh, vh_blob, self.rgb_head).reshape(-1)
         else:
