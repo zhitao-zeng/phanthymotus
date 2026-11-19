@@ -615,4 +615,13 @@ def test_single_view_rgb_head_and_streaming_crop_parity(tmp_path, monkeypatch):
     assert res is not None and np.isclose(res['probabilities'].sum(), 1.0, atol=1e-5)
     assert seen_shapes.count(('sv.engine', (1, 16, 3, 192, 192))) == 2
 
+    decoded_hd = (row[None, :4] * 2., row[None, 4],
+                  (row[6:].reshape(1, 17, 3) * np.array([2., 2., 1.], np.float32)),
+                  (960, 1280))
+    received_hd = [(i * .08, frame_bytes(1280, 960), decoded_hd) for i in range(16)]
+    res_lean = instance.recognize(received_hd, need_image=False)
+    assert res_lean is not None
+    assert res_lean['image'].shape == (960, 1280, 3)
+    assert not isinstance(res_lean['image'], np.ndarray)
+
 

@@ -63,8 +63,17 @@ class _SkeletonFrame:
         self.height = body_height(box)
 
 
+class _ImageShape:
+    """Zero-byte stand-in carrying `.shape` when pixel data is unused."""
+
+    __slots__ = ('shape',)
+
+    def __init__(self, shape):
+        self.shape = tuple(int(v) for v in shape)
+
+
 class SegmentBuffer:
-    def __init__(self, quiet_s=.4, max_s=30., max_bytes=16*1024**2):
+    def __init__(self, quiet_s=.4, max_s=30., max_bytes=12*1024**2):
         self.quiet_s = float(quiet_s)
         self.max_s = float(max_s)
         self.max_bytes = int(max_bytes)
@@ -513,6 +522,8 @@ class SegmentActionBackend:
         self.observations = int(observations)
         self.last_error = None
 
+    supports_need_image = True
+
     def warmup(self):
         """Run one dummy pass per segment TensorRT engine so case 1 sees warm latency."""
         for engine in (self.body._engine, self.rgb_engine):
@@ -554,7 +565,7 @@ class SegmentActionBackend:
             rgb.close()
             raise
 
-    def recognize(self, received, stop_event=None):
+    def recognize(self, received, stop_event=None, *, need_image=True):
         import cv2
         from plugins.vision_runtime import decode_poses
         if len(received) < 4:
@@ -631,28 +642,53 @@ class SegmentActionBackend:
         if not looks_like_probabilities(body):
             body = softmax(body)
 
+        _, snap_wh, records = frame_records[snapshot_index]
+        orig_w, orig_h = int(snap_wh[0]), int(snap_wh[1])
         snapshot_bgr = None
         if cached_poses:
-            # Stream-decode one frame at a time so 16 full-HD frames never coexist in RAM.
+            # Stream-decode one frame at a time; use 1/2 DCT decode on >=720p clips
+            # to cut ARM CPU decode latency ~1.8x and transient buffer size 4x.
+            crop_flag = (cv2.IMREAD_REDUCED_COLOR_2
+                         if min(orig_h, orig_w) >= 720 else cv2.IMREAD_COLOR)
             crops = {}
             geom = None
-            for fi in sorted(image_index_set | {snapshot_index}):
+            target_indices = (sorted(image_index_set | {snapshot_index})
+                              if need_image else sorted(image_index_set))
+            for fi in target_indices:
                 if stop_event is not None and stop_event.is_set():
                     return None
-                bgr = cv2.imdecode(np.frombuffer(samples[fi][1], np.uint8), cv2.IMREAD_COLOR)
-                if bgr is None:
-                    raise ValueError('segment contains an undecodable JPEG')
-                if fi == snapshot_index:
-                    snapshot_bgr = bgr
+                raw_buf = np.frombuffer(samples[fi][1], np.uint8)
+                if need_image and fi == snapshot_index and crop_flag != cv2.IMREAD_COLOR:
+                    snapshot_bgr = cv2.imdecode(raw_buf, cv2.IMREAD_COLOR)
+                    if snapshot_bgr is None:
+                        raise ValueError('segment contains an undecodable JPEG')
                 if fi in image_index_set:
+                    bgr = cv2.imdecode(raw_buf, crop_flag)
+                    if bgr is None:
+                        raise ValueError('segment contains an undecodable JPEG')
+                    if need_image and fi == snapshot_index and snapshot_bgr is None:
+                        snapshot_bgr = bgr
                     rgb_img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                     if geom is None:
+                        hr, wr = rgb_img.shape[:2]
+                        if (hr, wr) != (orig_h, orig_w) and orig_w > 0 and orig_h > 0:
+                            sx, sy = wr / float(orig_w), hr / float(orig_h)
+                            scaled_records = [
+                                np.column_stack([kp[:, 0]*sx, kp[:, 1]*sy, kp[:, 2]])
+                                for kp in primary_records
+                            ]
+                        else:
+                            scaled_records = primary_records
                         geom = prepare_rgb_crop_geometry(
-                            primary_records, rgb_img.shape[:2], crop_mode=self.crop_mode)
+                            scaled_records, (hr, wr), crop_mode=self.crop_mode)
                     crops[fi] = crop_rgb_pair_for_frame(rgb_img, fi, geom)
                     del rgb_img
-                if fi != snapshot_index:
-                    del bgr
+                    if snapshot_bgr is not bgr:
+                        del bgr
+                elif need_image and fi == snapshot_index and snapshot_bgr is None:
+                    snapshot_bgr = cv2.imdecode(raw_buf, cv2.IMREAD_COLOR)
+                    if snapshot_bgr is None:
+                        raise ValueError('segment contains an undecodable JPEG')
             vp_blob, vh_blob = build_rgb_views_from_crops(
                 [crops[i][0] for i in image_indices],
                 [crops[i][1] for i in image_indices],
@@ -688,8 +724,9 @@ class SegmentActionBackend:
             zh, name = OFFICIAL_126_CLASSES[action_id]
             activity = {'action_id': action_id, 'name': name, 'name_zh': zh,
                         'score': round(score, 3), 'source': 'segment-dual'}
-        _, size, records = frame_records[snapshot_index]
-        if snapshot_bgr is not None:
+        if not need_image:
+            image = _ImageShape((orig_h, orig_w, 3))
+        elif snapshot_bgr is not None:
             image = snapshot_bgr
         elif snapshot_index in rgb_images:
             image = cv2.cvtColor(rgb_images[snapshot_index], cv2.COLOR_RGB2BGR)

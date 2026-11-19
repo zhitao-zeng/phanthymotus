@@ -598,25 +598,15 @@ class _PoseNode(Node):
 
     def _next_worker_timeout(self) -> float:
         timeout = 0.1 if self._activity_idle_flush_s > 0.0 else 1.0
-        if self._segment_buffer is not None:
-            preview_done = (
-                self._segment_preview is not None
-                and self._segment_preview[0][0] == self._last_image_received_at
-            )
-            wait_until = getattr(self._segment_buffer, "next_wait_s", None)
-            if callable(wait_until):
-                wait_s = wait_until(
-                    time.monotonic(),
-                    None if preview_done else self._activity_idle_flush_s,
-                )
-                if wait_s is not None:
-                    return max(.001, min(timeout, wait_s))
-            elif preview_done:
-                remaining = (self._last_image_received_at + self._segment_buffer.quiet_s
-                             - time.monotonic())
-                return max(.001, min(timeout, remaining))
-        elif (self._activity_idle_flush_s > 0.0 and self._idle_persons
-              and self._last_image_received_at > self._idle_finalized_at):
+        if (self._segment_buffer is not None
+                and self._segment_preview is not None
+                and self._segment_preview[0][0] == self._last_image_received_at):
+            remaining = (self._last_image_received_at + self._segment_buffer.quiet_s
+                         - time.monotonic())
+            return max(.001, min(timeout, remaining))
+        if (self._segment_buffer is None
+                and self._activity_idle_flush_s > 0.0 and self._idle_persons
+                and self._last_image_received_at > self._idle_finalized_at):
             remaining = (self._last_image_received_at + self._activity_idle_flush_s
                          - time.monotonic())
             return max(.001, min(timeout, remaining))
@@ -730,7 +720,12 @@ class _PoseNode(Node):
         else:
             started = time.perf_counter()
             try:
-                result = self._segment_backend.recognize(received, self._stop_event)
+                if getattr(self._segment_backend, "supports_need_image", False):
+                    result = self._segment_backend.recognize(
+                        received, self._stop_event,
+                        need_image=self._hand_channel is not None)
+                else:
+                    result = self._segment_backend.recognize(received, self._stop_event)
             except Exception as error:
                 self._segment_backend.last_error = str(error)
                 self._last_prediction = {**stats, "segment_error": str(error)}
