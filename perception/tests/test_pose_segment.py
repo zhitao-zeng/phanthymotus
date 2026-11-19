@@ -769,3 +769,95 @@ def test_low_confidence_followup_bounce_fragment_is_suppressed(monkeypatch):
     # Action id 66 ('none') belongs to Other group rather than Kitchen.
     from plugins.pose_segment import _KITCHEN_IDS
     assert 66 not in _KITCHEN_IDS and 13 in _KITCHEN_IDS and 28 in _KITCHEN_IDS
+
+
+def test_dual_roi_patch_shrinks_buffer_ram_and_preserves_hand_detail(monkeypatch):
+    import cv2
+    from plugins.pose_segment import (
+        crop_rgb_pair_from_patch,
+        make_dual_roi_patch,
+        prepare_rgb_crop_geometry,
+    )
+
+    bgr = np.full((1080, 1920, 3), 100, dtype=np.uint8)
+    row = np.array(_standing_row(), np.float32)
+    boxes = row[None, :4] * 2.5
+    scores = row[None, 4]
+    kps = row[6:].reshape(1, 17, 3) * np.array([2.5, 2.5, 1.], np.float32)
+    # Paint high-contrast stripe near extended right/left wrists (indices 9, 10)
+    for wi in (9, 10):
+        wx, wy = int(kps[0, wi, 0]), int(kps[0, wi, 1])
+        bgr[max(0, wy - 20):wy + 20, max(0, wx - 20):wx + 20:2] = (10, 240, 20)
+
+    dual_patch = make_dual_roi_patch(bgr, boxes, scores, kps, person_hw=224, hand_hw=192)
+    p_pair, h_pair = dual_patch
+    assert max(p_pair[0].shape[:2]) <= 224
+    total_bytes = p_pair[0].nbytes + (h_pair[0].nbytes if h_pair is not None else 0)
+    assert total_bytes <= (224 * 224 + 192 * 192) * 3  # 261 KB < 307 KB (PersonROI-320)
+
+    monkeypatch.setattr(
+        cv2, 'imdecode',
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError('imdecode must not run')),
+    )
+    geom = prepare_rgb_crop_geometry([kps[0], kps[0]], bgr.shape[:2], crop_mode='E')
+    p_crop, h_crop = crop_rgb_pair_from_patch(dual_patch, None, 0, geom, bgr.shape[:2])
+    assert p_crop.shape == (3, 192, 192) and h_crop.shape == (3, 192, 192)
+    # Also test fallback when hand_patch is None
+    p_crop2, h_crop2 = crop_rgb_pair_from_patch((p_pair, None), None, 0, geom, bgr.shape[:2])
+    assert p_crop2.shape == (3, 192, 192) and h_crop2.shape == (3, 192, 192)
+
+
+def test_segment_pause_prevents_mid_clip_split_and_late_weak_followup_suppressed(monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(pose, 'time', SimpleNamespace(
+        monotonic=lambda: now, perf_counter=time.perf_counter, time=time.time))
+
+    class LateWeakModel(_SegmentModel):
+        def recognize(self, received, stop_event):
+            result = super().recognize(received, stop_event)
+            # Call 1 = preview at 100.52 (4f); Call 2 = confirmed clip #1 at 101.35 (8f).
+            if len(self.clips) == 2:
+                result['activity'] = {**result['activity'], 'name': 'drink water', 'score': .80}
+            elif len(self.clips) == 3:
+                result['activity'] = {**result['activity'], 'name': 'eat meal', 'score': .25}
+            elif len(self.clips) == 4:
+                result['activity'] = {**result['activity'], 'name': 'none', 'score': .70}
+            return result
+
+    backend = LateWeakModel()
+    node = pose._PoseNode('/cam/segment', None, .35, 30., 'pause_guard',
+                          classifier=_FinalClassifier(), segment_backend=backend,
+                          activity_idle_flush_s=0.40, activity_segment_pause_s=0.65)
+    messages = _publisher(node, node._output_topic).messages
+    row = np.array(_standing_row(), np.float32)
+    buf = node._segment_buffer
+
+    def push_frames(t_start, n=4):
+        for i in range(n):
+            ts = t_start + i * .03
+            buf.append(b'', ts)
+            buf.record_pose(ts, row[None, :4], row[None, 4],
+                            row[6:].reshape(1, 17, 3), (480, 640, 3))
+
+    push_frames(100.0, 4)
+    # A 0.50s stall triggers preview (0.40s) WITHOUT cutting the segment (< 0.65s).
+    now = 100.52
+    node._flush_received_segment()
+    assert len(messages) == 0
+    push_frames(100.59, 4)
+    # Complete 8-frame segment confirms at 101.35 without ever emitting two segments.
+    now = 101.35
+    node._flush_received_segment()
+    assert len(messages) == 1
+    assert node._last_prediction['received_frames'] == 8
+
+    # Even after >2.5s gap in same episode, weak (<0.35 after >=0.55) or 'none' fragment is suppressed.
+    push_frames(106.0, 4)
+    now = 106.75
+    node._flush_received_segment()
+    assert len(messages) == 1
+
+    push_frames(108.0, 4)
+    now = 108.75
+    node._flush_received_segment()
+    assert len(messages) == 1

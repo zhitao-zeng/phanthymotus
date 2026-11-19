@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 _FINGER_IDS = frozenset({84, 85, 86, 87, 88, 89, 90, 95})
 _DESKTOP_IDS = frozenset({29, 32, 35, 40, 48, 49, 54, 55, 56, 57, 58, 60})
 _KITCHEN_IDS = frozenset(range(13, 29))
-_CONTROL_IDS = frozenset({38}) | frozenset(range(103, 117))
+_CONTROL_IDS = frozenset(range(103, 117))
 
 
 def _build_router_group_masks():
@@ -73,7 +73,7 @@ class _ImageShape:
 
 
 class SegmentBuffer:
-    def __init__(self, quiet_s=.4, max_s=30., max_bytes=12*1024**2, max_patches=32):
+    def __init__(self, quiet_s=.4, max_s=30., max_bytes=12*1024**2, max_patches=24):
         self.quiet_s = float(quiet_s)
         self.max_s = float(max_s)
         self.max_bytes = int(max_bytes)
@@ -404,32 +404,10 @@ def crop_rgb_pair_for_frame(rgb, fi, geom):
     return p_crop, h_crop
 
 
-def make_person_roi_patch(bgr, boxes, scores, keypoints, roi_hw=320):
-    """Pre-crop a 1.55x RGB square ROI at <=roi_hw while frame is already decoded."""
+def _crop_square_patch(bgr, cx, cy, side, out_hw):
+    """Crop square region around (cx, cy, side) from BGR and return (rgb, meta)."""
     import cv2
     h, w = bgr.shape[:2]
-    boxes_arr = np.asarray(boxes, np.float32)
-    scores_arr = np.asarray(scores, np.float32)
-    kps_arr = np.asarray(keypoints, np.float32)
-    if len(boxes_arr) > 0:
-        areas = (np.maximum(1., (boxes_arr[:, 2]-boxes_arr[:, 0])
-                            * (boxes_arr[:, 3]-boxes_arr[:, 1]))
-                 / max(1., float(w*h)))
-        best = int((scores_arr*(.5+areas)).argmax())
-        b0 = boxes_arr[best]
-        x0, y0, x1, y1 = float(b0[0]), float(b0[1]), float(b0[2]), float(b0[3])
-        if len(kps_arr) > best:
-            kp = kps_arr[best]
-            valid = kp[:, 2] > .20
-            if valid.any():
-                x0 = min(x0, float(kp[valid, 0].min()))
-                x1 = max(x1, float(kp[valid, 0].max()))
-                y0 = min(y0, float(kp[valid, 1].min()))
-                y1 = max(y1, float(kp[valid, 1].max()))
-        cx, cy = .5*(x0+x1), .5*(y0+y1)
-        side = max(x1-x0, y1-y0, 160.)*1.55
-    else:
-        cx, cy, side = .5*w, .5*h, float(max(h, w))
     half = .5*side
     if side >= max(h, w):
         rx0, ry0, rx1, ry1 = 0, 0, w, h
@@ -449,8 +427,8 @@ def make_person_roi_patch(bgr, boxes, scores, keypoints, roi_hw=320):
     if sub.size == 0:
         rx0, ry0, sub = 0, 0, bgr
     sh, sw = sub.shape[:2]
-    if max(sh, sw) > roi_hw:
-        scale = roi_hw/float(max(sh, sw))
+    if max(sh, sw) > out_hw:
+        scale = out_hw/float(max(sh, sw))
         nw = max(1, int(round(sw*scale)))
         nh = max(1, int(round(sh*scale)))
         sub = cv2.resize(sub, (nw, nh), interpolation=cv2.INTER_AREA)
@@ -458,6 +436,76 @@ def make_person_roi_patch(bgr, boxes, scores, keypoints, roi_hw=320):
         nw, nh = sw, sh
     rgb = cv2.cvtColor(sub, cv2.COLOR_BGR2RGB)
     return rgb, (rx0, ry0, nw/float(max(sw, 1)), nh/float(max(sh, 1)))
+
+
+def _primary_person_geom(boxes, scores, keypoints, h, w):
+    boxes_arr = np.asarray(boxes, np.float32)
+    scores_arr = np.asarray(scores, np.float32)
+    kps_arr = np.asarray(keypoints, np.float32)
+    if len(boxes_arr) == 0:
+        return None, .5*w, .5*h, float(max(h, w)), 0.0
+    areas = (np.maximum(1., (boxes_arr[:, 2]-boxes_arr[:, 0])
+                        * (boxes_arr[:, 3]-boxes_arr[:, 1]))
+             / max(1., float(w*h)))
+    best = int((scores_arr*(.5+areas)).argmax())
+    b0 = boxes_arr[best]
+    x0, y0, x1, y1 = float(b0[0]), float(b0[1]), float(b0[2]), float(b0[3])
+    kp = kps_arr[best] if len(kps_arr) > best else None
+    if kp is not None:
+        valid = kp[:, 2] > .20
+        if valid.any():
+            x0 = min(x0, float(kp[valid, 0].min()))
+            x1 = max(x1, float(kp[valid, 0].max()))
+            y0 = min(y0, float(kp[valid, 1].min()))
+            y1 = max(y1, float(kp[valid, 1].max()))
+    body_side = max(x1-x0, y1-y0, 120.)
+    return kp, .5*(x0+x1), .5*(y0+y1), max(body_side, 160.)*1.55, body_side
+
+
+def make_person_roi_patch(bgr, boxes, scores, keypoints, roi_hw=320):
+    """Pre-crop a 1.55x RGB square ROI at <=roi_hw while frame is already decoded."""
+    h, w = bgr.shape[:2]
+    _, cx, cy, side, _ = _primary_person_geom(boxes, scores, keypoints, h, w)
+    return _crop_square_patch(bgr, cx, cy, side, roi_hw)
+
+
+def make_dual_roi_patch(bgr, boxes, scores, keypoints, person_hw=224, hand_hw=192):
+    """Pre-crop native-res person (person_hw) and upper/hand (hand_hw) RGB patches."""
+    h, w = bgr.shape[:2]
+    kp, cx, cy, p_full_side, body_side = _primary_person_geom(
+        boxes, scores, keypoints, h, w)
+    p_pair = _crop_square_patch(bgr, cx, cy, p_full_side, person_hw)
+    if kp is None or body_side <= 0.0:
+        return (p_pair, None)
+    p_side_est = max(body_side*1.30, 120.)
+    pts = _extended_wrists(kp, w, h, extension=.35)
+    sh_pts = [(float(kp[i, 0]), float(kp[i, 1])) for i in (5, 6) if kp[i, 2] > .20]
+    anchors = [(x, y) for _, x, y in pts]
+    if len(sh_pts) == 2:
+        anchors.append((.5*(sh_pts[0][0]+sh_pts[1][0]),
+                        .5*(sh_pts[0][1]+sh_pts[1][1])+.16*p_side_est))
+    elif sh_pts:
+        anchors.append((sh_pts[0][0], sh_pts[0][1]+.16*p_side_est))
+    if not anchors:
+        return (p_pair, None)
+    ax, ay = [p[0] for p in anchors], [p[1] for p in anchors]
+    hx, hy = .5*(min(ax)+max(ax)), .5*(min(ay)+max(ay))
+    span = max(max(ax)-min(ax), max(ay)-min(ay))
+    hs = min(max(span+.32*p_side_est, .62*p_side_est, 144.), 1.15*p_side_est)
+    if hs >= .88*p_full_side:
+        return (p_pair, None)
+    return (p_pair, _crop_square_patch(bgr, hx, hy, hs, hand_hw))
+
+
+def _patch_covers_square(patch_rgb, roi_meta, cx, cy, side, cw, ch, tol=4.0):
+    rx0, ry0, sx, sy = roi_meta
+    px1 = rx0 + patch_rgb.shape[1] / max(sx, 1e-6)
+    py1 = ry0 + patch_rgb.shape[0] / max(sy, 1e-6)
+    half = max(side * .5, 24.)
+    tx0, tx1 = max(0.0, cx - half), min(float(cw), cx + half)
+    ty0, ty1 = max(0.0, cy - half), min(float(ch), cy + half)
+    return (rx0 <= tx0 + tol and ry0 <= ty0 + tol
+            and px1 >= tx1 - tol and py1 >= ty1 - tol)
 
 
 def crop_from_roi_patch(rgb_patch, roi_meta, cx, cy, side, out_hw=192):
@@ -469,7 +517,12 @@ def crop_from_roi_patch(rgb_patch, roi_meta, cx, cy, side, out_hw=192):
 def crop_rgb_pair_from_patch(rgb_patch, roi_meta, fi, geom, frame_hw):
     p0, cx, cy, side, p_side, use_crop_e, sub_mode, prefer_left = geom
     ch, cw = int(frame_hw[0]), int(frame_hw[1])
-    p_crop = crop_from_roi_patch(rgb_patch, roi_meta, cx, cy, p_side).transpose(2, 0, 1)
+    if roi_meta is None and isinstance(rgb_patch, tuple):
+        p_pair, h_pair = rgb_patch
+        p_rgb, p_meta = p_pair
+    else:
+        p_rgb, p_meta, h_pair = rgb_patch, roi_meta, None
+    p_crop = crop_from_roi_patch(p_rgb, p_meta, cx, cy, p_side).transpose(2, 0, 1)
     if use_crop_e:
         hx, hy, hs = _hand_crop_for_frame_e(sub_mode, p0[fi], cx, cy, p_side, cw, ch)
     else:
@@ -495,7 +548,12 @@ def crop_rgb_pair_from_patch(rgb_patch, roi_meta, fi, geom, frame_hw):
         elif points:
             hx, hy = points[0]
             hs = max(.38*side, 96.)
-    h_crop = crop_from_roi_patch(rgb_patch, roi_meta, hx, hy, hs).transpose(2, 0, 1)
+    if h_pair is not None and _patch_covers_square(
+            h_pair[0], h_pair[1], hx, hy, hs, cw, ch):
+        h_src_rgb, h_src_meta = h_pair
+    else:
+        h_src_rgb, h_src_meta = p_rgb, p_meta
+    h_crop = crop_from_roi_patch(h_src_rgb, h_src_meta, hx, hy, hs).transpose(2, 0, 1)
     return p_crop, h_crop
 
 
@@ -771,9 +829,13 @@ class SegmentActionBackend:
                         orig_ri = int(indices[fi])
                         _, patch_entry = min(
                             patched_received, key=lambda item: abs(item[0] - orig_ri))
-                    rgb_patch, roi_meta = patch_entry
-                    crops[fi] = crop_rgb_pair_from_patch(
-                        rgb_patch, roi_meta, fi, geom_orig, (orig_h, orig_w))
+                    if isinstance(patch_entry[0], tuple):
+                        crops[fi] = crop_rgb_pair_from_patch(
+                            patch_entry, None, fi, geom_orig, (orig_h, orig_w))
+                    else:
+                        rgb_patch, roi_meta = patch_entry
+                        crops[fi] = crop_rgb_pair_from_patch(
+                            rgb_patch, roi_meta, fi, geom_orig, (orig_h, orig_w))
                 if need_image:
                     snap_bytes = samples[snapshot_index][1]
                     if snap_bytes:
@@ -787,7 +849,8 @@ class SegmentActionBackend:
                             orig_ri = int(indices[snapshot_index])
                             _, snap_entry = min(
                                 patched_received, key=lambda item: abs(item[0] - orig_ri))
-                        sp_rgb, (rx0, ry0, sx, sy) = snap_entry
+                        p_entry = snap_entry[0] if isinstance(snap_entry[0], tuple) else snap_entry
+                        sp_rgb, (rx0, ry0, sx, sy) = p_entry
                         snapshot_bgr = np.zeros((orig_h, orig_w, 3), np.uint8)
                         tw = min(orig_w - rx0, max(1, int(round(sp_rgb.shape[1] / max(sx, 1e-6)))))
                         th = min(orig_h - ry0, max(1, int(round(sp_rgb.shape[0] / max(sy, 1e-6)))))

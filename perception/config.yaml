@@ -336,7 +336,8 @@ plugins:
     min_window_frames: 4
     action_min_score: 0.02
     activity_interval_s: 0.28
-    activity_idle_flush_s: 0.4
+    activity_idle_flush_s: 0.24
+    activity_segment_pause_s: 0.35
     tracker_timeout_s: 0.6
     label_hold: 1
     # ── Fall thresholds ──────────────────────────────────────────────────

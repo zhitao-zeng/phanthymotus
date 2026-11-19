@@ -1529,15 +1529,15 @@ SEGMENT_ACTION_MODEL_BUNDLES = {
     "jp61": {
         "base_url": os.environ.get(
             "SEGMENT_ACTION_BUNDLE_BASE_URL",
-            "http://172.28.4.81:34567/zengzhitao/embodied-ai/action-v4-mnv2-sv-20261119-r06/jp61"),
+            "http://172.28.4.81:34567/zengzhitao/embodied-ai/action-v4-mnv2-dualroi-p0p1p2-20261119-r09/jp61"),
         "files": {
             "yolo26s-pose-batch4.engine": {
                 "size": 25027882,
                 "sha256": "dc41416d27fcc50efb540cf87c95c953fac58047e4e82aec5a7758baba40c161",
             },
-            "stgcnpp-action126-v2p.engine": {
-                "size": 7288461,
-                "sha256": "3cd3327d9a20e21937fbccbcc3d557c1e3d9cf903f1ac3b0cc0a7dd9b22ed516",
+            "stgcnpp-action126-v4-y26s.engine": {
+                "size": 4408676,
+                "sha256": "bbbb48f151fb8ea437bec68a365425ca8f4d6c547d18d4321cffc7e318725069",
             },
             "mnv2-sv16f-crope-v4-feat.engine": {
                 "size": 8707820,
@@ -1548,8 +1548,8 @@ SEGMENT_ACTION_MODEL_BUNDLES = {
                 "sha256": "c908636b5e595cfa3070150026141b0b252a13985eb67ed9324fba40757189d6",
             },
             "models.json": {
-                "size": 372,
-                "sha256": "1ebcf69c464e301c397f07fb84d4105e50d88b5b98189e8aeae99288557e71fc",
+                "size": 299,
+                "sha256": "b3b85ae3b630de01ec384bf7f42f029d712935bdc7a53dd12b7e8943847c8692",
             },
         },
     },

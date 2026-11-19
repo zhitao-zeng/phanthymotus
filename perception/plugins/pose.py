@@ -343,6 +343,7 @@ TOOLS = [
                 "action_window_s": {"type": "number", "minimum": 0.2, "title": "Movement look-back (s)", "description": "How much recent movement is used to judge waving and walking.", "default": 5.0, "scope": "instance", "advanced": True},
                 "activity_interval_s": {"type": "number", "minimum": 0.0, "title": "Action model interval (s)", "description": "The action model judges a clip, so running it every frame re-reads almost the same input. Posture stays frame-rate regardless.", "default": 0.45, "scope": "instance", "advanced": True},
                 "activity_idle_flush_s": {"type": "number", "minimum": 0.0, "title": "Finish action after input pause (s)", "description": "When the image stream pauses, judge the buffered action once. Zero disables this in rolling mode. In segment mode zero starts inference early and confirms the end after at least 0.4 seconds and two configured frame intervals.", "default": 0.0, "scope": "instance", "advanced": True},
+                "activity_segment_pause_s": {"type": "number", "minimum": 0.0, "title": "Confirm segment break after pause (s)", "description": "In segment mode, how long frames must pause before cutting a new segment. Exceeding activity_idle_flush_s previews without splitting brief mid-clip stalls.", "default": 0.0, "scope": "instance", "advanced": True},
                 "activity_mode": {"type": "string", "enum": ["rolling", "segment"], "title": "When to recognize an action", "description": "rolling updates actions while video arrives. segment recognizes the received clip once the input pauses, using its complete context.", "default": "rolling", "scope": "instance", "advanced": True},
                 "label_hold": {"type": "integer", "minimum": 1, "title": "Label stability (frames)", "description": "How many frames a new label must win before it replaces the current one. A label flickering several times a second is worse than a steady wrong one.", "default": 1, "scope": "instance", "advanced": True},
                 "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Action score threshold", "description": "Falls use a higher bar of their own: a false fall makes the robot drop what it is doing to ask if someone is hurt.", "default": 0.08, "scope": "instance", "advanced": True},
@@ -376,6 +377,7 @@ class _PoseNode(Node):
                  publish_overlay: bool = False, label_hold: int = 3,
                  activity_interval_s: float = 0.35,
                  activity_idle_flush_s: float = 0.0,
+                 activity_segment_pause_s: float = 0.0,
                  segment_backend=None,
                  tracker_timeout_s: float = 1.0,
                  gesture_tracker: Optional[GestureEventTracker] = None,
@@ -410,11 +412,13 @@ class _PoseNode(Node):
 
         self._activity_interval_s = float(activity_interval_s)
         self._activity_idle_flush_s = max(0.0, float(activity_idle_flush_s))
+        self._activity_segment_pause_s = max(0.0, float(activity_segment_pause_s))
         self._segment_backend = segment_backend
         self._segment_buffer = None
         self._segment_preview = None
         self._segment_count = 0
         self._last_segment_confirmed_at = 0.0
+        self._last_segment_score = 0.0
         if segment_backend is not None:
             from plugins.pose_segment import SegmentBuffer
             pause = self._activity_idle_flush_s
@@ -423,6 +427,8 @@ class _PoseNode(Node):
                 # A transient pause must not discard the start of a segment.
                 self._activity_idle_flush_s = max(.15, 2*self._frame_interval)
                 pause = max(.4, self._activity_idle_flush_s)
+            if self._activity_segment_pause_s > 0.0:
+                pause = max(pause, self._activity_segment_pause_s)
             self._segment_buffer = SegmentBuffer(pause)
         self._last_image_received_at = 0.0
         self._idle_finalized_at = 0.0
@@ -555,6 +561,7 @@ class _PoseNode(Node):
                 self._segment_buffer.reset()
                 self._segment_preview = None
                 self._last_segment_confirmed_at = 0.0
+                self._last_segment_score = 0.0
             # Drop gesture state with the tracks it belongs to. Keeping it
             # would mean a restart inherits a held gesture and an armed
             # cooldown from before the stop, so the first real gesture after
@@ -626,7 +633,7 @@ class _PoseNode(Node):
 
     def _inference_worker(self):
         import cv2
-        from plugins.pose_segment import make_person_roi_patch
+        from plugins.pose_segment import make_dual_roi_patch
         from plugins.vision_runtime import decode_poses
 
         while not self._stop_event.is_set():
@@ -656,7 +663,7 @@ class _PoseNode(Node):
                     outputs, meta, self._confidence
                 )
                 if self._segment_buffer is not None:
-                    rgb_patch = make_person_roi_patch(frame, boxes, scores, keypoints)
+                    rgb_patch = make_dual_roi_patch(frame, boxes, scores, keypoints)
                     self._segment_buffer.record_pose(
                         received_at, boxes, scores, keypoints, frame.shape,
                         rgb_patch=rgb_patch)
@@ -766,17 +773,19 @@ class _PoseNode(Node):
             self._last_prediction = {**stats, "reason": "no segment decision"}
             return
         act = result.get("activity")
-        if (self._segment_count >= 1
-                and self._last_segment_confirmed_at > 0.0
-                and (now - self._last_segment_confirmed_at) < 2.5
-                and act is not None
-                and (float(act.get("score") or 0.0) < 0.38
-                     or act.get("name") == "none")):
-            self._last_prediction = {**result["evidence"], **stats,
-                                     "inference_ms": inference_ms,
-                                     "reason": "low-confidence follow-up fragment suppressed"}
-            return
+        score_val = float(act.get("score") or 0.0) if act is not None else 0.0
+        if self._segment_count >= 1 and act is not None:
+            within_bounce = (self._last_segment_confirmed_at > 0.0
+                             and (now - self._last_segment_confirmed_at) < 2.5)
+            weak_followup = (score_val < 0.38 if within_bounce
+                             else (score_val < 0.35 and self._last_segment_score >= 0.55))
+            if act.get("name") == "none" or weak_followup:
+                self._last_prediction = {**result["evidence"], **stats,
+                                         "inference_ms": inference_ms,
+                                         "reason": "low-confidence follow-up fragment suppressed"}
+                return
         self._last_segment_confirmed_at = now
+        self._last_segment_score = score_val
         persons = self._describe(result["boxes"], result["scores"],
                                  result["keypoints"], result["image"], time.time(),
                                  primary_box=result["primary_box"])
@@ -795,6 +804,8 @@ class _PoseNode(Node):
             for p in persons}
         self._publish(persons, emit_gestures=False,
                       publish_skeleton=False, count_frame=False)
+        log.info(f"[pose] segment published: {act.get('name') if act else None} "
+                 f"score={score_val:.3f} frames={stats.get('received_frames', 0)} ms={inference_ms}")
 
     # ── payload construction ─────────────────────────────────────────────
 
@@ -1323,6 +1334,8 @@ class PosePerceptionPlugin:
             plugin_cfg.get("activity_interval_s", 0.35))
         self._activity_idle_flush_s = max(0.0, float(
             plugin_cfg.get("activity_idle_flush_s") or 0.0))
+        self._activity_segment_pause_s = max(0.0, float(
+            plugin_cfg.get("activity_segment_pause_s") or 0.0))
         self._activity_mode = str(os.environ.get("POSE_ACTIVITY_MODE") or
                                   plugin_cfg.get("activity_mode", "rolling"))
         self._window_maturity_s = float(
@@ -1408,6 +1421,8 @@ class PosePerceptionPlugin:
                 "activity_interval_s", self._activity_interval_s)),
             "activity_idle_flush_s": max(0.0, float(icfg.get(
                 "activity_idle_flush_s", self._activity_idle_flush_s) or 0.0)),
+            "activity_segment_pause_s": max(0.0, float(icfg.get(
+                "activity_segment_pause_s", self._activity_segment_pause_s) or 0.0)),
             "activity_mode": str(icfg.get("activity_mode", self._activity_mode)),
             "window_maturity_s": float(icfg.get(
                 "window_maturity_s", self._window_maturity_s)),
@@ -1973,6 +1988,7 @@ class PosePerceptionPlugin:
                 label_hold=merged["label_hold"],
                 activity_interval_s=merged["activity_interval_s"],
                 activity_idle_flush_s=merged["activity_idle_flush_s"],
+                activity_segment_pause_s=merged["activity_segment_pause_s"],
                 segment_backend=self._segment_backend_for(merged),
                 tracker_timeout_s=merged["tracker_timeout_s"],
                 gesture_tracker=self._gesture_tracker_for(merged),
@@ -2494,6 +2510,9 @@ class PosePerceptionPlugin:
         if "activity_idle_flush_s" in cfg:
             self._activity_idle_flush_s = max(0.0, float(
                 cfg["activity_idle_flush_s"] or 0.0))
+        if "activity_segment_pause_s" in cfg:
+            self._activity_segment_pause_s = max(0.0, float(
+                cfg["activity_segment_pause_s"] or 0.0))
         if "activity_mode" in cfg:
             self._activity_mode = str(cfg["activity_mode"])
         for key in _THRESHOLD_KEYS:
