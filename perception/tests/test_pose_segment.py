@@ -408,3 +408,90 @@ def test_lean_segment_frames_preserve_tracking_and_both_head_inputs(monkeypatch)
     np.testing.assert_array_equal(lean['probabilities'], reference['probabilities'])
     np.testing.assert_array_equal(lean_body[0], reference_body[0])
     np.testing.assert_array_equal(lean_rgb[0], reference_rgb[0])
+
+
+def test_crop_e_router_and_warmup_propagate_from_manifest(tmp_path, monkeypatch):
+    from utils import tensorrt_runtime
+    from plugins.pose_segment import build_rgb_input, fuse_calibrated_router
+    from plugins.pose_stgcn import resample_clip
+
+    warm_calls = []
+
+    class Engine:
+        input_dtype = np.float32
+
+        def __init__(self, path, **kwargs):
+            self.name = path.name
+            self.input_shape = ((1, 2, 100, 17, 6) if path.name == 'body.engine'
+                                else (1, 32, 3, 192, 192))
+
+        def infer(self, blob):
+            warm_calls.append((self.name, blob.shape, blob.dtype))
+            out = np.zeros((1, 126), np.float32)
+            out[0, 55 if self.name == 'rgb.engine' else 0] = 6.0
+            return [out]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tensorrt_runtime, 'TensorRTEngine', Engine)
+    theta = [1.3584, 1.876, -1.3663, -1.197, 0.472, -0.7761, -1.506, 1.1615, 0.5428, 0.2666]
+    (tmp_path/'models.json').write_text(json.dumps({
+        'body_engine': 'body.engine',
+        'rgb_engine': 'rgb.engine',
+        'crop_mode': 'E',
+        'router': {'mode': 'poe_gate', 'theta': theta},
+    }))
+    backend = SegmentActionBackend.from_directory(object(), tmp_path)
+    backend.warmup()
+    assert warm_calls == [
+        ('body.engine', (1, 2, 100, 17, 6), np.dtype('float32')),
+        ('rgb.engine', (1, 32, 3, 192, 192), np.dtype('float32')),
+    ]
+
+    plugin, _ = _plugin({'activity_mode': 'segment'})
+    plugin._segment_model = backend
+    monkeypatch.setenv('ACTION_SEGMENT_MODEL_DIR', str(tmp_path))
+    instance = plugin._segment_backend_for(plugin._merged_config('inst-v4'))
+    assert instance.crop_mode == 'E'
+    assert instance.rgb_n_per_view == 16
+    assert instance.router == {'mode': 'poe_gate', 'theta': theta}
+
+    row = np.array(_standing_row(), np.float32)
+    decoded = (row[None, :4], row[None, 4], row[6:].reshape(1, 17, 3), (480, 640))
+    received = [(i*.08, frame_bytes(640, 480), decoded) for i in range(16)]
+    res = instance.recognize(received)
+    assert res is not None and res['probabilities'].shape == (126,)
+    assert np.isclose(res['probabilities'].sum(), 1.0, atol=1e-5)
+
+    # Verify Crop E supports both close-wrist tabletop B and raised-chest C modes.
+    imgs = [np.zeros((480, 640, 3), np.uint8) for _ in range(16)]
+    kps = np.zeros((16, 17, 3), np.float32)
+    kps[:, :, 2] = .9
+    kps[:, 9, :2] = (300., 300.)
+    kps[:, 10, :2] = (310., 300.)
+    kps[:, 5, :2] = (260., 180.)
+    kps[:, 6, :2] = (360., 180.)
+    blob_b = build_rgb_input(imgs, kps, crop_mode='E')
+    kps[:, 10, :2] = (480., 300.)
+    blob_c = build_rgb_input(imgs, kps, crop_mode='E')
+    assert blob_b.shape == blob_c.shape == (1, 32, 3, 192, 192)
+
+    # Verify physical-timestamp resampling handles non-uniform frame gaps cleanly.
+    clip = np.zeros((3, 17, 6), np.float32)
+    clip[1] = 1.0
+    clip[2] = 3.0
+    ts = np.array([0.0, 0.25, 1.0], dtype=np.float64)
+    sampled = resample_clip(clip, 5, timestamps=ts)
+    assert sampled.shape == (5, 17, 6)
+    assert np.isclose(sampled[1, 0, 0], 1.0, atol=1e-5)
+    assert np.isclose(sampled[2, 0, 0], 1.0 + (0.5 - 0.25) / 0.75 * 2.0, atol=1e-5)
+
+    # Verify router low-FPS gate shifts weight toward RGB when FPS drops from 30 -> 12.
+    pb = np.full(126, .1 / 125, np.float32)
+    pr = np.full(126, .1 / 125, np.float32)
+    pb[0] = .9
+    pr[55] = .9
+    f_hi = fuse_calibrated_router(pb, pr, {'mode': 'poe_gate', 'theta': theta}, observation_fps=30.0)
+    f_lo = fuse_calibrated_router(pb, pr, {'mode': 'poe_gate', 'theta': theta}, observation_fps=12.0)
+    assert f_lo[55] > f_hi[55]

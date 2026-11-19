@@ -7,6 +7,8 @@ are needed. The frozen action models use the same person and hand crops.
 from collections import deque
 from pathlib import Path
 import json
+import logging
+import math
 import threading
 
 import numpy as np
@@ -14,6 +16,33 @@ import numpy as np
 from plugins.action_vocab import OFFICIAL_126_CLASSES
 from plugins.pose_action import PoseTracker, body_height
 from plugins.pose_stgcn import SkeletonActionBackend, looks_like_probabilities, softmax
+
+
+log = logging.getLogger(__name__)
+
+_FINGER_IDS = frozenset({84, 85, 86, 87, 88, 89, 90, 95})
+_DESKTOP_IDS = frozenset({29, 32, 35, 40, 48, 49, 54, 55, 56, 57, 58, 60})
+_KITCHEN_IDS = frozenset(range(13, 29)) | frozenset({66})
+_CONTROL_IDS = frozenset({38}) | frozenset(range(103, 117))
+
+
+def _build_router_group_masks():
+    masks = np.zeros((5, 126), dtype=np.float64)
+    for cid in range(1, 127):
+        if cid in _FINGER_IDS:
+            masks[0, cid - 1] = 1.0
+        elif cid in _DESKTOP_IDS:
+            masks[1, cid - 1] = 1.0
+        elif cid in _KITCHEN_IDS:
+            masks[2, cid - 1] = 1.0
+        elif cid in _CONTROL_IDS:
+            masks[3, cid - 1] = 1.0
+        else:
+            masks[4, cid - 1] = 1.0
+    return masks
+
+
+_ROUTER_GROUP_MASKS = _build_router_group_masks()
 
 
 class _SkeletonFrame:
@@ -89,6 +118,18 @@ class SegmentBuffer:
         for record in frames:
             self._by_time.pop(record[0], None)
 
+    def next_wait_s(self, now, preview_s=None):
+        """Return seconds until the active segment reaches preview or quiet confirm."""
+        with self._lock:
+            if self._ready:
+                return 0.0
+            if not self._frames:
+                return None
+            target_s = self.quiet_s
+            if preview_s is not None and 0.0 < float(preview_s) < self.quiet_s:
+                target_s = float(preview_s)
+            return max(0.0, self._frames[-1][0] + target_s - float(now))
+
     def snapshot_if_quiet(self, now, quiet_s):
         """Read a provisional segment without closing it on a brief pause."""
         with self._lock:
@@ -145,7 +186,62 @@ def rgb_frame_indices(length, n_per_view=4):
     return sixteen[np.linspace(0, 15, n_per_view).round().astype(int)]
 
 
-def build_rgb_input(rgb_frames, keypoints):
+def _extended_wrists(kp, width, height, extension=.35):
+    points = []
+    for wi, ei in [(9, 7), (10, 8)]:
+        if kp[wi, 2] > .20:
+            x, y = float(kp[wi, 0]), float(kp[wi, 1])
+            if kp[ei, 2] > .20:
+                x += extension*(x-float(kp[ei, 0]))
+                y += extension*(y-float(kp[ei, 1]))
+            points.append((wi, float(np.clip(x, 0, width-1)), float(np.clip(y, 0, height-1))))
+    return points
+
+
+def _clip_crop_mode_e(p0, width, height, side, dist_thresh=.12):
+    dists = []
+    two_frames = 0
+    for kp in p0:
+        pts = _extended_wrists(kp, width, height, extension=.35)
+        if len(pts) == 2:
+            two_frames += 1
+            dists.append(float(np.hypot(pts[0][1]-pts[1][1], pts[0][2]-pts[1][2]))/max(side, 1.))
+    if two_frames >= max(1, int(.6*len(p0))) and dists and float(np.median(dists)) <= dist_thresh:
+        return 'B'
+    return 'C'
+
+
+def _hand_crop_for_frame_e(mode, kp, cx, cy, side, width, height):
+    pts = _extended_wrists(kp, width, height, extension=.35)
+    if mode == 'B':
+        if len(pts) == 2:
+            (_, x1, y1), (_, x2, y2) = pts
+            dx, dy = abs(x1-x2), abs(y1-y2)
+            hx, hy = .5*(x1+x2), .5*(y1+y2)
+            hs = min(max(max(dx, dy)+.28*side, .32*side, 96.), 1.15*side)
+            return hx, hy, hs
+        if len(pts) == 1:
+            return pts[0][1], pts[0][2], max(.32*side, 96.)
+        return cx, cy-.12*side, max(.42*side, 96.)
+
+    anchors = [(x, y) for _, x, y in pts]
+    sh_pts = [(float(kp[i, 0]), float(kp[i, 1])) for i in (5, 6) if kp[i, 2] > .20]
+    if len(sh_pts) == 2:
+        sx, sy = .5*(sh_pts[0][0]+sh_pts[1][0]), .5*(sh_pts[0][1]+sh_pts[1][1])
+        anchors.append((sx, sy+.16*side))
+    elif sh_pts:
+        anchors.append((sh_pts[0][0], sh_pts[0][1]+.16*side))
+    if anchors:
+        ax = [p[0] for p in anchors]
+        ay = [p[1] for p in anchors]
+        hx, hy = .5*(min(ax)+max(ax)), .5*(min(ay)+max(ay))
+        span = max(max(ax)-min(ax), max(ay)-min(ay))
+        hs = min(max(span+.24*side, .52*side, 128.), 1.15*side)
+        return hx, hy, hs
+    return cx, cy-.08*side, max(.55*side, 128.)
+
+
+def build_rgb_input(rgb_frames, keypoints, crop_mode='A'):
     """RGB source images plus the whole segment's primary COCO-17 poses."""
     p0 = np.asarray(keypoints, np.float32)
     h, w = rgb_frames[0].shape[:2]
@@ -157,42 +253,101 @@ def build_rgb_input(rgb_frames, keypoints):
         cy = .5*(float(np.percentile(ys, 3))+float(np.percentile(ys, 97)))
         side = max(float(np.percentile(xs, 97)-np.percentile(xs, 3)),
                    float(np.percentile(ys, 98)-np.percentile(ys, 2)))*1.30
-    wrist_scores = []
-    for wi in [9, 10]:
-        ok = p0[:, wi, 2] > .25
-        wrist_scores.append(float(-p0[ok, wi, 1].mean()) if ok.any() else -9999.)
-    prefer_left = wrist_scores[0] >= wrist_scores[1]
-    people, hands = [], []
-    for rgb, fi in zip(rgb_frames, rgb_frame_indices(len(p0), len(rgb_frames))):
-        h, w = rgb.shape[:2]
-        people.append(crop_square(rgb, cx, cy, max(side, 120.)).transpose(2, 0, 1))
-        hx, hy, hs = cx, cy-.12*side, max(.42*side, 96.)
-        kp = p0[fi]
-        points = []
-        for wi, ei in [(9, 7), (10, 8)]:
-            if kp[wi, 2] > .20:
-                x, y = float(kp[wi, 0]), float(kp[wi, 1])
-                if kp[ei, 2] > .20:
-                    x += .30*(x-float(kp[ei, 0]))
-                    y += .30*(y-float(kp[ei, 1]))
-                points.append((np.clip(x, 0, w-1), np.clip(y, 0, h-1)))
-        if len(points) == 2:
-            (x1, y1), (x2, y2) = points
-            distance = float(np.hypot(x1-x2, y1-y2))
-            if distance <= .50*side:
-                hx, hy = .5*(x1+x2), .5*(y1+y2)
-                hs = max(distance+.34*side, .38*side, 96.)
-            else:
-                hx, hy = points[0 if prefer_left else 1]
+    use_crop_e = str(crop_mode or 'A').upper() == 'E'
+    if use_crop_e:
+        p_side = max(side, 120.)
+        sub_mode = _clip_crop_mode_e(p0, w, h, p_side)
+        people, hands = [], []
+        for rgb, fi in zip(rgb_frames, rgb_frame_indices(len(p0), len(rgb_frames))):
+            ch, cw = rgb.shape[:2]
+            people.append(crop_square(rgb, cx, cy, p_side).transpose(2, 0, 1))
+            hx, hy, hs = _hand_crop_for_frame_e(sub_mode, p0[fi], cx, cy, p_side, cw, ch)
+            hands.append(crop_square(rgb, hx, hy, hs).transpose(2, 0, 1))
+    else:
+        wrist_scores = []
+        for wi in [9, 10]:
+            ok = p0[:, wi, 2] > .25
+            wrist_scores.append(float(-p0[ok, wi, 1].mean()) if ok.any() else -9999.)
+        prefer_left = wrist_scores[0] >= wrist_scores[1]
+        people, hands = [], []
+        for rgb, fi in zip(rgb_frames, rgb_frame_indices(len(p0), len(rgb_frames))):
+            h, w = rgb.shape[:2]
+            people.append(crop_square(rgb, cx, cy, max(side, 120.)).transpose(2, 0, 1))
+            hx, hy, hs = cx, cy-.12*side, max(.42*side, 96.)
+            kp = p0[fi]
+            points = []
+            for wi, ei in [(9, 7), (10, 8)]:
+                if kp[wi, 2] > .20:
+                    x, y = float(kp[wi, 0]), float(kp[wi, 1])
+                    if kp[ei, 2] > .20:
+                        x += .30*(x-float(kp[ei, 0]))
+                        y += .30*(y-float(kp[ei, 1]))
+                    points.append((np.clip(x, 0, w-1), np.clip(y, 0, h-1)))
+            if len(points) == 2:
+                (x1, y1), (x2, y2) = points
+                distance = float(np.hypot(x1-x2, y1-y2))
+                if distance <= .50*side:
+                    hx, hy = .5*(x1+x2), .5*(y1+y2)
+                    hs = max(distance+.34*side, .38*side, 96.)
+                else:
+                    hx, hy = points[0 if prefer_left else 1]
+                    hs = max(.38*side, 96.)
+            elif points:
+                hx, hy = points[0]
                 hs = max(.38*side, 96.)
-        elif points:
-            hx, hy = points[0]
-            hs = max(.38*side, 96.)
-        hands.append(crop_square(rgb, hx, hy, hs).transpose(2, 0, 1))
+            hands.append(crop_square(rgb, hx, hy, hs).transpose(2, 0, 1))
     frames = np.concatenate([people, hands]).astype(np.float32)
     mean = np.array([123.675, 116.28, 103.53], np.float32)[None, :, None, None]
     std = np.array([58.395, 57.12, 57.375], np.float32)[None, :, None, None]
     return ((frames-mean)/std)[None]
+
+
+def _temp_scale_probs(probs, inv_t):
+    lp = np.log(np.clip(probs, 1e-7, 1.0))*float(inv_t)
+    lp -= lp.max()
+    ep = np.exp(lp)
+    return ep/ep.sum()
+
+
+def _norm_entropy(probs):
+    pc = np.clip(probs, 1e-7, 1.0)
+    return float(-(pc*np.log(pc)).sum()/math.log(126.0))
+
+
+def fuse_calibrated_router(body, rgb, router_cfg, observation_fps=None):
+    """Apply 10-DOF OOF-calibrated conditional routing between Body and RGB."""
+    theta = np.asarray(router_cfg['theta'], dtype=np.float64)
+    if theta.shape != (10,):
+        raise ValueError(f'router theta must have 10 scalars; got {theta.shape}')
+    mode = str(router_cfg.get('mode', 'poe_gate'))
+    low_hi = float(router_cfg.get('low_fps_hi', 20.0))
+    low_lo = float(router_cfg.get('low_fps_lo', 13.0))
+    if observation_fps is None or observation_fps <= 0.0:
+        is_low_fps = 0.0
+    else:
+        is_low_fps = float(np.clip((low_hi-float(observation_fps))/max(low_hi-low_lo, 1e-6), 0.0, 1.0))
+
+    inv_tb = float(np.clip(theta[0], 0.5, 2.5))
+    inv_tr = float(np.clip(theta[1], 0.5, 2.5))
+    g_logits = theta[2:7]
+    g_sharp_r, g_sharp_b, g_fps = float(theta[7]), float(theta[8]), float(theta[9])
+
+    pb = _temp_scale_probs(np.asarray(body, dtype=np.float64), inv_tb)
+    pr = _temp_scale_probs(np.asarray(rgb, dtype=np.float64), inv_tr)
+    sharp_b = 1.0 - _norm_entropy(pb)
+    sharp_r = 1.0 - _norm_entropy(pr)
+    base_logit = (g_logits[:, None]*_ROUTER_GROUP_MASKS).sum(axis=0)
+    dyn_logit = base_logit + g_sharp_r*sharp_r - g_sharp_b*sharp_b + g_fps*is_low_fps
+    w_rgb = 1.0/(1.0 + np.exp(-np.clip(dyn_logit, -8.0, 8.0)))
+
+    if mode == 'poe_gate':
+        log_f = (1.0-w_rgb)*np.log(np.clip(pb, 1e-7, 1.0)) + w_rgb*np.log(np.clip(pr, 1e-7, 1.0))
+        log_f -= log_f.max()
+        out = np.exp(log_f)
+        return (out/out.sum()).astype(np.float32)
+
+    out = (1.0-w_rgb)*pb + w_rgb*pr
+    return (out/out.sum()).astype(np.float32)
 
 
 def fuse_probabilities(body, rgb, ntu_rgb_weight=.08):
@@ -207,7 +362,8 @@ def fuse_probabilities(body, rgb, ntu_rgb_weight=.08):
 
 class SegmentActionBackend:
     def __init__(self, pose_model, body_engine, rgb_engine, min_score=.02,
-                 confidence=.35, observations=48, ntu_rgb_weight=.08):
+                 confidence=.35, observations=48, ntu_rgb_weight=.08,
+                 crop_mode='A', router=None):
         self.pose_model = pose_model
         self.body = SkeletonActionBackend(engine=body_engine, modality='jb',
                                          prenorm_mode='fix', min_motion=0.)
@@ -219,10 +375,28 @@ class SegmentActionBackend:
             raise ValueError('RGB action engine must take (N, 2*K, 3, 192, 192)')
         self.rgb_n_per_view = int(shape[1])//2
         self.ntu_rgb_weight = float(ntu_rgb_weight)
+        self.crop_mode = str(crop_mode or 'A').upper()
+        self.router = dict(router) if isinstance(router, dict) and 'theta' in router else None
         self.min_score = float(min_score)
         self.confidence = float(confidence)
         self.observations = int(observations)
         self.last_error = None
+
+    def warmup(self):
+        """Run one dummy pass per segment TensorRT engine so case 1 sees warm latency."""
+        for engine in (self.body._engine, self.rgb_engine):
+            infer = getattr(engine, 'infer', None)
+            shape = getattr(engine, 'optimization_shape', None) or getattr(engine, 'input_shape', None)
+            if not callable(infer) or not shape:
+                continue
+            try:
+                dims = tuple(int(d) for d in shape)
+                if any(d <= 0 for d in dims):
+                    continue
+                dtype = getattr(engine, 'input_dtype', None) or np.float32
+                infer(np.zeros(dims, dtype=dtype))
+            except Exception as error:
+                log.warning('Segment engine warmup skipped: %s', error)
 
     @classmethod
     def from_directory(cls, pose_model, directory, **kwargs):
@@ -238,6 +412,8 @@ class SegmentActionBackend:
             raise
         try:
             kwargs.setdefault('ntu_rgb_weight', files.get('rgb_ntu_weight', .08))
+            kwargs.setdefault('crop_mode', files.get('crop_mode', 'A'))
+            kwargs.setdefault('router', files.get('router'))
             return cls(pose_model, body, rgb, **kwargs)
         except Exception:
             body.close()
@@ -324,12 +500,18 @@ class SegmentActionBackend:
         body = self.body._run(blob)
         if not looks_like_probabilities(body):
             body = softmax(body)
-        rgb_blob = build_rgb_input([rgb_images[i] for i in image_indices], primary_records)
+        rgb_blob = build_rgb_input([rgb_images[i] for i in image_indices],
+                                   primary_records, crop_mode=self.crop_mode)
         raw_rgb = np.asarray(self.rgb_engine.infer(rgb_blob)[0], np.float32).reshape(-1)
         rgb = raw_rgb if looks_like_probabilities(raw_rgb) else softmax(raw_rgb)
         if body.shape != (126,) or rgb.shape != (126,):
             raise ValueError('segment action heads must both emit 126 classes')
-        probabilities = fuse_probabilities(body, rgb, self.ntu_rgb_weight)
+        if self.router is not None:
+            span_s = float(received[-1][0] - received[0][0]) if len(received) > 1 else 0.0
+            obs_fps = (len(received) - 1)/span_s if span_s > 1e-3 else 30.0
+            probabilities = fuse_calibrated_router(body, rgb, self.router, observation_fps=obs_fps)
+        else:
+            probabilities = fuse_probabilities(body, rgb, self.ntu_rgb_weight)
         action_id = int(probabilities.argmax())+1
         score = float(probabilities[action_id-1])
         activity = None

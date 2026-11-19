@@ -591,21 +591,39 @@ class _PoseNode(Node):
             except queue.Full:
                 pass
 
+    def _next_worker_timeout(self) -> float:
+        timeout = 0.1 if self._activity_idle_flush_s > 0.0 else 1.0
+        if self._segment_buffer is not None:
+            preview_done = (
+                self._segment_preview is not None
+                and self._segment_preview[0][0] == self._last_image_received_at
+            )
+            wait_until = getattr(self._segment_buffer, "next_wait_s", None)
+            if callable(wait_until):
+                wait_s = wait_until(
+                    time.monotonic(),
+                    None if preview_done else self._activity_idle_flush_s,
+                )
+                if wait_s is not None:
+                    return max(.001, min(timeout, wait_s))
+            elif preview_done:
+                remaining = (self._last_image_received_at + self._segment_buffer.quiet_s
+                             - time.monotonic())
+                return max(.001, min(timeout, remaining))
+        elif (self._activity_idle_flush_s > 0.0 and self._idle_persons
+              and self._last_image_received_at > self._idle_finalized_at):
+            remaining = (self._last_image_received_at + self._activity_idle_flush_s
+                         - time.monotonic())
+            return max(.001, min(timeout, remaining))
+        return timeout
+
     def _inference_worker(self):
         import cv2
         from plugins.vision_runtime import decode_poses
 
         while not self._stop_event.is_set():
             try:
-                timeout = 0.1 if self._activity_idle_flush_s > 0.0 else 1.0
-                if (self._segment_preview is not None
-                        and self._segment_preview[0][0] == self._last_image_received_at):
-                    # Wake at the confirmation boundary even if the preview
-                    # finished very close to it.
-                    remaining = (self._last_image_received_at + self._segment_buffer.quiet_s
-                                 - time.monotonic())
-                    timeout = max(.001, min(timeout, remaining))
-                item = self._frame_queue.get(timeout=timeout)
+                item = self._frame_queue.get(timeout=self._next_worker_timeout())
             except queue.Empty:
                 try:
                     self._flush_idle_activity()
@@ -1541,13 +1559,17 @@ class PosePerceptionPlugin:
             directory = seed if os.path.isdir(seed) else "/models/action-segment"
         with self._segment_model_lock:
             if self._segment_model is None:
-                self._segment_model = SegmentActionBackend.from_directory(
+                model = SegmentActionBackend.from_directory(
                     self._model, directory)
+                model.warmup()
+                self._segment_model = model
         return SegmentActionBackend(
             self._model, self._segment_model.body._engine,
             self._segment_model.rgb_engine,
             min_score=merged["action_min_score"], confidence=merged["confidence"],
-            ntu_rgb_weight=self._segment_model.ntu_rgb_weight)
+            ntu_rgb_weight=self._segment_model.ntu_rgb_weight,
+            crop_mode=self._segment_model.crop_mode,
+            router=self._segment_model.router)
 
     # ── engine ───────────────────────────────────────────────────────────
 
