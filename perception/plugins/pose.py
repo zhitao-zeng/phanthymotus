@@ -572,9 +572,10 @@ class _PoseNode(Node):
             return
         now = time.monotonic()
         self._last_image_received_at = now
+        will_infer = (now - self._last_inference_time) >= self._frame_interval
         if self._segment_buffer is not None:
-            self._segment_buffer.append(msg.data, now)
-        if now - self._last_inference_time < self._frame_interval:
+            self._segment_buffer.append(msg.data if will_infer else b"", now)
+        if not will_infer:
             return
         self._last_inference_time = now
         item = (now, msg.data) if self._segment_buffer is not None else msg.data
@@ -583,7 +584,11 @@ class _PoseNode(Node):
             self._frame_queue.put_nowait(item)
         except queue.Full:
             try:
-                self._frame_queue.get_nowait()
+                dropped = self._frame_queue.get_nowait()
+                if self._segment_buffer is not None and isinstance(dropped, tuple):
+                    drop_payload = getattr(self._segment_buffer, "drop_payload", None)
+                    if callable(drop_payload):
+                        drop_payload(dropped[0])
             except queue.Empty:
                 pass
             try:
@@ -731,6 +736,15 @@ class _PoseNode(Node):
                 self._last_prediction = {**stats, "segment_error": str(error)}
                 raise
             inference_ms = round((time.perf_counter()-started)*1000, 2)
+            if not confirmed and self._frame_queue.empty():
+                pop_same = getattr(self._segment_buffer, "pop_if_same_ready", None)
+                if callable(pop_same):
+                    same_ready = pop_same(time.monotonic(), key[0])
+                    if same_ready is not None:
+                        records, stats = same_ready
+                        received = [record for record in records if record[2] is not None]
+                        stats['processed_observations'] = len(received)
+                        confirmed = True
         if not confirmed:
             self._segment_preview = (key, result, inference_ms)
             return
@@ -1569,7 +1583,8 @@ class PosePerceptionPlugin:
             min_score=merged["action_min_score"], confidence=merged["confidence"],
             ntu_rgb_weight=self._segment_model.ntu_rgb_weight,
             crop_mode=self._segment_model.crop_mode,
-            router=self._segment_model.router)
+            router=self._segment_model.router,
+            rgb_head=self._segment_model.rgb_head)
 
     # ── engine ───────────────────────────────────────────────────────────
 

@@ -64,7 +64,7 @@ class _SkeletonFrame:
 
 
 class SegmentBuffer:
-    def __init__(self, quiet_s=.4, max_s=30., max_bytes=32*1024**2):
+    def __init__(self, quiet_s=.4, max_s=30., max_bytes=16*1024**2):
         self.quiet_s = float(quiet_s)
         self.max_s = float(max_s)
         self.max_bytes = int(max_bytes)
@@ -113,6 +113,25 @@ class SegmentBuffer:
             if record is not None:
                 record[2] = (np.array(boxes, copy=True), np.array(scores, copy=True),
                              np.array(keypoints, copy=True), tuple(image_shape[:2]))
+
+    def drop_payload(self, now):
+        """Release JPEG bytes for a frame evicted from the pose queue before inference."""
+        with self._lock:
+            record = self._by_time.get(float(now))
+            if record is not None and record[2] is None and record[1]:
+                self._bytes -= len(record[1])
+                record[1] = b''
+
+    def pop_if_same_ready(self, now, last_t):
+        """Confirm an in-flight preview immediately if quiet_s elapsed with no new frames."""
+        with self._lock:
+            if (not self._ready and self._frames
+                    and self._frames[-1][0] == float(last_t)
+                    and float(now) - float(last_t) >= self.quiet_s):
+                result = self._take()
+                self._forget(result[0])
+                return result
+        return None
 
     def _forget(self, frames):
         for record in frames:
@@ -302,6 +321,109 @@ def build_rgb_input(rgb_frames, keypoints, crop_mode='A'):
     return ((frames-mean)/std)[None]
 
 
+def build_rgb_views_from_crops(people, hands):
+    mean = np.array([123.675, 116.28, 103.53], np.float32)[None, :, None, None]
+    std = np.array([58.395, 57.12, 57.375], np.float32)[None, :, None, None]
+    vp = ((np.asarray(people, np.float32)-mean)/std)[None]
+    vh = ((np.asarray(hands, np.float32)-mean)/std)[None]
+    return vp, vh
+
+
+def prepare_rgb_crop_geometry(keypoints, frame_hw, crop_mode='A'):
+    p0 = np.asarray(keypoints, np.float32)
+    h, w = int(frame_hw[0]), int(frame_hw[1])
+    cx, cy, side = w*.5, h*.5, float(min(h, w))
+    valid = p0[..., 2] > .20
+    if valid.any():
+        xs, ys = p0[..., 0][valid], p0[..., 1][valid]
+        cx = .5*(float(np.percentile(xs, 5))+float(np.percentile(xs, 95)))
+        cy = .5*(float(np.percentile(ys, 3))+float(np.percentile(ys, 97)))
+        side = max(float(np.percentile(xs, 97)-np.percentile(xs, 3)),
+                   float(np.percentile(ys, 98)-np.percentile(ys, 2)))*1.30
+    use_crop_e = str(crop_mode or 'A').upper() == 'E'
+    p_side = max(side, 120.)
+    if use_crop_e:
+        return p0, cx, cy, side, p_side, True, _clip_crop_mode_e(p0, w, h, p_side), True
+    wrist_scores = []
+    for wi in [9, 10]:
+        ok = p0[:, wi, 2] > .25
+        wrist_scores.append(float(-p0[ok, wi, 1].mean()) if ok.any() else -9999.)
+    return p0, cx, cy, side, p_side, False, 'A', (wrist_scores[0] >= wrist_scores[1])
+
+
+def crop_rgb_pair_for_frame(rgb, fi, geom):
+    p0, cx, cy, side, p_side, use_crop_e, sub_mode, prefer_left = geom
+    ch, cw = rgb.shape[:2]
+    p_crop = crop_square(rgb, cx, cy, p_side).transpose(2, 0, 1)
+    if use_crop_e:
+        hx, hy, hs = _hand_crop_for_frame_e(sub_mode, p0[fi], cx, cy, p_side, cw, ch)
+    else:
+        hx, hy, hs = cx, cy-.12*side, max(.42*side, 96.)
+        kp = p0[fi]
+        points = []
+        for wi, ei in [(9, 7), (10, 8)]:
+            if kp[wi, 2] > .20:
+                x, y = float(kp[wi, 0]), float(kp[wi, 1])
+                if kp[ei, 2] > .20:
+                    x += .30*(x-float(kp[ei, 0]))
+                    y += .30*(y-float(kp[ei, 1]))
+                points.append((np.clip(x, 0, cw-1), np.clip(y, 0, ch-1)))
+        if len(points) == 2:
+            (x1, y1), (x2, y2) = points
+            distance = float(np.hypot(x1-x2, y1-y2))
+            if distance <= .50*side:
+                hx, hy = .5*(x1+x2), .5*(y1+y2)
+                hs = max(distance+.34*side, .38*side, 96.)
+            else:
+                hx, hy = points[0 if prefer_left else 1]
+                hs = max(.38*side, 96.)
+        elif points:
+            hx, hy = points[0]
+            hs = max(.38*side, 96.)
+    h_crop = crop_square(rgb, hx, hy, hs).transpose(2, 0, 1)
+    return p_crop, h_crop
+
+
+_ERF_VEC = np.vectorize(math.erf, otypes=[np.float64])
+
+
+def fuse_dual_event_head(fp, fh, vh_norm, head_cfg):
+    """Apply DualEventMotionHead in NumPy over B=1 single-view features (1, T', D)."""
+    b, t = vh_norm.shape[:2]
+    eh_raw = np.zeros((b, t), dtype=np.float32)
+    if t >= 2:
+        eh_raw[:, 1:] = np.abs(vh_norm[:, 1:] - vh_norm[:, :-1]).mean(axis=(2, 3, 4))
+    tp = fp.shape[1]
+    if tp != t and tp > 0 and t % tp == 0:
+        eh_seq = eh_raw.reshape(b, tp, t // tp).mean(axis=-1, keepdims=True)
+    else:
+        eh_seq = eh_raw[:, :tp, None]
+
+    f_cat = np.concatenate([np.asarray(fp, np.float32), np.asarray(fh, np.float32)], axis=-1)
+    mean_f = f_cat.mean(axis=1)
+    df_cat = np.zeros_like(f_cat)
+    if tp >= 2:
+        df_cat[:, 1:] = f_cat[:, 1:] - f_cat[:, :-1]
+
+    pre_act = (
+        f_cat @ head_cfg['att_f_w'].T
+        + np.abs(df_cat) @ head_cfg['att_d_w'].T
+        + eh_seq @ head_cfg['att_e_w'].T
+        + head_cfg['att_e_b']
+    )
+    x64 = np.asarray(pre_act, dtype=np.float64)
+    h_att = (0.5 * x64 * (1.0 + _ERF_VEC(x64 * (1.0 / math.sqrt(2.0))))).astype(np.float32)
+    att_logits = h_att @ head_cfg['att_out_w'].T + head_cfg['att_out_b']
+    att_logits = att_logits - att_logits.max(axis=1, keepdims=True)
+    alpha = np.exp(att_logits)
+    alpha = alpha / alpha.sum(axis=1, keepdims=True)
+
+    ev_res = (alpha * f_cat).sum(axis=1) - mean_f
+    dv_res = (alpha * df_cat).sum(axis=1)
+    pooled = mean_f + head_cfg['gamma_ev'] * ev_res + head_cfg['gamma_dv'] * dv_res
+    return (pooled @ head_cfg['fc_w'].T + head_cfg['fc_b']).astype(np.float32)
+
+
 def _temp_scale_probs(probs, inv_t):
     lp = np.log(np.clip(probs, 1e-7, 1.0))*float(inv_t)
     lp -= lp.max()
@@ -363,17 +485,26 @@ def fuse_probabilities(body, rgb, ntu_rgb_weight=.08):
 class SegmentActionBackend:
     def __init__(self, pose_model, body_engine, rgb_engine, min_score=.02,
                  confidence=.35, observations=48, ntu_rgb_weight=.08,
-                 crop_mode='A', router=None):
+                 crop_mode='A', router=None, rgb_head=None):
         self.pose_model = pose_model
         self.body = SkeletonActionBackend(engine=body_engine, modality='jb',
                                          prenorm_mode='fix', min_motion=0.)
         self.rgb_engine = rgb_engine
+        self.rgb_head = ({k: np.asarray(v, np.float32) for k, v in rgb_head.items()}
+                         if rgb_head is not None else None)
+        self.rgb_single_view = self.rgb_head is not None
         shape = getattr(rgb_engine, 'input_shape', None) or getattr(
             rgb_engine, 'optimization_shape', None)
-        if (shape is None or len(shape) != 5 or tuple(shape[2:]) != (3, 192, 192)
-                or int(shape[1]) <= 0 or int(shape[1]) % 2):
-            raise ValueError('RGB action engine must take (N, 2*K, 3, 192, 192)')
-        self.rgb_n_per_view = int(shape[1])//2
+        if self.rgb_single_view:
+            if (shape is None or len(shape) != 5 or tuple(shape[2:]) != (3, 192, 192)
+                    or int(shape[1]) <= 0):
+                raise ValueError('Single-view RGB engine must take (N, K, 3, 192, 192)')
+            self.rgb_n_per_view = int(shape[1])
+        else:
+            if (shape is None or len(shape) != 5 or tuple(shape[2:]) != (3, 192, 192)
+                    or int(shape[1]) <= 0 or int(shape[1]) % 2):
+                raise ValueError('RGB action engine must take (N, 2*K, 3, 192, 192)')
+            self.rgb_n_per_view = int(shape[1])//2
         self.ntu_rgb_weight = float(ntu_rgb_weight)
         self.crop_mode = str(crop_mode or 'A').upper()
         self.router = dict(router) if isinstance(router, dict) and 'theta' in router else None
@@ -411,6 +542,9 @@ class SegmentActionBackend:
             body.close()
             raise
         try:
+            if 'rgb_head' in files and files['rgb_head'] and 'rgb_head' not in kwargs:
+                with np.load(root/files['rgb_head']) as npz:
+                    kwargs['rgb_head'] = {k: np.array(npz[k], dtype=np.float32) for k in npz.files}
             kwargs.setdefault('ntu_rgb_weight', files.get('rgb_ntu_weight', .08))
             kwargs.setdefault('crop_mode', files.get('crop_mode', 'A'))
             kwargs.setdefault('router', files.get('router'))
@@ -429,6 +563,7 @@ class SegmentActionBackend:
                               min(self.observations, len(received))).round().astype(int)
         samples = [received[i] for i in indices]
         image_indices = list(rgb_frame_indices(len(samples), self.rgb_n_per_view))
+        image_index_set = set(image_indices)
         rgb_images, frame_records = {}, []
         tracker = PoseTracker(timeout_s=2., history_s=30.,
                               frame_factory=_SkeletonFrame)
@@ -449,18 +584,13 @@ class SegmentActionBackend:
 
         cached_poses = len(samples[0]) == 3
         if cached_poses:
-            for fi, (_, data, pose) in enumerate(samples):
+            for fi, (_, _data, pose) in enumerate(samples):
                 if stop_event is not None and stop_event.is_set():
                     return None
                 if pose is None:
                     raise ValueError('segment observation has no processed pose')
                 boxes, scores, kps, shape = pose
                 record_detections(fi, shape, boxes, scores, kps)
-                if fi in image_indices:
-                    image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-                    if image is None:
-                        raise ValueError('segment contains an undecodable JPEG')
-                    rgb_images[fi] = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         for start in ([] if cached_poses else range(0, len(samples), 8)):
             if stop_event is not None and stop_event.is_set():
                 return None
@@ -474,7 +604,7 @@ class SegmentActionBackend:
             for offset, (image, (raw, meta)) in enumerate(zip(images, outputs)):
                 fi = start+offset
                 h, w = image.shape[:2]
-                if fi in image_indices:
+                if fi in image_index_set:
                     rgb_images[fi] = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 boxes, scores, kps = decode_poses(raw, meta, self.confidence)
                 record_detections(fi, (h, w), boxes, scores, kps)
@@ -500,9 +630,48 @@ class SegmentActionBackend:
         body = self.body._run(blob)
         if not looks_like_probabilities(body):
             body = softmax(body)
-        rgb_blob = build_rgb_input([rgb_images[i] for i in image_indices],
-                                   primary_records, crop_mode=self.crop_mode)
-        raw_rgb = np.asarray(self.rgb_engine.infer(rgb_blob)[0], np.float32).reshape(-1)
+
+        snapshot_bgr = None
+        if cached_poses:
+            # Stream-decode one frame at a time so 16 full-HD frames never coexist in RAM.
+            crops = {}
+            geom = None
+            for fi in sorted(image_index_set | {snapshot_index}):
+                if stop_event is not None and stop_event.is_set():
+                    return None
+                bgr = cv2.imdecode(np.frombuffer(samples[fi][1], np.uint8), cv2.IMREAD_COLOR)
+                if bgr is None:
+                    raise ValueError('segment contains an undecodable JPEG')
+                if fi == snapshot_index:
+                    snapshot_bgr = bgr
+                if fi in image_index_set:
+                    rgb_img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    if geom is None:
+                        geom = prepare_rgb_crop_geometry(
+                            primary_records, rgb_img.shape[:2], crop_mode=self.crop_mode)
+                    crops[fi] = crop_rgb_pair_for_frame(rgb_img, fi, geom)
+                    del rgb_img
+                if fi != snapshot_index:
+                    del bgr
+            vp_blob, vh_blob = build_rgb_views_from_crops(
+                [crops[i][0] for i in image_indices],
+                [crops[i][1] for i in image_indices],
+            )
+            del crops
+        else:
+            rgb_blob_full = build_rgb_input([rgb_images[i] for i in image_indices],
+                                            primary_records, crop_mode=self.crop_mode)
+            vp_blob = rgb_blob_full[:, :self.rgb_n_per_view]
+            vh_blob = rgb_blob_full[:, self.rgb_n_per_view:]
+
+        if self.rgb_single_view:
+            fp = np.asarray(self.rgb_engine.infer(vp_blob)[0], np.float32)
+            fh = np.asarray(self.rgb_engine.infer(vh_blob)[0], np.float32)
+            raw_rgb = fuse_dual_event_head(fp, fh, vh_blob, self.rgb_head).reshape(-1)
+        else:
+            rgb_blob = np.concatenate([vp_blob, vh_blob], axis=1)
+            raw_rgb = np.asarray(self.rgb_engine.infer(rgb_blob)[0], np.float32).reshape(-1)
+        del vp_blob, vh_blob
         rgb = raw_rgb if looks_like_probabilities(raw_rgb) else softmax(raw_rgb)
         if body.shape != (126,) or rgb.shape != (126,):
             raise ValueError('segment action heads must both emit 126 classes')
@@ -520,7 +689,9 @@ class SegmentActionBackend:
             activity = {'action_id': action_id, 'name': name, 'name_zh': zh,
                         'score': round(score, 3), 'source': 'segment-dual'}
         _, size, records = frame_records[snapshot_index]
-        if snapshot_index in rgb_images:
+        if snapshot_bgr is not None:
+            image = snapshot_bgr
+        elif snapshot_index in rgb_images:
             image = cv2.cvtColor(rgb_images[snapshot_index], cv2.COLOR_RGB2BGR)
         else:
             image = cv2.imdecode(np.frombuffer(samples[snapshot_index][1], np.uint8), cv2.IMREAD_COLOR)

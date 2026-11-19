@@ -495,3 +495,124 @@ def test_crop_e_router_and_warmup_propagate_from_manifest(tmp_path, monkeypatch)
     f_hi = fuse_calibrated_router(pb, pr, {'mode': 'poe_gate', 'theta': theta}, observation_fps=30.0)
     f_lo = fuse_calibrated_router(pb, pr, {'mode': 'poe_gate', 'theta': theta}, observation_fps=12.0)
     assert f_lo[55] > f_hi[55]
+
+
+def test_preview_finishing_after_quiet_boundary_publishes_immediately_and_evicts_unposed_jpegs(monkeypatch):
+    now = 20.0
+    monkeypatch.setattr(pose, 'time', SimpleNamespace(
+        monotonic=lambda: now, perf_counter=time.perf_counter, time=time.time))
+
+    class SlowPreview(_SegmentModel):
+        def recognize(self, received, stop_event):
+            nonlocal now
+            result = super().recognize(received, stop_event)
+            now = 20.60  # Cross quiet_s=0.40s while segment inference is in flight.
+            return result
+
+    backend = SlowPreview()
+    node = pose._PoseNode('/cam/segment', None, .35, 10., 'slow_preview',
+                          classifier=_FinalClassifier(), segment_backend=backend)
+    messages = _publisher(node, node._output_topic).messages
+    row = np.array(_standing_row(), np.float32)
+    buffer = node._segment_buffer
+
+    # Simulate throttled + queue-evicted frames releasing JPEG bytes while keeping counts.
+    for i in range(4):
+        now = 20.0 + i * .03
+        node._image_cb(_FakeCompressedImage(b'x' * 4096))
+    # Drain the single queued posed item so _frame_queue is empty, and attach 4 poses.
+    while not node._frame_queue.empty():
+        node._frame_queue.get_nowait()
+    # Throttled/evicted frames should have released their raw JPEG bytes before posing.
+    assert buffer._bytes <= 4096
+    for i in range(4):
+        ts = 20.0 + i * .03
+        buffer._frames[i][1] = b'j' * 128
+        buffer.record_pose(ts, row[None, :4], row[None, 4],
+                           row[6:].reshape(1, 17, 3), (480, 640, 3))
+
+    now = 20.32  # Past preview_s (20.09 + 0.20 = 20.29) before quiet_s (20.49) -> starts preview.
+    node._flush_received_segment()
+    # Because SlowPreview crossed quiet_s=0.40s with no new frames, it confirms in the same call!
+    assert len(messages) == 1
+    assert node._segment_preview is None
+    assert node._last_prediction['received_frames'] == 4
+    assert node._last_prediction['processed_observations'] == 4
+
+
+def test_single_view_rgb_head_and_streaming_crop_parity(tmp_path, monkeypatch):
+    from utils import tensorrt_runtime
+    from plugins.pose_segment import (
+        build_rgb_input, build_rgb_views_from_crops,
+        crop_rgb_pair_for_frame, prepare_rgb_crop_geometry,
+    )
+
+    rng = np.random.default_rng(123)
+    imgs = [rng.integers(0, 255, size=(240, 320, 3), dtype=np.uint8) for _ in range(16)]
+    kps = rng.uniform(20., 200., size=(16, 17, 3)).astype(np.float32)
+    kps[:, :, 2] = .9
+
+    for mode in ('A', 'E'):
+        ref = build_rgb_input(imgs, kps, crop_mode=mode)
+        geom = prepare_rgb_crop_geometry(kps, imgs[0].shape[:2], crop_mode=mode)
+        pairs = [crop_rgb_pair_for_frame(imgs[i], i, geom) for i in range(16)]
+        vp, vh = build_rgb_views_from_crops([p[0] for p in pairs], [p[1] for p in pairs])
+        np.testing.assert_array_equal(np.concatenate([vp, vh], axis=1), ref)
+
+    seen_shapes = []
+
+    class SVEngine:
+        input_dtype = np.float32
+
+        def __init__(self, path, **kwargs):
+            self.name = path.name
+            self.input_shape = ((1, 2, 100, 17, 6) if path.name == 'body.engine'
+                                else (1, 16, 3, 192, 192))
+
+        def infer(self, blob):
+            seen_shapes.append((self.name, blob.shape))
+            if self.name == 'body.engine':
+                out = np.zeros((1, 126), np.float32)
+                out[0, 0] = 5.0
+                return [out]
+            return [np.ones((1, 16, 8), np.float32) * 0.25]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tensorrt_runtime, 'TensorRTEngine', SVEngine)
+    np.savez(
+        tmp_path / 'head.npz',
+        att_f_w=np.zeros((4, 16), np.float32),
+        att_d_w=np.zeros((4, 16), np.float32),
+        att_e_w=np.zeros((4, 1), np.float32),
+        att_e_b=np.zeros((4,), np.float32),
+        att_out_w=np.zeros((1, 4), np.float32),
+        att_out_b=np.zeros((1,), np.float32),
+        gamma_ev=np.zeros((1, 16), np.float32),
+        gamma_dv=np.zeros((1, 16), np.float32),
+        fc_w=np.zeros((126, 16), np.float32),
+        fc_b=np.linspace(0., 6., 126, dtype=np.float32),
+    )
+    (tmp_path / 'models.json').write_text(json.dumps({
+        'body_engine': 'body.engine',
+        'rgb_engine': 'sv.engine',
+        'rgb_head': 'head.npz',
+        'crop_mode': 'E',
+    }))
+    backend = SegmentActionBackend.from_directory(object(), tmp_path)
+    plugin, _ = _plugin({'activity_mode': 'segment'})
+    plugin._segment_model = backend
+    monkeypatch.setenv('ACTION_SEGMENT_MODEL_DIR', str(tmp_path))
+    instance = plugin._segment_backend_for(plugin._merged_config('sv-inst'))
+    assert instance.rgb_single_view is True
+    assert instance.rgb_n_per_view == 16
+
+    row = np.array(_standing_row(), np.float32)
+    decoded = (row[None, :4], row[None, 4], row[6:].reshape(1, 17, 3), (480, 640))
+    received = [(i * .08, frame_bytes(640, 480), decoded) for i in range(16)]
+    res = instance.recognize(received)
+    assert res is not None and np.isclose(res['probabilities'].sum(), 1.0, atol=1e-5)
+    assert seen_shapes.count(('sv.engine', (1, 16, 3, 192, 192))) == 2
+
+
