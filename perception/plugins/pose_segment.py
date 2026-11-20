@@ -349,6 +349,17 @@ def build_rgb_views_from_crops(people, hands):
     return vp, vh
 
 
+def build_ctx_view_from_crops(ctx_crops, target_len):
+    mean = np.array([123.675, 116.28, 103.53], np.float32)[None, :, None, None]
+    std = np.array([58.395, 57.12, 57.375], np.float32)[None, :, None, None]
+    vc = ((np.asarray(ctx_crops, np.float32)-mean)/std)[None]
+    ctx_k = int(vc.shape[1])
+    if ctx_k <= 0 or ctx_k == int(target_len):
+        return vc
+    rep = max(1, (int(target_len) + ctx_k - 1) // ctx_k)
+    return np.repeat(vc, rep, axis=1)[:, :int(target_len)]
+
+
 def prepare_rgb_crop_geometry(keypoints, frame_hw, crop_mode='A'):
     p0 = np.asarray(keypoints, np.float32)
     h, w = int(frame_hw[0]), int(frame_hw[1])
@@ -469,14 +480,27 @@ def make_person_roi_patch(bgr, boxes, scores, keypoints, roi_hw=320):
     return _crop_square_patch(bgr, cx, cy, side, roi_hw)
 
 
-def make_dual_roi_patch(bgr, boxes, scores, keypoints, person_hw=224, hand_hw=192):
-    """Pre-crop native-res person (person_hw) and upper/hand (hand_hw) RGB patches."""
+def make_context_patch(bgr, ctx_hw=192):
+    """Build a letterboxed full-frame RGB context patch (uint8 HxWx3)."""
+    import cv2
+    from plugins.vision_runtime import letterbox
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    canvas, _ = letterbox(rgb, int(ctx_hw), int(ctx_hw))
+    return canvas
+
+
+def make_dual_roi_patch(bgr, boxes, scores, keypoints, person_hw=224, hand_hw=192,
+                        ctx_hw=0):
+    """Pre-crop native-res person (person_hw), hand (hand_hw), and optional context RGB patches."""
     h, w = bgr.shape[:2]
     kp, cx, cy, p_full_side, body_side = _primary_person_geom(
         boxes, scores, keypoints, h, w)
     p_pair = _crop_square_patch(bgr, cx, cy, p_full_side, person_hw)
+    ctx_rgb = make_context_patch(bgr, ctx_hw=ctx_hw) if int(ctx_hw) > 0 else None
+    def _pack(h_pair):
+        return (p_pair, h_pair, ctx_rgb) if ctx_rgb is not None else (p_pair, h_pair)
     if kp is None or body_side <= 0.0:
-        return (p_pair, None)
+        return _pack(None)
     p_side_est = max(body_side*1.30, 120.)
     pts = _extended_wrists(kp, w, h, extension=.35)
     sh_pts = [(float(kp[i, 0]), float(kp[i, 1])) for i in (5, 6) if kp[i, 2] > .20]
@@ -487,14 +511,14 @@ def make_dual_roi_patch(bgr, boxes, scores, keypoints, person_hw=224, hand_hw=19
     elif sh_pts:
         anchors.append((sh_pts[0][0], sh_pts[0][1]+.16*p_side_est))
     if not anchors:
-        return (p_pair, None)
+        return _pack(None)
     ax, ay = [p[0] for p in anchors], [p[1] for p in anchors]
     hx, hy = .5*(min(ax)+max(ax)), .5*(min(ay)+max(ay))
     span = max(max(ax)-min(ax), max(ay)-min(ay))
     hs = min(max(span+.32*p_side_est, .62*p_side_est, 144.), 1.15*p_side_est)
     if hs >= .88*p_full_side:
-        return (p_pair, None)
-    return (p_pair, _crop_square_patch(bgr, hx, hy, hs, hand_hw))
+        return _pack(None)
+    return _pack(_crop_square_patch(bgr, hx, hy, hs, hand_hw))
 
 
 def _patch_covers_square(patch_rgb, roi_meta, cx, cy, side, cw, ch, tol=4.0):
@@ -518,7 +542,7 @@ def crop_rgb_pair_from_patch(rgb_patch, roi_meta, fi, geom, frame_hw):
     p0, cx, cy, side, p_side, use_crop_e, sub_mode, prefer_left = geom
     ch, cw = int(frame_hw[0]), int(frame_hw[1])
     if roi_meta is None and isinstance(rgb_patch, tuple):
-        p_pair, h_pair = rgb_patch
+        p_pair, h_pair = rgb_patch[0], rgb_patch[1]
         p_rgb, p_meta = p_pair
     else:
         p_rgb, p_meta, h_pair = rgb_patch, roi_meta, None
@@ -560,8 +584,25 @@ def crop_rgb_pair_from_patch(rgb_patch, roi_meta, fi, geom, frame_hw):
 _ERF_VEC = np.vectorize(math.erf, otypes=[np.float64])
 
 
-def fuse_dual_event_head(fp, fh, vh_norm, head_cfg):
-    """Apply DualEventMotionHead in NumPy over B=1 single-view features (1, T', D)."""
+def _gelu_exact(x):
+    x64 = np.asarray(x, dtype=np.float64)
+    return (0.5 * x64 * (1.0 + _ERF_VEC(x64 * (1.0 / math.sqrt(2.0))))).astype(np.float32)
+
+
+def _normalize_rgb_head_cfg(raw_cfg):
+    cfg = {}
+    for k, v in raw_cfg.items():
+        if k == 'head_type':
+            cfg[k] = str(v.item()) if hasattr(v, 'item') else str(v)
+        elif k == 'ctx_frames':
+            cfg[k] = int(v.item()) if hasattr(v, 'item') else int(v)
+        else:
+            cfg[k] = np.asarray(v, dtype=np.float32)
+    return cfg
+
+
+def fuse_dual_event_head(fp, fh, vh_norm, head_cfg, fc=None):
+    """Apply DualEventMotionHead (with optional context residual branch) in NumPy."""
     b, t = vh_norm.shape[:2]
     eh_raw = np.zeros((b, t), dtype=np.float32)
     if t >= 2:
@@ -578,14 +619,12 @@ def fuse_dual_event_head(fp, fh, vh_norm, head_cfg):
     if tp >= 2:
         df_cat[:, 1:] = f_cat[:, 1:] - f_cat[:, :-1]
 
-    pre_act = (
+    h_att = _gelu_exact(
         f_cat @ head_cfg['att_f_w'].T
         + np.abs(df_cat) @ head_cfg['att_d_w'].T
         + eh_seq @ head_cfg['att_e_w'].T
         + head_cfg['att_e_b']
     )
-    x64 = np.asarray(pre_act, dtype=np.float64)
-    h_att = (0.5 * x64 * (1.0 + _ERF_VEC(x64 * (1.0 / math.sqrt(2.0))))).astype(np.float32)
     att_logits = h_att @ head_cfg['att_out_w'].T + head_cfg['att_out_b']
     att_logits = att_logits - att_logits.max(axis=1, keepdims=True)
     alpha = np.exp(att_logits)
@@ -594,6 +633,30 @@ def fuse_dual_event_head(fp, fh, vh_norm, head_cfg):
     ev_res = (alpha * f_cat).sum(axis=1) - mean_f
     dv_res = (alpha * df_cat).sum(axis=1)
     pooled = mean_f + head_cfg['gamma_ev'] * ev_res + head_cfg['gamma_dv'] * dv_res
+    if fc is not None:
+        c_pool = np.asarray(fc, np.float32).mean(axis=1)
+        head_type = str(head_cfg.get('head_type', 'res_ctx'))
+        if head_type == 'res_ctx' and 'ctx_p_w' in head_cfg:
+            logits_ph = pooled @ head_cfg['fc_w'].T + head_cfg['fc_b']
+            h_ctx = _gelu_exact(
+                pooled @ head_cfg['ctx_p_w'].T
+                + c_pool @ head_cfg['ctx_c_w'].T
+                + head_cfg['ctx_c_b']
+            )
+            return (logits_ph + h_ctx @ head_cfg['ctx_fc_w'].T + head_cfg['ctx_fc_b']).astype(np.float32)
+        if head_type == 'gated_concat' and 'gate_p_w' in head_cfg:
+            h_g = _gelu_exact(
+                pooled @ head_cfg['gate_p_w'].T
+                + c_pool @ head_cfg['gate_c_w'].T
+                + head_cfg['gate_c_b']
+            )
+            g_logit = h_g @ head_cfg['gate_out_w'].T + head_cfg['gate_out_b']
+            g = 1.0 / (1.0 + np.exp(-np.clip(g_logit, -30.0, 30.0)))
+            feat_all = np.concatenate([pooled, g * c_pool], axis=-1).astype(np.float32)
+            return (feat_all @ head_cfg['fc_w'].T + head_cfg['fc_b']).astype(np.float32)
+        if 'ctx_frames' in head_cfg:
+            feat_all = np.concatenate([pooled, c_pool], axis=-1).astype(np.float32)
+            return (feat_all @ head_cfg['fc_w'].T + head_cfg['fc_b']).astype(np.float32)
     return (pooled @ head_cfg['fc_w'].T + head_cfg['fc_b']).astype(np.float32)
 
 
@@ -663,9 +726,11 @@ class SegmentActionBackend:
         self.body = SkeletonActionBackend(engine=body_engine, modality='jb',
                                          prenorm_mode='fix', min_motion=0.)
         self.rgb_engine = rgb_engine
-        self.rgb_head = ({k: np.asarray(v, np.float32) for k, v in rgb_head.items()}
+        self.rgb_head = (_normalize_rgb_head_cfg(rgb_head)
                          if rgb_head is not None else None)
         self.rgb_single_view = self.rgb_head is not None
+        self.rgb_ctx_frames = (int(self.rgb_head.get('ctx_frames', 0))
+                               if self.rgb_head is not None else 0)
         shape = getattr(rgb_engine, 'input_shape', None) or getattr(
             rgb_engine, 'optimization_shape', None)
         if self.rgb_single_view:
@@ -719,7 +784,7 @@ class SegmentActionBackend:
         try:
             if 'rgb_head' in files and files['rgb_head'] and 'rgb_head' not in kwargs:
                 with np.load(root/files['rgb_head']) as npz:
-                    kwargs['rgb_head'] = {k: np.array(npz[k], dtype=np.float32) for k in npz.files}
+                    kwargs['rgb_head'] = _normalize_rgb_head_cfg({k: npz[k] for k in npz.files})
             kwargs.setdefault('ntu_rgb_weight', files.get('rgb_ntu_weight', .08))
             kwargs.setdefault('crop_mode', files.get('crop_mode', 'A'))
             kwargs.setdefault('router', files.get('router'))
@@ -731,7 +796,7 @@ class SegmentActionBackend:
 
     def recognize(self, received, stop_event=None, *, need_image=True):
         import cv2
-        from plugins.vision_runtime import decode_poses
+        from plugins.vision_runtime import decode_poses, letterbox
         if len(received) < 4:
             return None
         indices = np.linspace(0, len(received)-1,
@@ -739,6 +804,9 @@ class SegmentActionBackend:
         samples = [received[i] for i in indices]
         image_indices = list(rgb_frame_indices(len(samples), self.rgb_n_per_view))
         image_index_set = set(image_indices)
+        ctx_indices = (list(rgb_frame_indices(len(samples), self.rgb_ctx_frames))
+                       if (self.rgb_single_view and self.rgb_ctx_frames > 0) else [])
+        ctx_index_set = set(ctx_indices)
         rgb_images, frame_records = {}, []
         tracker = PoseTracker(timeout_s=2., history_s=30.,
                               frame_factory=_SkeletonFrame)
@@ -782,7 +850,7 @@ class SegmentActionBackend:
             for offset, (image, (raw, meta)) in enumerate(zip(images, outputs)):
                 fi = start+offset
                 h, w = image.shape[:2]
-                if fi in image_index_set:
+                if fi in image_index_set or fi in ctx_index_set:
                     rgb_images[fi] = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 boxes, scores, kps = decode_poses(raw, meta, self.confidence)
                 record_detections(fi, (h, w), boxes, scores, kps)
@@ -812,6 +880,7 @@ class SegmentActionBackend:
         _, snap_wh, records = frame_records[snapshot_index]
         orig_w, orig_h = int(snap_wh[0]), int(snap_wh[1])
         snapshot_bgr = None
+        vc_blob = None
         if cached_poses:
             patched_received = [
                 (ri, rec[2][4]) for ri, rec in enumerate(received)
@@ -836,6 +905,24 @@ class SegmentActionBackend:
                         rgb_patch, roi_meta = patch_entry
                         crops[fi] = crop_rgb_pair_from_patch(
                             rgb_patch, roi_meta, fi, geom_orig, (orig_h, orig_w))
+                if ctx_indices:
+                    ctx_received = [
+                        (ri, entry[2]) for ri, entry in patched_received
+                        if isinstance(entry, tuple) and len(entry) >= 3 and entry[2] is not None
+                    ]
+                    if ctx_received:
+                        ctx_crops = []
+                        for ci in ctx_indices:
+                            p_entry = sample_patches.get(ci)
+                            if isinstance(p_entry, tuple) and len(p_entry) >= 3 and p_entry[2] is not None:
+                                ctx_rgb = p_entry[2]
+                            else:
+                                orig_ri = int(indices[ci])
+                                _, ctx_rgb = min(
+                                    ctx_received, key=lambda item: abs(item[0] - orig_ri))
+                            ctx_crops.append(ctx_rgb.transpose(2, 0, 1))
+                        vc_blob = build_ctx_view_from_crops(ctx_crops, self.rgb_n_per_view)
+                        del ctx_crops
                 if need_image:
                     snap_bytes = samples[snapshot_index][1]
                     if snap_bytes:
@@ -869,9 +956,11 @@ class SegmentActionBackend:
                 crop_flag = (cv2.IMREAD_REDUCED_COLOR_2
                              if min(orig_h, orig_w) >= 720 else cv2.IMREAD_COLOR)
                 crops = {}
+                ctx_map = {}
                 geom = None
-                target_indices = (sorted(image_index_set | {snapshot_index})
-                                  if need_image else sorted(image_index_set))
+                needed_rgb = image_index_set | ctx_index_set
+                target_indices = (sorted(needed_rgb | {snapshot_index})
+                                  if need_image else sorted(needed_rgb))
                 for fi in target_indices:
                     if stop_event is not None and stop_event.is_set():
                         return None
@@ -880,26 +969,30 @@ class SegmentActionBackend:
                         snapshot_bgr = cv2.imdecode(raw_buf, cv2.IMREAD_COLOR)
                         if snapshot_bgr is None:
                             raise ValueError('segment contains an undecodable JPEG')
-                    if fi in image_index_set:
+                    if fi in needed_rgb:
                         bgr = cv2.imdecode(raw_buf, crop_flag)
                         if bgr is None:
                             raise ValueError('segment contains an undecodable JPEG')
                         if need_image and fi == snapshot_index and snapshot_bgr is None:
                             snapshot_bgr = bgr
                         rgb_img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                        if geom is None:
-                            hr, wr = rgb_img.shape[:2]
-                            if (hr, wr) != (orig_h, orig_w) and orig_w > 0 and orig_h > 0:
-                                sx, sy = wr / float(orig_w), hr / float(orig_h)
-                                scaled_records = [
-                                    np.column_stack([kp[:, 0]*sx, kp[:, 1]*sy, kp[:, 2]])
-                                    for kp in primary_records
-                                ]
-                            else:
-                                scaled_records = primary_records
-                            geom = prepare_rgb_crop_geometry(
-                                scaled_records, (hr, wr), crop_mode=self.crop_mode)
-                        crops[fi] = crop_rgb_pair_for_frame(rgb_img, fi, geom)
+                        if fi in image_index_set:
+                            if geom is None:
+                                hr, wr = rgb_img.shape[:2]
+                                if (hr, wr) != (orig_h, orig_w) and orig_w > 0 and orig_h > 0:
+                                    sx, sy = wr / float(orig_w), hr / float(orig_h)
+                                    scaled_records = [
+                                        np.column_stack([kp[:, 0]*sx, kp[:, 1]*sy, kp[:, 2]])
+                                        for kp in primary_records
+                                    ]
+                                else:
+                                    scaled_records = primary_records
+                                geom = prepare_rgb_crop_geometry(
+                                    scaled_records, (hr, wr), crop_mode=self.crop_mode)
+                            crops[fi] = crop_rgb_pair_for_frame(rgb_img, fi, geom)
+                        if fi in ctx_index_set:
+                            ctx_canvas, _ = letterbox(rgb_img, 192, 192)
+                            ctx_map[fi] = ctx_canvas.transpose(2, 0, 1)
                         del rgb_img
                         if snapshot_bgr is not bgr:
                             del bgr
@@ -911,12 +1004,20 @@ class SegmentActionBackend:
                     [crops[i][0] for i in image_indices],
                     [crops[i][1] for i in image_indices],
                 )
-                del crops
+                if ctx_indices:
+                    vc_blob = build_ctx_view_from_crops(
+                        [ctx_map[i] for i in ctx_indices], self.rgb_n_per_view)
+                del crops, ctx_map
         else:
             rgb_blob_full = build_rgb_input([rgb_images[i] for i in image_indices],
                                             primary_records, crop_mode=self.crop_mode)
             vp_blob = rgb_blob_full[:, :self.rgb_n_per_view]
             vh_blob = rgb_blob_full[:, self.rgb_n_per_view:]
+            if ctx_indices:
+                ctx_crops = [letterbox(rgb_images[i], 192, 192)[0].transpose(2, 0, 1)
+                             for i in ctx_indices]
+                vc_blob = build_ctx_view_from_crops(ctx_crops, self.rgb_n_per_view)
+                del ctx_crops
 
         if stop_event is not None and stop_event.is_set():
             return None
@@ -925,11 +1026,16 @@ class SegmentActionBackend:
             if stop_event is not None and stop_event.is_set():
                 return None
             fh = np.asarray(self.rgb_engine.infer(vh_blob)[0], np.float32)
-            raw_rgb = fuse_dual_event_head(fp, fh, vh_blob, self.rgb_head).reshape(-1)
+            fc = None
+            if vc_blob is not None:
+                if stop_event is not None and stop_event.is_set():
+                    return None
+                fc = np.asarray(self.rgb_engine.infer(vc_blob)[0], np.float32)
+            raw_rgb = fuse_dual_event_head(fp, fh, vh_blob, self.rgb_head, fc=fc).reshape(-1)
         else:
             rgb_blob = np.concatenate([vp_blob, vh_blob], axis=1)
             raw_rgb = np.asarray(self.rgb_engine.infer(rgb_blob)[0], np.float32).reshape(-1)
-        del vp_blob, vh_blob
+        del vp_blob, vh_blob, vc_blob
         rgb = raw_rgb if looks_like_probabilities(raw_rgb) else softmax(raw_rgb)
         if body.shape != (126,) or rgb.shape != (126,):
             raise ValueError('segment action heads must both emit 126 classes')

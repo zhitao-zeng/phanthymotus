@@ -37,6 +37,7 @@ of perception on jp5.11 (see plugins/kokoro_worker.py).
 
 from __future__ import annotations
 
+from collections import deque
 import gc
 import json
 import logging
@@ -344,6 +345,7 @@ TOOLS = [
                 "activity_interval_s": {"type": "number", "minimum": 0.0, "title": "Action model interval (s)", "description": "The action model judges a clip, so running it every frame re-reads almost the same input. Posture stays frame-rate regardless.", "default": 0.45, "scope": "instance", "advanced": True},
                 "activity_idle_flush_s": {"type": "number", "minimum": 0.0, "title": "Finish action after input pause (s)", "description": "When the image stream pauses, judge the buffered action once. Zero disables this in rolling mode. In segment mode zero starts inference early and confirms the end after at least 0.4 seconds and two configured frame intervals.", "default": 0.0, "scope": "instance", "advanced": True},
                 "activity_segment_pause_s": {"type": "number", "minimum": 0.0, "title": "Confirm segment break after pause (s)", "description": "In segment mode, how long frames must pause before cutting a new segment. Exceeding activity_idle_flush_s previews without splitting brief mid-clip stalls.", "default": 0.0, "scope": "instance", "advanced": True},
+                "activity_stall_backfill_s": {"type": "number", "minimum": 0.0, "title": "Backfill missed frames after stall (s)", "description": "In segment mode, when pose processing lags by at least this interval, backfill up to 3 buffered frames in a single pose batch to keep temporal coverage.", "default": 0.0, "scope": "instance", "advanced": True},
                 "activity_mode": {"type": "string", "enum": ["rolling", "segment"], "title": "When to recognize an action", "description": "rolling updates actions while video arrives. segment recognizes the received clip once the input pauses, using its complete context.", "default": "rolling", "scope": "instance", "advanced": True},
                 "label_hold": {"type": "integer", "minimum": 1, "title": "Label stability (frames)", "description": "How many frames a new label must win before it replaces the current one. A label flickering several times a second is worse than a steady wrong one.", "default": 1, "scope": "instance", "advanced": True},
                 "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Action score threshold", "description": "Falls use a higher bar of their own: a false fall makes the robot drop what it is doing to ask if someone is hurt.", "default": 0.08, "scope": "instance", "advanced": True},
@@ -378,6 +380,7 @@ class _PoseNode(Node):
                  activity_interval_s: float = 0.35,
                  activity_idle_flush_s: float = 0.0,
                  activity_segment_pause_s: float = 0.0,
+                 activity_stall_backfill_s: float = 0.0,
                  segment_backend=None,
                  tracker_timeout_s: float = 1.0,
                  gesture_tracker: Optional[GestureEventTracker] = None,
@@ -413,6 +416,16 @@ class _PoseNode(Node):
         self._activity_interval_s = float(activity_interval_s)
         self._activity_idle_flush_s = max(0.0, float(activity_idle_flush_s))
         self._activity_segment_pause_s = max(0.0, float(activity_segment_pause_s))
+        self._activity_stall_backfill_s = max(0.0, float(activity_stall_backfill_s))
+        self._backfill_window_s = 0.60
+        self._backfill_max_frames = 3
+        self._backfill_max_bytes = int(1.5 * 1024 * 1024)
+        self._recent_frames = deque(maxlen=20)
+        self._recent_frames_bytes = 0
+        self._recent_frames_lock = threading.Lock()
+        self._last_pose_received_at = 0.0
+        self._backfill_triggers = 0
+        self._backfill_frames = 0
         self._segment_backend = segment_backend
         self._segment_buffer = None
         self._segment_preview = None
@@ -557,6 +570,10 @@ class _PoseNode(Node):
             self._idle_persons = []
             self._last_image_received_at = 0.0
             self._idle_finalized_at = 0.0
+            self._last_pose_received_at = 0.0
+            with self._recent_frames_lock:
+                self._recent_frames.clear()
+                self._recent_frames_bytes = 0
             if self._segment_buffer is not None:
                 self._segment_buffer.reset()
                 self._segment_preview = None
@@ -576,6 +593,68 @@ class _PoseNode(Node):
             log.info(f"[pose] stopped: {self._input_topic or '(no topic)'}")
             return self._status()
 
+    def _record_recent_frame(self, now: float, data) -> None:
+        raw = bytes(data)
+        with self._recent_frames_lock:
+            if len(self._recent_frames) == self._recent_frames.maxlen:
+                _, old = self._recent_frames.popleft()
+                self._recent_frames_bytes -= len(old)
+            self._recent_frames.append((now, raw))
+            self._recent_frames_bytes += len(raw)
+            cutoff = now - self._backfill_window_s
+            while len(self._recent_frames) > 1 and (
+                self._recent_frames[0][0] < cutoff
+                or self._recent_frames_bytes > self._backfill_max_bytes
+            ):
+                _, old = self._recent_frames.popleft()
+                self._recent_frames_bytes -= len(old)
+
+    def _pick_backfill_frames(self, received_at: float) -> list:
+        if (self._segment_buffer is None
+                or self._activity_stall_backfill_s <= 0.0
+                or self._last_pose_received_at <= 0.0
+                or received_at - self._last_pose_received_at < self._activity_stall_backfill_s):
+            return []
+        if not callable(getattr(self._model, "infer_batch", None)):
+            return []
+        engine = getattr(self._model, "_engine", None)
+        profiles = getattr(engine, "profiles", []) if engine is not None else []
+        max_batch = max((shape[2][0] for shape in profiles), default=4) if profiles else 4
+        max_bf = min(self._backfill_max_frames, max(0, int(max_batch) - 1))
+        if max_bf <= 0:
+            return []
+        with self._recent_frames_lock:
+            snap = list(self._recent_frames)
+        if not snap:
+            return []
+        quiet_s = self._segment_buffer.quiet_s
+        min_t = max(self._last_pose_received_at + 1e-6, received_at - self._backfill_window_s)
+        cands = []
+        next_t = received_at
+        for t, data in reversed(snap):
+            if t >= received_at - 1e-6:
+                continue
+            if next_t - t >= quiet_s:
+                break
+            next_t = t
+            if t < min_t:
+                break
+            cands.append((t, data))
+        cands.reverse()
+        if not cands:
+            return []
+        if len(cands) <= max_bf:
+            return cands
+        sel = np.linspace(0, len(cands) - 1, max_bf + 2)[1:-1].round().astype(int)
+        picks = []
+        seen = set()
+        for idx in sel:
+            i = int(idx)
+            if i not in seen:
+                seen.add(i)
+                picks.append(cands[i])
+        return picks
+
     def _image_cb(self, msg: CompressedImage):
         if self._stop_event.is_set():
             return
@@ -583,10 +662,12 @@ class _PoseNode(Node):
         self._last_image_received_at = now
         will_infer = (now - self._last_inference_time) >= self._frame_interval
         if self._segment_buffer is not None:
-            # Pre-cropped PersonROI patches carry all RGB pixels needed for segment
+            # Pre-cropped ROI patches carry all RGB pixels needed for segment
             # classification; retain raw JPEG bytes only when hand_channel needs full BGR.
             keep_jpeg = will_infer and self._hand_channel is not None
             self._segment_buffer.append(msg.data if keep_jpeg else b"", now)
+            if self._activity_stall_backfill_s > 0.0:
+                self._record_recent_frame(now, msg.data)
         if not will_infer:
             return
         self._last_inference_time = now
@@ -656,17 +737,52 @@ class _PoseNode(Node):
                 )
                 if frame is None:
                     continue
-                outputs, meta = self._model.infer(frame)
-                if self._stop_event.is_set():
-                    break
+                ctx_hw = (192 if getattr(self._segment_backend, "rgb_ctx_frames", 0) > 0
+                          else 0)
+                backfill_items = (self._pick_backfill_frames(received_at)
+                                  if self._segment_buffer is not None else [])
+                bf_decoded = []
+                for bf_t, bf_jpeg in backfill_items:
+                    bf_frame = cv2.imdecode(
+                        np.frombuffer(bf_jpeg, np.uint8), cv2.IMREAD_COLOR
+                    )
+                    if bf_frame is not None:
+                        bf_decoded.append((bf_t, bf_frame))
+                if bf_decoded:
+                    batch_frames = [bf_frame for _, bf_frame in bf_decoded] + [frame]
+                    batch_results = self._model.infer_batch(batch_frames)
+                    if self._stop_event.is_set():
+                        break
+                    for (bf_t, bf_frame), (bf_out, bf_meta) in zip(
+                        bf_decoded, batch_results[:-1]
+                    ):
+                        bf_boxes, bf_scores, bf_kps = decode_poses(
+                            bf_out, bf_meta, self._confidence
+                        )
+                        bf_patch = make_dual_roi_patch(
+                            bf_frame, bf_boxes, bf_scores, bf_kps, ctx_hw=ctx_hw
+                        )
+                        self._segment_buffer.record_pose(
+                            bf_t, bf_boxes, bf_scores, bf_kps, bf_frame.shape,
+                            rgb_patch=bf_patch)
+                    self._backfill_triggers += 1
+                    self._backfill_frames += len(bf_decoded)
+                    outputs, meta = batch_results[-1]
+                else:
+                    outputs, meta = self._model.infer(frame)
+                    if self._stop_event.is_set():
+                        break
                 boxes, scores, keypoints = decode_poses(
                     outputs, meta, self._confidence
                 )
                 if self._segment_buffer is not None:
-                    rgb_patch = make_dual_roi_patch(frame, boxes, scores, keypoints)
+                    rgb_patch = make_dual_roi_patch(
+                        frame, boxes, scores, keypoints, ctx_hw=ctx_hw
+                    )
                     self._segment_buffer.record_pose(
                         received_at, boxes, scores, keypoints, frame.shape,
                         rgb_patch=rgb_patch)
+                    self._last_pose_received_at = received_at
                 persons = self._describe(boxes, scores, keypoints, frame, started)
                 self._publish(persons, frame, started)
                 self._idle_persons = persons
@@ -805,7 +921,9 @@ class _PoseNode(Node):
         self._publish(persons, emit_gestures=False,
                       publish_skeleton=False, count_frame=False)
         log.info(f"[pose] segment published: {act.get('name') if act else None} "
-                 f"score={score_val:.3f} frames={stats.get('received_frames', 0)} ms={inference_ms}")
+                 f"score={score_val:.3f} frames={stats.get('received_frames', 0)} "
+                 f"obs={stats.get('processed_observations', 0)} "
+                 f"bf={self._backfill_frames} ms={inference_ms}")
 
     # ── payload construction ─────────────────────────────────────────────
 
@@ -1336,6 +1454,8 @@ class PosePerceptionPlugin:
             plugin_cfg.get("activity_idle_flush_s") or 0.0))
         self._activity_segment_pause_s = max(0.0, float(
             plugin_cfg.get("activity_segment_pause_s") or 0.0))
+        self._activity_stall_backfill_s = max(0.0, float(
+            plugin_cfg.get("activity_stall_backfill_s") or 0.0))
         self._activity_mode = str(os.environ.get("POSE_ACTIVITY_MODE") or
                                   plugin_cfg.get("activity_mode", "rolling"))
         self._window_maturity_s = float(
@@ -1423,6 +1543,8 @@ class PosePerceptionPlugin:
                 "activity_idle_flush_s", self._activity_idle_flush_s) or 0.0)),
             "activity_segment_pause_s": max(0.0, float(icfg.get(
                 "activity_segment_pause_s", self._activity_segment_pause_s) or 0.0)),
+            "activity_stall_backfill_s": max(0.0, float(icfg.get(
+                "activity_stall_backfill_s", self._activity_stall_backfill_s) or 0.0)),
             "activity_mode": str(icfg.get("activity_mode", self._activity_mode)),
             "window_maturity_s": float(icfg.get(
                 "window_maturity_s", self._window_maturity_s)),
@@ -1989,6 +2111,7 @@ class PosePerceptionPlugin:
                 activity_interval_s=merged["activity_interval_s"],
                 activity_idle_flush_s=merged["activity_idle_flush_s"],
                 activity_segment_pause_s=merged["activity_segment_pause_s"],
+                activity_stall_backfill_s=merged["activity_stall_backfill_s"],
                 segment_backend=self._segment_backend_for(merged),
                 tracker_timeout_s=merged["tracker_timeout_s"],
                 gesture_tracker=self._gesture_tracker_for(merged),
@@ -2513,6 +2636,9 @@ class PosePerceptionPlugin:
         if "activity_segment_pause_s" in cfg:
             self._activity_segment_pause_s = max(0.0, float(
                 cfg["activity_segment_pause_s"] or 0.0))
+        if "activity_stall_backfill_s" in cfg:
+            self._activity_stall_backfill_s = max(0.0, float(
+                cfg["activity_stall_backfill_s"] or 0.0))
         if "activity_mode" in cfg:
             self._activity_mode = str(cfg["activity_mode"])
         for key in _THRESHOLD_KEYS:

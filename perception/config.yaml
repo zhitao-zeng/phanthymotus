@@ -338,6 +338,7 @@ plugins:
     activity_interval_s: 0.28
     activity_idle_flush_s: 0.24
     activity_segment_pause_s: 0.35
+    activity_stall_backfill_s: 0.20
     tracker_timeout_s: 0.6
     label_hold: 1
     # ── Fall thresholds ──────────────────────────────────────────────────

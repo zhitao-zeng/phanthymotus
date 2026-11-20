@@ -1529,27 +1529,27 @@ SEGMENT_ACTION_MODEL_BUNDLES = {
     "jp61": {
         "base_url": os.environ.get(
             "SEGMENT_ACTION_BUNDLE_BASE_URL",
-            "http://172.28.4.81:34567/zengzhitao/embodied-ai/action-v4-mnv2-dualroi-p0p1p2-20261119-r09/jp61"),
+            "http://172.28.4.81:34567/zengzhitao/embodied-ai/action-p3-cd-ctx4-ntu200-a4-20261120-r01/jp61"),
         "files": {
             "yolo26s-pose-batch4.engine": {
                 "size": 25027882,
                 "sha256": "dc41416d27fcc50efb540cf87c95c953fac58047e4e82aec5a7758baba40c161",
             },
-            "stgcnpp-action126-v4-y26s.engine": {
-                "size": 4408676,
-                "sha256": "bbbb48f151fb8ea437bec68a365425ca8f4d6c547d18d4321cffc7e318725069",
+            "stgcnpp-action126-v4-ntu200-y26s.engine": {
+                "size": 4419748,
+                "sha256": "a37b321cc0d7c3b32d25a2abc83f0ef836c9e4acc5514de2952017af7fa8115a",
             },
-            "mnv2-sv16f-crope-v4-feat.engine": {
-                "size": 8707820,
-                "sha256": "fc4734707cf9603d2dd7dd0e76c9330abd0181590fef1cb68cbbaab8892a8814",
+            "mnv2-sv16f-crope-ctx4-v4-feat.engine": {
+                "size": 8673452,
+                "sha256": "e7e61bb21e651b1f965febe62752e734c9a0fa0d1bad8ef7ec66f836b3a3fcba",
             },
-            "mnv2-sv16f-crope-v4-head.npz": {
-                "size": 1969454,
-                "sha256": "c908636b5e595cfa3070150026141b0b252a13985eb67ed9324fba40757189d6",
+            "mnv2-sv16f-crope-ctx4-v4-head.npz": {
+                "size": 5018382,
+                "sha256": "9df6c2285b59dd97536290da320fc912278e6b4b233f590678de746729e6ff19",
             },
             "models.json": {
-                "size": 299,
-                "sha256": "b3b85ae3b630de01ec384bf7f42f029d712935bdc7a53dd12b7e8943847c8692",
+                "size": 329,
+                "sha256": "f841f9a25a0653eceb6da67df90eced451a230ac4659d3c0a9d269971eec98f1",
             },
         },
     },

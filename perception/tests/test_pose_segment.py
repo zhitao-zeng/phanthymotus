@@ -861,3 +861,142 @@ def test_segment_pause_prevents_mid_clip_split_and_late_weak_followup_suppressed
     now = 108.75
     node._flush_received_segment()
     assert len(messages) == 1
+
+
+def test_context_patch_and_res_ctx_head_runs_third_single_view():
+    cv2 = pytest.importorskip('cv2')
+    from plugins.pose_segment import (
+        SegmentActionBackend,
+        SegmentBuffer,
+        fuse_dual_event_head,
+        make_dual_roi_patch,
+    )
+
+    frame = np.full((360, 640, 3), 90, dtype=np.uint8)
+    frame[60:300, 220:420] = (180, 120, 60)
+    row = np.array(_standing_row(), np.float32)
+    boxes = row[None, :4]
+    scores = row[None, 4]
+    kps = row[6:].reshape(1, 17, 3)
+
+    patch_no_ctx = make_dual_roi_patch(frame, boxes, scores, kps)
+    assert len(patch_no_ctx) == 2
+
+    patch_ctx = make_dual_roi_patch(frame, boxes, scores, kps, ctx_hw=192)
+    assert len(patch_ctx) == 3
+    assert patch_ctx[2].shape == (192, 192, 3)
+    assert patch_ctx[2].dtype == np.uint8
+
+    class BodyStub:
+        input_shape = (1, 2, 100, 17, 6)
+
+        def infer(self, blob):
+            out = np.zeros((1, 126), dtype=np.float32)
+            out[0, 13] = 3.0
+            return [out]
+
+    class RgbFeatStub:
+        input_shape = (1, 16, 3, 192, 192)
+
+        def __init__(self):
+            self.calls = []
+
+        def infer(self, blob):
+            self.calls.append(tuple(blob.shape))
+            val = float(len(self.calls))
+            return [np.full((1, 16, 16), val * 0.1, dtype=np.float32)]
+
+    d_feat = 16
+    rank = 8
+    raw_head = {
+        'head_type': np.array('res_ctx'),
+        'ctx_frames': np.array(4, dtype=np.int32),
+        'att_f_w': np.zeros((4, 2 * d_feat), dtype=np.float32),
+        'att_d_w': np.zeros((4, 2 * d_feat), dtype=np.float32),
+        'att_e_w': np.zeros((4, 1), dtype=np.float32),
+        'att_e_b': np.zeros((4,), dtype=np.float32),
+        'att_out_w': np.zeros((1, 4), dtype=np.float32),
+        'att_out_b': np.zeros((1,), dtype=np.float32),
+        'gamma_ev': np.zeros((1, 2 * d_feat), dtype=np.float32),
+        'gamma_dv': np.zeros((1, 2 * d_feat), dtype=np.float32),
+        'fc_w': np.zeros((126, 2 * d_feat), dtype=np.float32),
+        'fc_b': np.zeros((126,), dtype=np.float32),
+        'ctx_p_w': np.zeros((rank, 2 * d_feat), dtype=np.float32),
+        'ctx_c_w': np.full((rank, d_feat), 0.5, dtype=np.float32),
+        'ctx_c_b': np.zeros((rank,), dtype=np.float32),
+        'ctx_fc_w': np.zeros((126, rank), dtype=np.float32),
+        'ctx_fc_b': np.zeros((126,), dtype=np.float32),
+    }
+    raw_head['ctx_fc_w'][13, :] = 2.0  # boost class 14 when context fires
+
+    rgb_stub = RgbFeatStub()
+    backend = SegmentActionBackend(
+        None, BodyStub(), rgb_stub, crop_mode='E', rgb_head=raw_head
+    )
+    assert backend.rgb_ctx_frames == 4
+    assert backend.rgb_head['head_type'] == 'res_ctx'
+
+    buf = SegmentBuffer(quiet_s=0.35)
+    for i in range(6):
+        ts = 10.0 + i * 0.05
+        buf.append(b'', ts)
+        buf.record_pose(ts, boxes, scores, kps, frame.shape, rgb_patch=patch_ctx)
+    records, _ = buf.pop_ready(11.0)
+    res = backend.recognize(records, need_image=False)
+    assert res is not None
+    assert len(rgb_stub.calls) == 3
+    assert all(shape == (1, 16, 3, 192, 192) for shape in rgb_stub.calls)
+    # Direct head call must be positive on class 14 because context branch fired.
+    logits = fuse_dual_event_head(
+        np.full((1, 16, d_feat), 0.1, dtype=np.float32),
+        np.full((1, 16, d_feat), 0.2, dtype=np.float32),
+        np.zeros((1, 16, 3, 192, 192), dtype=np.float32),
+        backend.rgb_head,
+        fc=np.full((1, 16, d_feat), 0.3, dtype=np.float32),
+    )
+    assert logits.shape == (1, 126)
+    assert float(logits[0, 13]) > 1.0
+
+
+def test_pose_node_stall_backfill_picks_up_to_three_and_respects_quiet_gap(monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(pose, 'time', SimpleNamespace(
+        monotonic=lambda: now, perf_counter=time.perf_counter, time=time.time))
+
+    class BatchModel:
+        def __init__(self):
+            self.batch_calls = []
+
+        def infer_batch(self, frames):
+            self.batch_calls.append(len(frames))
+            return []
+
+    node = pose._PoseNode(
+        '/cam/bf', BatchModel(), .35, 30., 'bf_test',
+        classifier=_FinalClassifier(), segment_backend=_SegmentModel(),
+        activity_idle_flush_s=0.24, activity_segment_pause_s=0.35,
+        activity_stall_backfill_s=0.20,
+    )
+    # Feed frames at 30fps over a 0.33s stall (10 frames between t=100.00 and t=100.33).
+    node._last_pose_received_at = 100.00
+    for i in range(1, 11):
+        t = 100.00 + i * 0.033
+        node._record_recent_frame(t, f'frame-{i}'.encode())
+
+    picks = node._pick_backfill_frames(100.33)
+    assert len(picks) == 3
+    assert [t for t, _ in picks] == sorted(t for t, _ in picks)
+    assert all(100.00 < t < 100.33 for t, _ in picks)
+
+    # Gap shorter than threshold returns nothing.
+    node._last_pose_received_at = 100.20
+    assert node._pick_backfill_frames(100.33) == []
+
+    # Quiet gap (>= 0.35s) between two segments must NOT pull frames from previous segment.
+    node._last_pose_received_at = 100.00
+    node._recent_frames.clear()
+    node._recent_frames_bytes = 0
+    for t in (100.05, 100.10, 100.55, 100.58):
+        node._record_recent_frame(t, b'jpeg')
+    picks_seg = node._pick_backfill_frames(100.61)
+    assert [t for t, _ in picks_seg] == [100.55, 100.58]
