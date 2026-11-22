@@ -293,8 +293,14 @@ def output_topic_for(input_topic: Optional[str]) -> str:
 def canonical_model_name(name: str) -> str:
     """Map a configured model name onto the one model this build ships."""
     base = (name or "").strip()
-    if base.endswith(".pt") or base.endswith(".engine"):
+    if base.endswith(".pt"):
         base = base.rsplit(".", 1)[0]
+    # An explicit engine path is the dev-box escape hatch that _resolve_engine
+    # honours, so its suffix has to survive: stripping it here made every
+    # configured .engine look like a bundle name and silently load the pinned
+    # model instead.
+    if base.endswith(".engine"):
+        return base
     return _MODEL_ALIASES.get(base, base or DEFAULT_MODEL)
 
 TOOLS = [
@@ -356,7 +362,7 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "confidence": {"type": "number", "description": "Detection confidence threshold (0-1)", "default": 0.3, "scope": "instance"},
+                "confidence": {"type": "number", "description": "Detection confidence threshold (0-1)", "default": 0.51, "scope": "instance"},
                 "fps":        {"type": "integer", "description": "Max inference frames per second", "default": 5, "scope": "instance"},
                 # Both govern the *streamed* payload only. The one-shot photo
                 # actions always answer in full: that reply is asked for once
@@ -592,7 +598,7 @@ class VideoObjectPerceptionPlugin:
         # Kept whole for the image-source helpers, which read image_roots and
         # max_image_bytes straight from it (see plugins/image_input.py).
         self._plugin_cfg = dict(plugin_cfg or {})
-        self._confidence = float(plugin_cfg.get("confidence", 0.3))
+        self._confidence = float(plugin_cfg.get("confidence", 0.51))
         self._fps = int(plugin_cfg.get("fps", 5))
         self._publish_bbox = bool(plugin_cfg.get("publish_bbox", True))
         self._publish_color = _color_level(plugin_cfg.get("publish_color"))

@@ -69,9 +69,14 @@ def test_legacy_model_names_still_resolve(configured, expected):
     assert vop_plugin.canonical_model_name(configured) == expected
 
 
-def test_unknown_model_name_is_left_alone():
-    """An explicit engine path is a dev-box escape hatch, not an alias miss."""
-    assert vop_plugin.canonical_model_name("/models/custom.engine") == "/models/custom"
+def test_explicit_engine_path_keeps_its_suffix():
+    """An explicit engine path is a dev-box escape hatch, not an alias miss.
+
+    The suffix has to survive: `_resolve_engine` only takes the configured-file
+    branch while the name still ends in `.engine`, so stripping it here made
+    every such config quietly load the pinned bundle instead.
+    """
+    assert vop_plugin.canonical_model_name("/models/custom.engine") == "/models/custom.engine"
 
 
 # ── frozen vocabulary ────────────────────────────────────────────────────────

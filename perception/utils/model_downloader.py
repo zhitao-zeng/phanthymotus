@@ -1280,15 +1280,25 @@ _VOP_VOCAB = {
     "sha256": "5aaa0f34df07fff0037318c4100f40bf55b62beb439b89f60b6641924f17fd3b",
 }
 
+VOP_OVDEIM_REVISION = "b5dca4b7adc8c847d1f6581c89e864e640a3c0a0"
+VOP_OVDEIM_BASE = os.environ.get(
+    "VOP_OVDEIM_MODEL_BASE_URL",
+    "https://www.modelscope.cn/models/Flame4pd/"
+    f"vop-ovdeim-m-jp61-trt/resolve/{VOP_OVDEIM_REVISION}",
+)
+
 VOP_MODEL_BUNDLES = {
     "jp61": {
-        "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp61-trt10.4-orin-640",
+        "base_url": f"{VOP_OVDEIM_BASE}/tensorrt-jp61-trt10.4-orin-768",
         "files": {
-            "yoloe-26s-seg.engine": {
-                "size": 24780908,
-                "sha256": "b8cb77a0685a399ef7d83dfc4d0777b54e66ea110d1085a005c4f153366e4099",
+            "ovdeim-m-768-vop220.engine": {
+                "size": 45065692,
+                "sha256": "0d4dfecd578548e057169099c0b7b290af32df8108c67e6b9405819ac4ccbe1e",
             },
-            "vocab.json": _VOP_VOCAB,
+            "vocab.json": {
+                "size": 3446,
+                "sha256": "d35a6672dbc5472d05dc70ee5973846b19517cf4ba2f10e80a483d69cacf133c",
+            },
         },
     },
     "jp511": {
