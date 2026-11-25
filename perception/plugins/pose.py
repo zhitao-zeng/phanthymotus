@@ -76,6 +76,13 @@ from plugins.hand_gesture import (
     classify as classify_hand,
     gesture_catalogue,
 )
+from plugins.hand_gesture_detector import (
+    ALL_DETECTOR_GESTURES,
+    DEFAULT_GESTURE_DET_CONF,
+    DEFAULT_HAND_DET_CONF,
+    HandGestureDetectorChannel,
+    detector_gesture_catalogue,
+)
 from plugins.gesture_events import (
     DEFAULT_COOLDOWN_S,
     DEFAULT_GESTURES,
@@ -673,7 +680,9 @@ class _PoseNode(Node):
             except Exception as error:  # noqa: BLE001 — never lose the bodies
                 log.warning(f"[pose] hand channel failed: {error}")
 
-        if self._hand_channel is not None and self._hand_gestures:
+        if (self._hand_channel is not None
+                and not isinstance(self._hand_channel, HandGestureDetectorChannel)
+                and self._hand_gestures):
             for person in persons:
                 name_hand_shapes(person, self._hand_gestures)
 
@@ -727,11 +736,19 @@ class _PoseNode(Node):
             # skeleton topic instead.
             record["hands_seen"] = sorted(side for side, value in hands.items()
                                           if value is not None)
-            named = {side: name for side, name
-                     in (person.get("hand_gestures") or {}).items() if name}
-            if named:
-                record["hand_gestures"] = named
-            if self._publish_hand_keypoints != "off":
+            if "hand_bboxes" in person:
+                record["hand_bboxes"] = person["hand_bboxes"]
+                record["hand_gestures"] = person.get(
+                    "hand_gestures", {"left": None, "right": None})
+                record["hand_gesture_scores"] = person.get(
+                    "hand_gesture_scores", {"left": None, "right": None})
+            else:
+                named = {side: name for side, name
+                         in (person.get("hand_gestures") or {}).items() if name}
+                if named:
+                    record["hand_gestures"] = named
+            if (self._publish_hand_keypoints != "off"
+                    and not isinstance(self._hand_channel, HandGestureDetectorChannel)):
                 detail = (_compact_keypoints
                           if self._publish_hand_keypoints == "compact"
                           else _full_keypoints)
@@ -752,14 +769,18 @@ class _PoseNode(Node):
             "keypoints": _full_keypoints(self._payload_keypoints(person)),
         }
 
+    def _has_hand_keypoints(self) -> bool:
+        return (self._hand_channel is not None
+                and not isinstance(self._hand_channel, HandGestureDetectorChannel))
+
     def _payload_keypoints(self, person: dict):
-        """Body keypoints, with both hands appended when the channel is on.
+        """Body keypoints, with both hands appended when the 21-point channel is on.
 
         Appended and never interleaved: pose2d.js keeps its own copy of the
         COCO bone table and any already-wired consumer indexes the first 17.
         See hand_runtime.merge_keypoints.
         """
-        if self._hand_channel is None:
+        if not self._has_hand_keypoints():
             return person["keypoints"]
         hands = person.get("hands") or {}
         return merge_keypoints(person["keypoints"], hands.get("left"),
@@ -810,10 +831,10 @@ class _PoseNode(Node):
             # renderer draw 59 keypoints with no frontend change at all —
             # pose2d.js already prefers a payload-carried table over its copy.
             "keypoint_names": (merged_keypoint_names(COCO_KEYPOINTS)
-                               if self._hand_channel is not None
+                               if self._has_hand_keypoints()
                                else list(COCO_KEYPOINTS)),
             "skeleton": (merged_skeleton(COCO_SKELETON, N_KEYPOINTS)
-                         if self._hand_channel is not None
+                         if self._has_hand_keypoints()
                          else [list(edge) for edge in COCO_SKELETON]),
             "persons": [self._skeleton_record(p) for p in persons],
         }
@@ -1056,6 +1077,7 @@ class PosePerceptionPlugin:
                                                         DEFAULT_COOLDOWN_S))
         self._gesture_min_score = float(plugin_cfg.get("gesture_min_score", 0.0))
         self._hands = _hands_enabled(plugin_cfg.get("hands"))
+        self._hand_backend = str(plugin_cfg.get("hand_backend", "rtmpose") or "rtmpose").strip().lower()
         self._hand_interval_s = float(plugin_cfg.get("hand_interval_s", 0.25))
         self._hand_max_rois = int(plugin_cfg.get("hand_max_rois", 2))
         self._hand_min_forearm_px = float(
@@ -1064,6 +1086,11 @@ class PosePerceptionPlugin:
                                                  DEFAULT_HAND_HOLD_S))
         self._hand_confidence = float(plugin_cfg.get("hand_confidence",
                                                      DEFAULT_HAND_CONFIDENCE))
+        self._hand_det_confidence = float(plugin_cfg.get("hand_det_confidence",
+                                                         DEFAULT_HAND_DET_CONF))
+        self._gesture_det_confidence = float(plugin_cfg.get("gesture_det_confidence",
+                                                            DEFAULT_GESTURE_DET_CONF))
+        self._hand_adaptive_zoom = bool(plugin_cfg.get("hand_adaptive_zoom", True))
         self._publish_hand_keypoints = _keypoint_level(
             plugin_cfg.get("publish_hand_keypoints"))
         self._action_window_s = float(plugin_cfg.get("action_window_s", 1.5))
@@ -1093,6 +1120,8 @@ class PosePerceptionPlugin:
         # for hands. Its own lock, not the body engine's: a hand fetch must not
         # block a body start, and the two are fetched independently.
         self._hand_model = None
+        self._hand_det_model = None
+        self._gesture_det_model = None
         self._hand_load_error: Optional[str] = None
         self._hand_model_lock = threading.Lock()
 
@@ -1148,6 +1177,7 @@ class PosePerceptionPlugin:
                                                 self._gesture_min_score)),
             "hands": (_hands_enabled(icfg["hands"]) if "hands" in icfg
                       else self._hands),
+            "hand_backend": str(icfg.get("hand_backend", self._hand_backend) or "rtmpose").strip().lower(),
             "hand_interval_s": float(icfg.get("hand_interval_s",
                                               self._hand_interval_s)),
             "hand_max_rois": int(icfg.get("hand_max_rois", self._hand_max_rois)),
@@ -1156,6 +1186,12 @@ class PosePerceptionPlugin:
             "hand_hold_s": float(icfg.get("hand_hold_s", self._hand_hold_s)),
             "hand_confidence": float(icfg.get("hand_confidence",
                                               self._hand_confidence)),
+            "hand_det_confidence": float(icfg.get("hand_det_confidence",
+                                                  self._hand_det_confidence)),
+            "gesture_det_confidence": float(icfg.get("gesture_det_confidence",
+                                                     self._gesture_det_confidence)),
+            "hand_adaptive_zoom": bool(icfg.get("hand_adaptive_zoom",
+                                                self._hand_adaptive_zoom)),
             "publish_hand_keypoints": (
                 _keypoint_level(icfg["publish_hand_keypoints"])
                 if "publish_hand_keypoints" in icfg
@@ -1207,6 +1243,57 @@ class PosePerceptionPlugin:
             self._hand_model = session
             return self._hand_model
 
+    def _ensure_hand_detector_models(self):
+        """Lazy-load the two lightweight YOLOv10n TensorRT engines for hand + gesture detection."""
+        if self._gesture_det_model is not None:
+            return self._gesture_det_model, self._hand_det_model
+        with self._hand_model_lock:
+            if self._gesture_det_model is not None:
+                return self._gesture_det_model, self._hand_det_model
+            from plugins.vision_runtime import VisionEngineSession
+            from utils.model_downloader import ensure_hand_detector_models
+            from utils.model_progress import fetch_status
+
+            gest_override = (
+                os.environ.get("HAND_GESTURE_ENGINE_PATH")
+                or self._plugin_cfg.get("gesture_det_engine_path")
+                or ""
+            ).strip()
+            hand_override = (
+                os.environ.get("HAND_DET_ENGINE_PATH")
+                or self._plugin_cfg.get("hand_det_engine_path")
+                or ""
+            ).strip()
+            if gest_override and os.path.isfile(gest_override):
+                gest_path = gest_override
+                hand_path = hand_override if (hand_override and os.path.isfile(hand_override)) else None
+            else:
+                model_dir = os.environ.get("HAND_GESTURE_MODEL_DIR", "/models/hand_gesture")
+                progress_cb, _ = fetch_status(
+                    lambda text: setattr(self, "_model_load_status", text),
+                    "hand-gesture-detector")
+                paths = ensure_hand_detector_models(model_dir, progress_cb=progress_cb)
+                gest_path = next(
+                    (p for name, p in paths.items() if "gesture" in name and name.endswith(".engine")),
+                    None,
+                )
+                hand_path = next(
+                    (p for name, p in paths.items() if "hand" in name and "gesture" not in name and name.endswith(".engine")),
+                    None,
+                )
+                if not gest_path:
+                    raise RuntimeError(f"gesture detector engine missing from bundle: {sorted(paths)}")
+
+            log.info(f"[pose] loading hand gesture detector engine: {gest_path}")
+            gest_session = VisionEngineSession(gest_path)
+            hand_session = None
+            if hand_path:
+                log.info(f"[pose] loading hand box detector engine: {hand_path}")
+                hand_session = VisionEngineSession(hand_path)
+            self._gesture_det_model = gest_session
+            self._hand_det_model = hand_session
+            return self._gesture_det_model, self._hand_det_model
+
     def _hand_channel_for(self, merged: dict):
         """Build the hand channel for one instance, or None.
 
@@ -1218,6 +1305,24 @@ class PosePerceptionPlugin:
         """
         if not merged["hands"]:
             return None
+        if merged.get("hand_backend") == "detector":
+            try:
+                gest_session, hand_session = self._ensure_hand_detector_models()
+            except Exception as error:  # noqa: BLE001 — the card must still work
+                self._hand_load_error = str(error)
+                log.warning("[pose] hand gesture detector unavailable, running without "
+                            "hands: %s", error)
+                return None
+            self._hand_load_error = None
+            return HandGestureDetectorChannel(
+                gest_session,
+                hand_session,
+                hand_conf=merged["hand_det_confidence"],
+                gesture_conf=merged["gesture_det_confidence"],
+                kpt_conf=merged["kpt_confidence"],
+                adaptive_zoom=merged["hand_adaptive_zoom"],
+                interval_s=merged["hand_interval_s"],
+            )
         try:
             session = self._ensure_hand_model()
         except Exception as error:  # noqa: BLE001 — the card must still work
@@ -1343,8 +1448,20 @@ class PosePerceptionPlugin:
         if configured.endswith(".engine") and os.path.isfile(configured):
             return configured
 
-        from utils.model_downloader import ensure_pose_model
+        from utils.model_downloader import ensure_hand_detector_models, ensure_pose_model
         from utils.model_progress import fetch_status
+
+        if configured == "yolo26n-pose":
+            model_dir = os.environ.get("HAND_GESTURE_MODEL_DIR", "/models/hand_gesture")
+            progress_cb, _ = fetch_status(
+                lambda text: setattr(self, "_model_load_status", text), configured)
+            paths = ensure_hand_detector_models(model_dir, progress_cb=progress_cb)
+            pose_path = next(
+                (p for name, p in paths.items() if "pose" in name and name.endswith(".engine")),
+                None,
+            )
+            if pose_path:
+                return pose_path
 
         model_dir = os.environ.get("POSE_MODEL_DIR", "/models/pose")
         progress_cb, _ = fetch_status(
@@ -1451,6 +1568,7 @@ class PosePerceptionPlugin:
         # The full keypoints always go back in this reply, unlike the stream:
         # it is asked for once and read once, so trimming it saves nothing, and
         # a caller who cannot see the frame has no other way to get them.
+        detector_hands = merged["hands"] and merged.get("hand_backend") == "detector"
         return {
             "ok": True,
             "source": source,
@@ -1459,7 +1577,7 @@ class PosePerceptionPlugin:
             "count": len(persons),
             "latency_ms": int((time.time() - started) * 1000),
             "keypoint_names": (merged_keypoint_names(COCO_KEYPOINTS)
-                               if merged["hands"]
+                               if (merged["hands"] and not detector_hands)
                                else list(COCO_KEYPOINTS)),
             # Said plainly rather than left for the caller to notice: a single
             # image cannot support waving, walking, turning or a fall, so
@@ -1486,15 +1604,30 @@ class PosePerceptionPlugin:
                     **({"point_direction": person["verdict"]["point_direction"]}
                        if person["verdict"].get("point_direction") else {}),
                     "keypoints": _full_keypoints(person["keypoints"]),
-                    **({"hands": {
-                        side: _full_keypoints(value)
-                        for side, value in (person.get("hands") or {}).items()
-                        if value is not None}}
-                       if merged["hands"] else {}),
-                    **({"hand_gestures": person["hand_gestures"],
-                        "hand_gesture_evidence": person.get(
-                            "hand_gesture_evidence", {})}
-                       if person.get("hand_gestures") else {}),
+                    **(
+                        {
+                            "hands": person.get("hands") or {},
+                            "hand_bboxes": person.get(
+                                "hand_bboxes", {"left": [], "right": []}),
+                            "hand_gestures": person.get(
+                                "hand_gestures", {"left": None, "right": None}),
+                            "hand_gesture_scores": person.get(
+                                "hand_gesture_scores", {"left": None, "right": None}),
+                        }
+                        if "hand_bboxes" in person else (
+                            {
+                                **({"hands": {
+                                    side: _full_keypoints(value)
+                                    for side, value in (person.get("hands") or {}).items()
+                                    if value is not None}}
+                                   if merged["hands"] else {}),
+                                **({"hand_gestures": person["hand_gestures"],
+                                    "hand_gesture_evidence": person.get(
+                                        "hand_gesture_evidence", {})}
+                                   if person.get("hand_gestures") else {}),
+                            }
+                        )
+                    ),
                 }
                 for person in persons
             ],
@@ -1523,6 +1656,25 @@ class PosePerceptionPlugin:
         occluded, nothing found in the crop) and one real failure, and from
         the caller's side they all look like "no fingers".
         """
+        if merged.get("hand_backend") == "detector":
+            try:
+                gest_session, hand_session = self._ensure_hand_detector_models()
+            except Exception as error:  # noqa: BLE001 — the bodies still answer
+                self._hand_load_error = str(error)
+                return ({"ok": False, "reason": "engine_unavailable",
+                         "detail": str(error)}, [])
+            self._hand_load_error = None
+            channel = HandGestureDetectorChannel(
+                gest_session,
+                hand_session,
+                hand_conf=merged["hand_det_confidence"],
+                gesture_conf=merged["gesture_det_confidence"],
+                kpt_conf=merged["kpt_confidence"],
+                adaptive_zoom=merged["hand_adaptive_zoom"],
+                interval_s=0.0,
+            )
+            note = channel.update(persons, frame, 0.0, synthesize_person=True)
+            return note, []
         try:
             session = self._ensure_hand_model()
         except Exception as error:  # noqa: BLE001 — the bodies still answer
@@ -1731,7 +1883,9 @@ class PosePerceptionPlugin:
                     "whitelist": list(self._gesture_whitelist),
                     "available": list(DEFAULT_GESTURES),
                     "optional": list(OPTIONAL_GESTURES),
-                    "hand_shapes": gesture_catalogue(),
+                    "hand_shapes": (detector_gesture_catalogue()
+                                    if self._hand_backend == "detector"
+                                    else gesture_catalogue()),
                     "hand_shapes_note": (
                         "需要 hands: gesture。这些是单帧的手型，由 21 个关键点的"
                         "几何判定，不额外跑模型。thumbs_up 在词表里但默认不开 —— "
@@ -1883,7 +2037,10 @@ class PosePerceptionPlugin:
                             for node in nodes.values())
         info["hands"] = bool(running_hands or self._hands)
         if info["hands"]:
-            info["hand_model"] = HAND_MODEL
+            info["hand_backend"] = self._hand_backend
+            info["hand_model"] = (
+                "yolov10n-hand-gesture" if self._hand_backend == "detector" else HAND_MODEL
+            )
             info["hand_keypoint_names"] = list(HAND_KEYPOINTS)
             info["hand_note"] = (
                 "手部只在近处有效：从原生分辨率裁 ROI 上采样后约 3.5m 以内，"
@@ -2093,6 +2250,14 @@ class PosePerceptionPlugin:
             self._gesture_min_score = float(cfg["gesture_min_score"])
         if "hands" in cfg:
             self._hands = _hands_enabled(cfg["hands"])
+        if "hand_backend" in cfg:
+            self._hand_backend = str(cfg["hand_backend"]).strip().lower()
+        if "hand_det_confidence" in cfg:
+            self._hand_det_confidence = float(cfg["hand_det_confidence"])
+        if "gesture_det_confidence" in cfg:
+            self._gesture_det_confidence = float(cfg["gesture_det_confidence"])
+        if "hand_adaptive_zoom" in cfg:
+            self._hand_adaptive_zoom = bool(cfg["hand_adaptive_zoom"])
         if "hand_interval_s" in cfg:
             self._hand_interval_s = float(cfg["hand_interval_s"])
         if "hand_max_rois" in cfg:

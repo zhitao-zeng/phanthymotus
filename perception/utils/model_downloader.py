@@ -5,6 +5,7 @@ utils/model_downloader.py — Auto-download sherpa-onnx models from COS if missi
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import os
 import tarfile
@@ -12,8 +13,8 @@ import tempfile
 import time
 import zipfile
 from urllib.error import URLError
-from urllib.parse import quote
-from urllib.request import Request, urlopen, urlretrieve
+from urllib.parse import quote, urlparse
+from urllib.request import ProxyHandler, Request, build_opener, urlopen, urlretrieve
 
 try:  # Linux only; the perception images are Linux, dev hosts may not be.
     import fcntl
@@ -285,8 +286,37 @@ def _common_prefix_from_names(names: list[str]) -> str:
 
 MODELS_ROOT = "/models"
 
+_ORIG_URLOPEN = urlopen
+_NO_PROXY_OPENER = None
 
-def require_models_subpath(path: str, root: str = MODELS_ROOT) -> str:
+
+def _is_private_or_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    cleaned = host.strip("[]").lower()
+    if cleaned == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(cleaned)
+        return addr.is_private or addr.is_loopback
+    except ValueError:
+        return False
+
+
+def _open_url(req_or_url, timeout: float = 120):
+    """Open URL directly for private/loopback hosts while respecting monkeypatched urlopen."""
+    if urlopen is not _ORIG_URLOPEN:
+        return urlopen(req_or_url, timeout=timeout)
+    raw_url = req_or_url.full_url if isinstance(req_or_url, Request) else str(req_or_url)
+    if _is_private_or_loopback_host(urlparse(raw_url).hostname):
+        global _NO_PROXY_OPENER
+        if _NO_PROXY_OPENER is None:
+            _NO_PROXY_OPENER = build_opener(ProxyHandler({}))
+        return _NO_PROXY_OPENER.open(req_or_url, timeout=timeout)
+    return urlopen(req_or_url, timeout=timeout)
+
+
+def require_models_subpath(path: str, root: str | None = None) -> str:
     """Validate that a caller-supplied model_dir stays inside the models tree.
 
     model_dir is accepted over MCP config and the downloader runs as root in
@@ -300,6 +330,8 @@ def require_models_subpath(path: str, root: str = MODELS_ROOT) -> str:
     created later — and compare the resolved paths. Returns the resolved
     absolute path, which callers must use for all filesystem work.
     """
+    if root is None:
+        root = MODELS_ROOT
     candidate = os.path.normpath(os.path.join("/", str(path)))
     root_real = os.path.realpath(root)
 
@@ -469,7 +501,7 @@ def _fetch_pinned_file(
             )
             fetched = 0
             last_pct = 0
-            with urlopen(url, timeout=120) as response, open(destination, "wb") as output:
+            with _open_url(url, timeout=120) as response, open(destination, "wb") as output:
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
@@ -548,7 +580,7 @@ def _probe_source(source: str, filename: str) -> float:
     request = Request(url, headers={"Range": f"bytes=0-{_PROBE_BYTES - 1}"})
     start = time.monotonic()
     try:
-        with urlopen(request, timeout=_PROBE_TIMEOUT) as response:
+        with _open_url(request, timeout=_PROBE_TIMEOUT) as response:
             read = len(response.read(_PROBE_BYTES))
     except Exception as error:      # noqa: BLE001 — an unusable source is a result
         log.info(f"[model_downloader] probe failed for {url}: {error}")
@@ -1423,6 +1455,52 @@ HAND_ONNX_BASE = os.environ.get(
     "HAND_ONNX_BASE_URL", f"{VISION_MODEL_BASE}/rtmpose-m-hand5/onnx")
 
 
+# Lightweight pose + single- and two-hand gesture detector engines
+# (yolo26n-pose + YOLOv10n_hands + YOLOv10n_gestures, 7.47M params total,
+# <30 MB combined FP16 TensorRT engines per JetPack family).
+HAND_DETECTOR_MODEL_BASE = os.environ.get(
+    "HAND_DETECTOR_MODEL_BASE_URL",
+    "http://172.28.4.81:34567/zengzhitao/embodied-ai/hand-gesture-r5n-20261125",
+)
+
+HAND_DETECTOR_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{HAND_DETECTOR_MODEL_BASE}/jp61",
+        "files": {
+            "yolo26n-pose.engine": {
+                "size": 9845284,
+                "sha256": "5ecb5b82990a3143b274d67c5dff2589ae0f9d78c449e41ca85357f47926a18d",
+            },
+            "yolov10n_hands_640.engine": {
+                "size": 7809020,
+                "sha256": "b7033ab0d78c18be73c57e0497469a9dddda19a104f5196f67823bbd65fb2353",
+            },
+            "yolov10n_gestures_640.engine": {
+                "size": 7719668,
+                "sha256": "456c9a40670cfc5fef2d929439198e426392b4af21c893d023ecd67869fc250e",
+            },
+        },
+    },
+    "jp511": {
+        "base_url": f"{HAND_DETECTOR_MODEL_BASE}/jp511",
+        "files": {
+            "yolo26n-pose.engine": {
+                "size": 8834756,
+                "sha256": "f66feb97ece94f997ab942a7303a503b59a68babbe027b258f360189650ae609",
+            },
+            "yolov10n_hands_640.engine": {
+                "size": 6618579,
+                "sha256": "d4245dd4313c07db860ec3c49e337c61cdeab938550579a0cb9466d839be8c24",
+            },
+            "yolov10n_gestures_640.engine": {
+                "size": 6881191,
+                "sha256": "3bbf0f47a38a735d1f64500eec90e43a234d8d5c26b6b15adc1bfb085328402a",
+            },
+        },
+    },
+}
+
+
 # Skeleton-action recognition for the pose card: ST-GCN++, joint stream,
 # NTU60-XSub, 2D 17-keypoint input. 1.39 M params and 1.95 GFLOPs at 100 frames,
 # top-1 89.3% — the smallest of the options with a published 2D-COCO17
@@ -1612,6 +1690,19 @@ def ensure_hand_model(model_dir: str, family: str | None = None,
     """
     return _ensure_vision_bundle("hand", HAND_MODEL_BUNDLES, model_dir, family,
                                  progress_cb=progress_cb)
+
+
+def ensure_hand_detector_models(model_dir: str, family: str | None = None,
+                                progress_cb=None) -> dict[str, str]:
+    """Ensure the YOLOv10n hand box + gesture detector engines for the runtime TensorRT."""
+    key = select_bundle_family(HAND_DETECTOR_MODEL_BUNDLES, family)
+    return _ensure_vision_bundle(
+        "hand_detector",
+        HAND_DETECTOR_MODEL_BUNDLES,
+        os.path.join(model_dir, key),
+        key,
+        progress_cb=progress_cb,
+    )
 
 
 def ensure_hand_onnx(model_dir: str, progress_cb=None) -> dict[str, str]:
